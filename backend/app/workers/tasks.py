@@ -1,7 +1,6 @@
-"""Pure task functions — no Celery, no decorators.
+"""Pure task functions called by APScheduler and the /workers endpoints.
 
-Called by app.scheduler (APScheduler) and by the /workers endpoints for
-on-demand manual triggers.  All DB sessions are managed by the caller.
+All DB sessions are managed by the caller.
 """
 from __future__ import annotations
 

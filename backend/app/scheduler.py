@@ -1,8 +1,4 @@
-"""Scheduler — replaces Celery with APScheduler (no broker / Redis required).
-
-All periodic work runs in background threads managed by APScheduler.
-Tasks are pure functions in app.workers.tasks — no Celery decorators.
-"""
+"""APScheduler — runs all periodic jobs as background threads inside the FastAPI process."""
 from __future__ import annotations
 
 import logging
