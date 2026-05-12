@@ -82,14 +82,18 @@ async def lifespan(app: FastAPI):
     from app.scheduler import start_scheduler, stop_scheduler
 
     logger.info("Starting AI Governance API")
-    Base.metadata.create_all(bind=engine)
-    with engine.connect() as conn:
-        for stmt in _SAFE_ALTERS:
-            try:
-                conn.execute(text(stmt))
-            except Exception as exc:
-                logger.warning("Auto-migration skipped: %s — %s", stmt, exc)
-        conn.commit()
+    try:
+        Base.metadata.create_all(bind=engine)
+        with engine.connect() as conn:
+            for stmt in _SAFE_ALTERS:
+                try:
+                    conn.execute(text(stmt))
+                except Exception as exc:
+                    logger.warning("Auto-migration skipped: %s — %s", stmt, exc)
+            conn.commit()
+    except Exception as exc:
+        logger.error("Database setup failed: %s", exc)
+        logger.error("Check that DATABASE_URL is set correctly in your environment.")
 
     start_scheduler()
     try:
