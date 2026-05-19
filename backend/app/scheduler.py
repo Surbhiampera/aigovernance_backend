@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import logging
 
+from apscheduler.executors.pool import ThreadPoolExecutor
 from apscheduler.schedulers.background import BackgroundScheduler
+
+from app.config import get_scheduler_max_workers
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +103,17 @@ def start_scheduler() -> BackgroundScheduler:
     if _scheduler and _scheduler.running:
         return _scheduler
 
-    _scheduler = BackgroundScheduler(timezone="UTC", job_defaults={"misfire_grace_time": 300})
+    job_defaults = {
+        "coalesce": True,
+        "max_instances": 1,
+        "misfire_grace_time": 300,
+    }
+    executors = {"default": ThreadPoolExecutor(max_workers=get_scheduler_max_workers())}
+    _scheduler = BackgroundScheduler(
+        timezone="UTC",
+        executors=executors,
+        job_defaults=job_defaults,
+    )
     _scheduler.add_job(_job_daily_aggregation, "interval", hours=1, id="daily_agg", replace_existing=True)
     _scheduler.add_job(_job_monthly_aggregation, "interval", hours=24, id="monthly_agg", replace_existing=True)
     _scheduler.add_job(_job_anomaly_detection, "interval", minutes=30, id="anomaly_detection", replace_existing=True)

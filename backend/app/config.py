@@ -39,6 +39,31 @@ def _int(key: str, default: str) -> int:
     return int(os.getenv(key, default))
 
 
+def get_db_pool_size() -> int:
+    """Maximum persistent DB connections per API process."""
+    return _int("DB_POOL_SIZE", "3")
+
+
+def get_db_max_overflow() -> int:
+    """Temporary DB connections above pool size; keep low for managed Postgres."""
+    return _int("DB_MAX_OVERFLOW", "0")
+
+
+def get_db_pool_timeout() -> int:
+    """Seconds to wait for a pooled connection before failing fast."""
+    return _int("DB_POOL_TIMEOUT", "10")
+
+
+def get_db_pool_recycle() -> int:
+    """Recycle pooled DB connections before server-side idle timeouts."""
+    return _int("DB_POOL_RECYCLE", "1800")
+
+
+def get_scheduler_max_workers() -> int:
+    """Maximum APScheduler worker threads inside each API process."""
+    return _int("SCHEDULER_MAX_WORKERS", "2")
+
+
 # ── Cost engine rates ──────────────────────────────────────────────────────
 def get_cost_default_rate_per_1k() -> Decimal:
     return _dec("COST_DEFAULT_RATE_PER_1K", "0.0025")
