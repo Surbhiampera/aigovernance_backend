@@ -3,7 +3,7 @@ from decimal import Decimal
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import case, func
+from sqlalchemy import and_, case, func
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_db
@@ -19,6 +19,13 @@ from app.models import (
 )
 
 router = APIRouter(prefix="/costs", tags=["costs"])
+
+
+# Telemetry events ingested by the governance_logger decorator are stamped
+# with an `event_id` of the form  "dec-<uuid>"  (see decorator/router.py
+# `/decorator/ingest`). The cost module must surface ONLY those rows so
+# manually-seeded / orphan test data never leaks into the dashboards.
+DECORATOR_EVENT_FILTER = TelemetryEvent.event_id.like("dec-%")
 
 
 def _scope(query, model, org_id, project_id=None):
@@ -99,7 +106,10 @@ def cost_by_project(
             func.avg(TelemetryEvent.latency_ms).label("avg_latency_ms"),
             func.count(TelemetryEvent.model_name.distinct()).label("tool_count"),
         )
-        .outerjoin(TelemetryEvent, TelemetryEvent.project_id == Project.id)
+        .outerjoin(
+            TelemetryEvent,
+            and_(TelemetryEvent.project_id == Project.id, DECORATOR_EVENT_FILTER),
+        )
         .outerjoin(Organization, Organization.id == Project.org_id)
         .group_by(
             Project.id,
@@ -306,7 +316,10 @@ def cost_by_org(db: Session = Depends(get_db)):
             func.coalesce(func.sum(TelemetryEvent.total_cost), 0).label("total_cost"),
             func.avg(TelemetryEvent.latency_ms).label("avg_latency_ms"),
         )
-        .outerjoin(TelemetryEvent, TelemetryEvent.org_id == Organization.id)
+        .outerjoin(
+            TelemetryEvent,
+            and_(TelemetryEvent.org_id == Organization.id, DECORATOR_EVENT_FILTER),
+        )
         .group_by(Organization.id, Organization.org_name, Organization.plan_type)
         .order_by(func.coalesce(func.sum(TelemetryEvent.total_cost), 0).desc())
         .all()

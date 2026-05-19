@@ -658,6 +658,10 @@ def get_cost_breakdown(
         )
         .join(Organization, Organization.id == TelemetryEvent.org_id)
         .join(Project, Project.id == TelemetryEvent.project_id)
+        # Only telemetry that arrived through the governance_logger
+        # decorator (event_id is stamped "dec-..." by /decorator/ingest)
+        # is counted — manually-seeded / orphan rows are ignored.
+        .filter(TelemetryEvent.event_id.like("dec-%"))
         .group_by(
             TelemetryEvent.org_id,
             TelemetryEvent.project_id,
