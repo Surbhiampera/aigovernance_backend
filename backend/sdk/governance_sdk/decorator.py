@@ -116,25 +116,67 @@ def _args_to_dict(fn: Callable, args: tuple, kwargs: dict) -> dict:
 
 def _extract_tokens(response: Any) -> tuple[int, int]:
     """
-    Try to extract prompt/completion token counts from an OpenAI or Anthropic
-    response object. Returns (prompt_tokens, completion_tokens).
+    Try to extract prompt/completion token counts from SDK objects, dicts, and
+    common nested route response shapes. Returns (prompt_tokens, completion_tokens).
     """
     if response is None:
         return 0, 0
+
     usage = getattr(response, "usage", None)
-    if usage is None:
-        return 0, 0
-    prompt = (
-        getattr(usage, "prompt_tokens", None)
-        or getattr(usage, "input_tokens", None)
-        or 0
-    )
-    completion = (
-        getattr(usage, "completion_tokens", None)
-        or getattr(usage, "output_tokens", None)
-        or 0
-    )
+    if usage is not None:
+        prompt = (
+            getattr(usage, "prompt_tokens", None)
+            or getattr(usage, "input_tokens", None)
+            or 0
+        )
+        completion = (
+            getattr(usage, "completion_tokens", None)
+            or getattr(usage, "output_tokens", None)
+            or 0
+        )
+        if prompt or completion:
+            return int(prompt), int(completion)
+
+    if isinstance(response, dict):
+        for candidate in (
+            response.get("usage"),
+            response.get("metrics"),
+            response.get("raw_usage_json"),
+            response,
+        ):
+            if isinstance(candidate, dict):
+                prompt = candidate.get("prompt_tokens") or candidate.get("input_tokens") or candidate.get("total_input_tokens") or 0
+                completion = candidate.get("completion_tokens") or candidate.get("output_tokens") or candidate.get("total_output_tokens") or 0
+                if prompt or completion:
+                    return int(prompt), int(completion)
+
+        nested_response = response.get("response") or response.get("result")
+        if nested_response is not response:
+            prompt, completion = _extract_tokens(nested_response)
+            if prompt or completion:
+                return prompt, completion
+
+        total = response.get("total_tokens") or 0
+        if total:
+            return int(total), 0
+
+    prompt = getattr(response, "prompt_tokens", None) or getattr(response, "input_tokens", None) or 0
+    completion = getattr(response, "completion_tokens", None) or getattr(response, "output_tokens", None) or 0
     return int(prompt), int(completion)
+
+
+def _extract_model(response: Any, fallback: Optional[str] = None) -> Optional[str]:
+    if isinstance(response, dict):
+        model = response.get("model_name") or response.get("model")
+        if model:
+            return model
+        nested_response = response.get("response") or response.get("result")
+        if nested_response is not response:
+            nested_model = _extract_model(nested_response, None)
+            if nested_model:
+                return nested_model
+        return fallback
+    return getattr(response, "model_name", None) or getattr(response, "model", None) or fallback
 
 
 def _keys_summary(obj: Any) -> str:
@@ -543,6 +585,7 @@ class GovernanceDecorator:
     ) -> None:
         try:
             prompt_tokens, completion_tokens = _extract_tokens(result)
+            resolved_model = _extract_model(result, model_name)
 
             output_preview, output_size, output_pii = "", 0, False
             if capture_io and result is not None:
@@ -567,7 +610,7 @@ class GovernanceDecorator:
                 "project_id":           self._sdk.project_id,
                 "tool_name":            self._sdk.tool_name,
                 "provider":             provider or "unknown",
-                "model_name":           model_name,
+                "model_name":           resolved_model,
                 "service_type":         service_type or decorator_type,
                 "function_name":        fn_qualname,
                 "module_path":          fn_module,

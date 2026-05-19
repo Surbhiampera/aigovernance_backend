@@ -128,6 +128,7 @@ class SDKIngestService:
             input_preview=sdk_event.input_preview,
             output_preview=sdk_event.output_preview,
             infra_cost=Decimal("0"),
+            precomputed_llm_cost=pricing["cost"] if pricing["source"] != "none" else None,
             raw_usage_json={
                 "input_tokens": sdk_event.input_tokens,
                 "output_tokens": sdk_event.output_tokens,

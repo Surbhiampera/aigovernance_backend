@@ -116,6 +116,12 @@ def _extract_tokens(response: Any) -> tuple:
         c = response.get("completion_tokens") or response.get("output_tokens") or 0
         if p or c:
             return int(p), int(c)
+        # Common route shape: {"model": "...", "response": <LLM response>}.
+        nested = response.get("response") or response.get("result")
+        if nested is not None and nested is not response:
+            p, c = _extract_tokens(nested)
+            if p or c:
+                return p, c
         # Only total_tokens supplied
         t = response.get("total_tokens") or 0
         if t:
@@ -131,8 +137,16 @@ def _extract_tokens(response: Any) -> tuple:
 def _extract_model(response: Any, fallback: Optional[str] = None) -> Optional[str]:
     """Return model name from response dict/object, or fallback."""
     if isinstance(response, dict):
-        return response.get("model") or response.get("model_name") or fallback
-    return getattr(response, "model", None) or fallback
+        model = response.get("model") or response.get("model_name")
+        if model:
+            return model
+        nested = response.get("response") or response.get("result")
+        if nested is not None and nested is not response:
+            nested_model = _extract_model(nested, None)
+            if nested_model:
+                return nested_model
+        return fallback
+    return getattr(response, "model", None) or getattr(response, "model_name", None) or fallback
 
 
 # ── Cost estimation ───────────────────────────────────────────────────────────

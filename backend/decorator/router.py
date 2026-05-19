@@ -42,6 +42,39 @@ def _first_present(payload: dict, *keys: str, default: Any = None) -> Any:
     return default
 
 
+def _first_present_deep(payload: dict, *keys: str, default: Any = None) -> Any:
+    """Pick a metric from top-level payload or common nested usage blocks."""
+    value = _first_present(payload, *keys)
+    if value is not None:
+        return value
+
+    for container_key in ("usage", "metrics", "raw_usage_json", "metadata"):
+        nested = payload.get(container_key)
+        if isinstance(nested, dict):
+            value = _first_present(nested, *keys)
+            if value is not None:
+                return value
+
+            # Some app routes return {"response": {"usage": {...}}}.
+            response = nested.get("response")
+            if isinstance(response, dict):
+                response_usage = response.get("usage") or response.get("metrics") or response
+                if isinstance(response_usage, dict):
+                    value = _first_present(response_usage, *keys)
+                    if value is not None:
+                        return value
+
+    response = payload.get("response")
+    if isinstance(response, dict):
+        response_usage = response.get("usage") or response.get("metrics") or response
+        if isinstance(response_usage, dict):
+            value = _first_present(response_usage, *keys)
+            if value is not None:
+                return value
+
+    return default
+
+
 def _as_int(value: Any, default: int = 0) -> int:
     try:
         return int(float(value))
@@ -392,15 +425,18 @@ def ingest_decorator_telemetry(
     tool_name     = _first_present(payload, "tool_name", "route", "endpoint", default="unknown")
     function_name = _first_present(payload, "function_name", "route", "endpoint", default="unknown")
     module_path   = payload.get("module_path")
-    model_name    = _first_present(payload, "model_name", "model")
+    model_name    = _first_present_deep(payload, "model_name", "model")
     provider      = payload.get("provider") or "unknown"
     decorator_type= payload.get("decorator_type") or "fastapi_route"
     status        = payload.get("status") or "success"
-    latency_ms    = _as_int(payload.get("latency_ms") or (_as_float(payload.get("latency_seconds")) * 1000))
-    prompt_tokens = _as_int(_first_present(payload, "input_tokens", "prompt_tokens", "total_input_tokens"))
-    completion_tokens = _as_int(_first_present(payload, "output_tokens", "completion_tokens", "total_output_tokens"))
-    total_tokens  = _as_int(payload.get("total_tokens")) or (prompt_tokens + completion_tokens)
-    estimated_cost= _as_float(_first_present(payload, "estimated_cost", "estimated_cost_usd", "total_cost", "llm_cost"))
+    latency_ms    = _as_int(
+        _first_present_deep(payload, "latency_ms")
+        or (_as_float(_first_present_deep(payload, "latency_seconds")) * 1000)
+    )
+    prompt_tokens = _as_int(_first_present_deep(payload, "input_tokens", "prompt_tokens", "total_input_tokens"))
+    completion_tokens = _as_int(_first_present_deep(payload, "output_tokens", "completion_tokens", "total_output_tokens"))
+    total_tokens  = _as_int(_first_present_deep(payload, "total_tokens")) or (prompt_tokens + completion_tokens)
+    estimated_cost= _as_float(_first_present_deep(payload, "estimated_cost", "estimated_cost_usd", "total_cost", "llm_cost"))
     contains_pii  = bool(payload.get("contains_pii", False))
     input_preview = payload.get("input_preview")
     output_preview= payload.get("output_preview")
