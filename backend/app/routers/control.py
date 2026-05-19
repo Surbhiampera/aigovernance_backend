@@ -633,25 +633,39 @@ def get_cost_breakdown(
     project_id: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
-    """Cost breakdown aggregated per model/tool, scoped by org and/or project."""
-    q = db.query(
-        TelemetryEvent.org_id,
-        TelemetryEvent.project_id,
-        TelemetryEvent.model_name.label("model"),
-        TelemetryEvent.provider,
-        func.count(TelemetryEvent.id).label("events"),
-        func.sum(TelemetryEvent.prompt_tokens).label("input_tokens"),
-        func.sum(TelemetryEvent.completion_tokens).label("output_tokens"),
-        func.sum(TelemetryEvent.total_tokens).label("total_tokens"),
-        func.sum(TelemetryEvent.llm_cost).label("llm_cost"),
-        func.sum(TelemetryEvent.infra_cost).label("infra_cost"),
-        func.sum(TelemetryEvent.external_cost).label("external_cost"),
-        func.sum(TelemetryEvent.total_cost).label("total_cost"),
-    ).group_by(
-        TelemetryEvent.org_id,
-        TelemetryEvent.project_id,
-        TelemetryEvent.model_name,
-        TelemetryEvent.provider,
+    """Cost breakdown aggregated per model/tool, scoped by org and/or project.
+
+    Only telemetry whose `org_id` and `project_id` exist in the master
+    `organizations` / `projects` tables is included — stale or orphan
+    IDs (e.g. legacy 'external-team-org') are excluded.
+    """
+    q = (
+        db.query(
+            TelemetryEvent.org_id,
+            TelemetryEvent.project_id,
+            Organization.org_name.label("org_name"),
+            Project.project_name.label("project_name"),
+            TelemetryEvent.model_name.label("model"),
+            TelemetryEvent.provider,
+            func.count(TelemetryEvent.id).label("events"),
+            func.sum(TelemetryEvent.prompt_tokens).label("input_tokens"),
+            func.sum(TelemetryEvent.completion_tokens).label("output_tokens"),
+            func.sum(TelemetryEvent.total_tokens).label("total_tokens"),
+            func.sum(TelemetryEvent.llm_cost).label("llm_cost"),
+            func.sum(TelemetryEvent.infra_cost).label("infra_cost"),
+            func.sum(TelemetryEvent.external_cost).label("external_cost"),
+            func.sum(TelemetryEvent.total_cost).label("total_cost"),
+        )
+        .join(Organization, Organization.id == TelemetryEvent.org_id)
+        .join(Project, Project.id == TelemetryEvent.project_id)
+        .group_by(
+            TelemetryEvent.org_id,
+            TelemetryEvent.project_id,
+            Organization.org_name,
+            Project.project_name,
+            TelemetryEvent.model_name,
+            TelemetryEvent.provider,
+        )
     )
 
     if org_id:
@@ -664,7 +678,9 @@ def get_cost_breakdown(
     return [
         {
             "org_id": r.org_id,
+            "org_name": r.org_name,
             "project_id": r.project_id,
+            "project_name": r.project_name,
             "model": r.model or "unknown",
             "provider": r.provider or "unknown",
             "events": int(r.events or 0),

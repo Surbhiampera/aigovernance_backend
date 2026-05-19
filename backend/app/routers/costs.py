@@ -7,7 +7,16 @@ from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_db
-from app.models import Alert, Budget, DailyOrgSummary, MonthlyOrgSummary, TelemetryEvent, ToolRegistry
+from app.models import (
+    Alert,
+    Budget,
+    DailyOrgSummary,
+    MonthlyOrgSummary,
+    Organization,
+    Project,
+    TelemetryEvent,
+    ToolRegistry,
+)
 
 router = APIRouter(prefix="/costs", tags=["costs"])
 
@@ -70,30 +79,47 @@ def cost_by_project(
     org_id: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
+    """Cost grouped by project, driven by the `projects` master table.
+    Every project that exists in the DB is returned (with zeroed metrics
+    if it has no telemetry yet); stale project_ids that exist only in
+    telemetry but not in the `projects` table are ignored."""
     rows = (
         db.query(
-            TelemetryEvent.project_id,
-            TelemetryEvent.org_id,
+            Project.id.label("project_id"),
+            Project.org_id.label("org_id"),
+            Project.project_name.label("project_name"),
+            Project.environment.label("environment"),
+            Organization.org_name.label("org_name"),
             func.count(TelemetryEvent.id).label("total_events"),
-            func.sum(TelemetryEvent.total_tokens).label("total_tokens"),
-            func.sum(TelemetryEvent.llm_cost).label("llm_cost"),
-            func.sum(TelemetryEvent.infra_cost).label("infra_cost"),
-            func.sum(TelemetryEvent.external_cost).label("external_cost"),
-            func.sum(TelemetryEvent.total_cost).label("total_cost"),
+            func.coalesce(func.sum(TelemetryEvent.total_tokens), 0).label("total_tokens"),
+            func.coalesce(func.sum(TelemetryEvent.llm_cost), 0).label("llm_cost"),
+            func.coalesce(func.sum(TelemetryEvent.infra_cost), 0).label("infra_cost"),
+            func.coalesce(func.sum(TelemetryEvent.external_cost), 0).label("external_cost"),
+            func.coalesce(func.sum(TelemetryEvent.total_cost), 0).label("total_cost"),
             func.avg(TelemetryEvent.latency_ms).label("avg_latency_ms"),
             func.count(TelemetryEvent.model_name.distinct()).label("tool_count"),
         )
-        .filter(TelemetryEvent.project_id.isnot(None), TelemetryEvent.project_id != "")
-        .group_by(TelemetryEvent.project_id, TelemetryEvent.org_id)
-        .order_by(func.sum(TelemetryEvent.total_cost).desc())
+        .outerjoin(TelemetryEvent, TelemetryEvent.project_id == Project.id)
+        .outerjoin(Organization, Organization.id == Project.org_id)
+        .group_by(
+            Project.id,
+            Project.org_id,
+            Project.project_name,
+            Project.environment,
+            Organization.org_name,
+        )
+        .order_by(func.coalesce(func.sum(TelemetryEvent.total_cost), 0).desc())
     )
     if org_id:
-        rows = rows.filter(TelemetryEvent.org_id == org_id)
+        rows = rows.filter(Project.org_id == org_id)
 
     return [
         {
             "project_id": r.project_id,
             "org_id": r.org_id,
+            "org_name": r.org_name,
+            "project_name": r.project_name,
+            "environment": r.environment,
             "total_events": r.total_events or 0,
             "total_tokens": r.total_tokens or 0,
             "llm_cost": float(r.llm_cost or 0),
@@ -266,21 +292,30 @@ def cost_monthly(
 
 @router.get("/by-org")
 def cost_by_org(db: Session = Depends(get_db)):
+    """Cost grouped by organization, driven by the `organizations` master
+    table. Every organization in the DB is returned (with zeroed metrics
+    if no telemetry yet); stale org_ids that exist only in telemetry but
+    not in the `organizations` table are ignored."""
     rows = (
         db.query(
-            TelemetryEvent.org_id,
+            Organization.id.label("org_id"),
+            Organization.org_name.label("org_name"),
+            Organization.plan_type.label("plan_type"),
             func.count(TelemetryEvent.id).label("total_events"),
-            func.sum(TelemetryEvent.total_tokens).label("total_tokens"),
-            func.sum(TelemetryEvent.total_cost).label("total_cost"),
+            func.coalesce(func.sum(TelemetryEvent.total_tokens), 0).label("total_tokens"),
+            func.coalesce(func.sum(TelemetryEvent.total_cost), 0).label("total_cost"),
             func.avg(TelemetryEvent.latency_ms).label("avg_latency_ms"),
         )
-        .group_by(TelemetryEvent.org_id)
-        .order_by(func.sum(TelemetryEvent.total_cost).desc())
+        .outerjoin(TelemetryEvent, TelemetryEvent.org_id == Organization.id)
+        .group_by(Organization.id, Organization.org_name, Organization.plan_type)
+        .order_by(func.coalesce(func.sum(TelemetryEvent.total_cost), 0).desc())
         .all()
     )
     return [
         {
             "org_id": r.org_id,
+            "org_name": r.org_name,
+            "plan_type": r.plan_type,
             "total_events": r.total_events or 0,
             "total_tokens": r.total_tokens or 0,
             "total_cost": float(r.total_cost or 0),
