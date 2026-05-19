@@ -19,6 +19,13 @@ from decimal import Decimal
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app.config import (
+    get_alert_anomaly_batch_limit,
+    get_alert_budget_default_threshold_pct,
+    get_alert_budget_mid_pct,
+    get_alert_dedup_days,
+    get_alert_token_quota_warning_pct,
+)
 from app.models import Alert, Budget, DailyOrgSummary, GovernanceRule, RateLimit, UsageAnomaly
 from app.schemas import CostSummary, TelemetryEventCreate
 
@@ -150,12 +157,11 @@ class AlertEngine:
 
             spent = Decimal(str(spent_q.scalar() or 0))
             limit_amount = Decimal(str(budget.limit_amount))
-            # Threshold from DB — never hardcoded
-            threshold_pct = Decimal(str(budget.alert_threshold_percent or 80))
+            threshold_pct = Decimal(str(budget.alert_threshold_percent or get_alert_budget_default_threshold_pct()))
             usage_pct = (spent / limit_amount * 100).quantize(Decimal("0.1"))
 
-            # Alert at configured threshold, 90%, and 100%
-            for alert_pct in sorted({threshold_pct, Decimal("90"), Decimal("100")}):
+            # Alert at configured threshold, mid-tier, and 100%
+            for alert_pct in sorted({threshold_pct, get_alert_budget_mid_pct(), Decimal("100")}):
                 if usage_pct >= alert_pct:
                     sev = "critical" if alert_pct >= Decimal("100") else "high"
                     self._create_alert(
@@ -224,7 +230,7 @@ class AlertEngine:
             used = Decimal(str(used_today))
             pct = (used / quota * 100).quantize(Decimal("0.1")) if quota > 0 else Decimal("0")
 
-            if pct >= Decimal("80"):
+            if pct >= get_alert_token_quota_warning_pct():
                 sev = "critical" if pct >= Decimal("100") else "high"
                 self._create_alert(
                     db=db,
@@ -287,7 +293,7 @@ class AlertEngine:
             db.query(UsageAnomaly)
             .filter(UsageAnomaly.status == "open")
             .order_by(UsageAnomaly.created_at.desc())
-            .limit(20)
+            .limit(get_alert_anomaly_batch_limit())
             .all()
         )
         created = 0
@@ -344,7 +350,7 @@ class AlertEngine:
         rule_id: int | None = None,
         tool_name: str | None = None,
     ) -> None:
-        recent_cutoff = date.today() - timedelta(days=1)
+        recent_cutoff = date.today() - timedelta(days=get_alert_dedup_days())
         existing = (
             db.query(Alert)
             .filter(

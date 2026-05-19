@@ -2,6 +2,11 @@ from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
+from app.config import (
+    get_cost_default_per_second_rate,
+    get_cost_default_rate_per_1k,
+    get_cost_infra_rate_per_ms,
+)
 from app.models import ModelPricing, ToolRegistry
 from app.schemas import CostSummary, TelemetryEventCreate
 
@@ -54,13 +59,13 @@ class CostEngine:
                 latency_s = (Decimal(str(max(int(event_data.latency_ms or 0), 0))) / Decimal("1000")).quantize(Decimal("0.000001"))
 
                 if cost_model == "per_token":
-                    rate_per_1k = base_cost if base_cost > 0 else Decimal("0.0025")
+                    rate_per_1k = base_cost if base_cost > 0 else get_cost_default_rate_per_1k()
                     if total_tokens > 0:
                         llm_cost = (Decimal(str(total_tokens)) / Decimal("1000")) * rate_per_1k
                 elif cost_model == "per_request":
                     llm_cost = base_cost
                 elif cost_model == "per_second":
-                    rate_per_s = base_cost if base_cost > 0 else Decimal("0.0001")
+                    rate_per_s = base_cost if base_cost > 0 else get_cost_default_per_second_rate()
                     llm_cost = latency_s * rate_per_s
                 elif cost_model == "fixed":
                     llm_cost = base_cost
@@ -74,10 +79,10 @@ class CostEngine:
                     llm_cost = (base_cost * multiplier) + (per_mb_in * mb_in) + (per_mb_out * mb_out)
                 else:
                     if total_tokens > 0:
-                        llm_cost = (Decimal(str(total_tokens)) / Decimal("1000")) * Decimal("0.0025")
+                        llm_cost = (Decimal(str(total_tokens)) / Decimal("1000")) * get_cost_default_rate_per_1k()
 
         if infra_cost == 0 and event_data.latency_ms > 0:
-            infra_cost = Decimal(str(event_data.latency_ms)) * Decimal("0.00008")
+            infra_cost = Decimal(str(event_data.latency_ms)) * get_cost_infra_rate_per_ms()
 
         for ext in event_data.external_tools:
             external_cost += Decimal(str(ext.cost))

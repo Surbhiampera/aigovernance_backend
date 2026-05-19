@@ -13,6 +13,7 @@ from decimal import Decimal
 from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
+from app.config import get_anomaly_high_severity_ratio, get_anomaly_spike_ratio
 from app.models import (
     ConnectorSyncLog,
     DailyOrgSummary,
@@ -212,14 +213,14 @@ def _detect_anomalies(db: Session) -> int:
             if base_val <= 0:
                 continue
             score = observed / base_val
-            if score >= Decimal("1.8"):
+            if score >= get_anomaly_spike_ratio():
                 db.add(
                     UsageAnomaly(
                         org_id=row.org_id,
                         project_id=row.project_id,
                         tool_name=row.tool_name,
                         anomaly_type=anomaly_type,
-                        severity="high" if score >= Decimal("2.5") else "medium",
+                        severity="high" if score >= get_anomaly_high_severity_ratio() else "medium",
                         anomaly_score=score.quantize(Decimal("0.01")),
                         baseline_value=base_val.quantize(Decimal("0.01")),
                         observed_value=observed.quantize(Decimal("0.01")),

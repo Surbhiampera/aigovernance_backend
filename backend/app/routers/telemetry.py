@@ -16,6 +16,11 @@ from app.schemas import (
     TelemetryEventUpdate,
     TraceDetailResponse,
 )
+from app.config import (
+    get_anomaly_baseline_days,
+    get_anomaly_spike_threshold,
+    get_cost_infra_rate_per_ms,
+)
 from app.services.alert_engine import AlertEngine
 from app.services.cost_engine import CostEngine
 from app.services.langfuse_bridge import mirror_event as _langfuse_mirror_event
@@ -906,7 +911,7 @@ def _save_cost_breakdown(db: Session, event_data: TelemetryEventCreate, cost_sum
                 event_id=event_data.event_id,
                 cost_type="infra",
                 component_name="compute",
-                unit_cost=Decimal("0.000080"),
+                unit_cost=get_cost_infra_rate_per_ms().quantize(Decimal("0.000001")),
                 quantity=Decimal(str(max(event_data.latency_ms, 1))),
                 total_cost=cost_summary.infra_cost,
             )
@@ -1038,7 +1043,7 @@ def _detect_event_spike(db: Session, event_data: TelemetryEventCreate) -> tuple[
         .filter(
             TelemetryEvent.org_id == event_data.org_id,
             TelemetryEvent.model_name == (event_data.model_name or event_data.tool_name),
-            TelemetryEvent.created_at >= datetime.combine(today - timedelta(days=7), datetime.min.time()),
+            TelemetryEvent.created_at >= datetime.combine(today - timedelta(days=get_anomaly_baseline_days()), datetime.min.time()),
             TelemetryEvent.created_at < datetime.combine(today, datetime.min.time()),
         )
         .group_by(func.date(TelemetryEvent.created_at))
@@ -1057,7 +1062,7 @@ def _detect_event_spike(db: Session, event_data: TelemetryEventCreate) -> tuple[
     )
     observed = Decimal(str(today_count + 1))
     anomaly_ratio = observed / baseline if baseline > 0 else Decimal("1")
-    abnormal_usage_spike = anomaly_ratio >= Decimal("1.5")
+    abnormal_usage_spike = anomaly_ratio >= get_anomaly_spike_threshold()
     return anomaly_ratio.quantize(Decimal("0.01")), abnormal_usage_spike
 
 
