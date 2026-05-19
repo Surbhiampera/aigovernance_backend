@@ -76,18 +76,46 @@ def _safe_preview(obj: Any, max_chars: int = 500) -> tuple:
 # ── Token / model extraction ──────────────────────────────────────────────────
 
 def _extract_tokens(response: Any) -> tuple:
+    """Best-effort extraction of (prompt_tokens, completion_tokens).
+
+    Supports three response shapes, in order of preference:
+      1. Nested usage object (OpenAI/Anthropic SDK response): response.usage.prompt_tokens
+      2. Nested usage dict:                                   response["usage"]["prompt_tokens"]
+      3. Top-level dict keys (custom FastAPI responses):      response["prompt_tokens"] / ["input_tokens"]
+      4. Top-level object attributes (custom Pydantic models): response.prompt_tokens
+    """
     if response is None:
         return 0, 0
+
+    # 1. Object with .usage attribute (OpenAI/Anthropic native SDK objects)
     usage = getattr(response, "usage", None)
-    if usage is None:
-        if isinstance(response, dict):
-            u = response.get("usage") or {}
-            p = u.get("prompt_tokens") or u.get("input_tokens") or 0
-            c = u.get("completion_tokens") or u.get("output_tokens") or 0
+    if usage is not None:
+        p = getattr(usage, "prompt_tokens", None) or getattr(usage, "input_tokens", None) or 0
+        c = getattr(usage, "completion_tokens", None) or getattr(usage, "output_tokens", None) or 0
+        if p or c:
             return int(p), int(c)
+
+    # 2 & 3. Dict-shaped response
+    if isinstance(response, dict):
+        u = response.get("usage") or {}
+        p = u.get("prompt_tokens") or u.get("input_tokens") or 0
+        c = u.get("completion_tokens") or u.get("output_tokens") or 0
+        if p or c:
+            return int(p), int(c)
+        # Fallback: tokens at top level of the response dict
+        p = response.get("prompt_tokens") or response.get("input_tokens") or 0
+        c = response.get("completion_tokens") or response.get("output_tokens") or 0
+        if p or c:
+            return int(p), int(c)
+        # Sometimes only total_tokens is provided
+        t = response.get("total_tokens") or 0
+        if t:
+            return int(t), 0
         return 0, 0
-    p = getattr(usage, "prompt_tokens", None) or getattr(usage, "input_tokens", None) or 0
-    c = getattr(usage, "completion_tokens", None) or getattr(usage, "output_tokens", None) or 0
+
+    # 4. Object with top-level token attributes (Pydantic / dataclass)
+    p = getattr(response, "prompt_tokens", None) or getattr(response, "input_tokens", None) or 0
+    c = getattr(response, "completion_tokens", None) or getattr(response, "output_tokens", None) or 0
     return int(p), int(c)
 
 

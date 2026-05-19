@@ -34,6 +34,28 @@ from decorator.models import (
 router = APIRouter(tags=["decorator"])
 
 
+def _first_present(payload: dict, *keys: str, default: Any = None) -> Any:
+    for key in keys:
+        value = payload.get(key)
+        if value is not None and value != "":
+            return value
+    return default
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SDK → platform upsert
 # Called by GovernanceDecorator._update_inventory() after every function call.
@@ -367,18 +389,18 @@ def ingest_decorator_telemetry(
     # ── unpack ─────────────────────────────────────────────────────────────
     org_id        = payload.get("org_id") or payload.get("organization") or "unknown"
     project_id    = payload.get("project_id") or payload.get("project_name") or "unknown"
-    tool_name     = payload.get("tool_name") or "unknown"
-    function_name = payload.get("function_name") or "unknown"
+    tool_name     = _first_present(payload, "tool_name", "route", "endpoint", default="unknown")
+    function_name = _first_present(payload, "function_name", "route", "endpoint", default="unknown")
     module_path   = payload.get("module_path")
-    model_name    = payload.get("model_name")
+    model_name    = _first_present(payload, "model_name", "model")
     provider      = payload.get("provider") or "unknown"
     decorator_type= payload.get("decorator_type") or "fastapi_route"
     status        = payload.get("status") or "success"
-    latency_ms    = int(payload.get("latency_ms") or 0)
-    prompt_tokens = int(payload.get("input_tokens") or 0)
-    completion_tokens = int(payload.get("output_tokens") or 0)
-    total_tokens  = int(payload.get("total_tokens") or 0) or (prompt_tokens + completion_tokens)
-    estimated_cost= float(payload.get("estimated_cost") or 0)
+    latency_ms    = _as_int(payload.get("latency_ms") or (_as_float(payload.get("latency_seconds")) * 1000))
+    prompt_tokens = _as_int(_first_present(payload, "input_tokens", "prompt_tokens", "total_input_tokens"))
+    completion_tokens = _as_int(_first_present(payload, "output_tokens", "completion_tokens", "total_output_tokens"))
+    total_tokens  = _as_int(payload.get("total_tokens")) or (prompt_tokens + completion_tokens)
+    estimated_cost= _as_float(_first_present(payload, "estimated_cost", "estimated_cost_usd", "total_cost", "llm_cost"))
     contains_pii  = bool(payload.get("contains_pii", False))
     input_preview = payload.get("input_preview")
     output_preview= payload.get("output_preview")
