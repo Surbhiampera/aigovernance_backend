@@ -64,6 +64,15 @@ _SAFE_ALTERS = [
     "ALTER TABLE telemetry_events ADD COLUMN IF NOT EXISTS output_preview TEXT",
     "ALTER TABLE trace_model_usage ADD COLUMN IF NOT EXISTS function_name VARCHAR(255)",
     "ALTER TABLE trace_model_usage ADD COLUMN IF NOT EXISTS call_sequence INTEGER DEFAULT 0",
+    # request_response_logs — per-call LLM metrics (migration 004)
+    "ALTER TABLE request_response_logs ADD COLUMN IF NOT EXISTS route VARCHAR(255)",
+    "ALTER TABLE request_response_logs ADD COLUMN IF NOT EXISTS model_name VARCHAR(120)",
+    "ALTER TABLE request_response_logs ADD COLUMN IF NOT EXISTS provider VARCHAR(100)",
+    "ALTER TABLE request_response_logs ADD COLUMN IF NOT EXISTS prompt_tokens INTEGER DEFAULT 0",
+    "ALTER TABLE request_response_logs ADD COLUMN IF NOT EXISTS completion_tokens INTEGER DEFAULT 0",
+    "ALTER TABLE request_response_logs ADD COLUMN IF NOT EXISTS total_tokens INTEGER DEFAULT 0",
+    "ALTER TABLE request_response_logs ADD COLUMN IF NOT EXISTS latency_ms INTEGER DEFAULT 0",
+    "ALTER TABLE request_response_logs ADD COLUMN IF NOT EXISTS estimated_cost_usd NUMERIC(14,8) DEFAULT 0",
 ]
 
 _ALL_ROUTERS = [
