@@ -144,7 +144,7 @@ def upsert_tool_inventory(
             inv.error_calls = (inv.error_calls or 0) + 1
         # rolling average latency
         n = inv.total_calls or 1
-        inv.avg_latency_ms = int(((inv.avg_latency_ms or 0) * (n - 1) + latency_ms) / n)
+        inv.avg_latency_ms = int(((inv.avg_latency_ms or 0) * (n - 1) + (latency_ms or 0)) / n)
 
     # ── decorator_registrations upsert ─────────────────────────────────────
     reg = (
@@ -370,12 +370,12 @@ def list_request_response_logs(
                 "route":               r.route,
                 "model_name":          r.model_name,
                 "provider":            r.provider,
-                "prompt_tokens":       r.prompt_tokens or 0,
-                "completion_tokens":   r.completion_tokens or 0,
-                "total_tokens":        r.total_tokens or 0,
-                "latency_ms":          r.latency_ms or 0,
-                "latency_seconds":     round((r.latency_ms or 0) / 1000, 4),
-                "estimated_cost_usd":  float(r.estimated_cost_usd or 0),
+                "prompt_tokens":       r.prompt_tokens,
+                "completion_tokens":   r.completion_tokens,
+                "total_tokens":        r.total_tokens,
+                "latency_ms":          r.latency_ms,
+                "latency_seconds":     round(r.latency_ms / 1000, 4) if r.latency_ms is not None else None,
+                "estimated_cost_usd":  float(r.estimated_cost_usd) if r.estimated_cost_usd is not None else None,
                 "input_preview":       r.input_preview,
                 "output_preview":      r.output_preview,
                 "input_size_bytes":    r.input_size_bytes,
@@ -428,34 +428,54 @@ def ingest_decorator_telemetry(
     db: Session = Depends(get_db),
     _: Any = Depends(require_api_key),
 ):
-    # ── unpack ─────────────────────────────────────────────────────────────
-    org_id        = payload.get("org_id") or payload.get("organization") or "unknown"
-    project_id    = payload.get("project_id") or payload.get("project_name") or "unknown"
-    tool_name     = _first_present(payload, "tool_name", "route", "endpoint", default="unknown")
-    function_name = _first_present(payload, "function_name", "route", "endpoint", default="unknown")
-    module_path   = payload.get("module_path")
-    model_name    = _first_present_deep(payload, "model_name", "model")
-    provider      = payload.get("provider") or "unknown"
-    decorator_type= payload.get("decorator_type") or "fastapi_route"
-    status        = payload.get("status") or "success"
-    latency_ms    = _as_int(
-        _first_present_deep(payload, "latency_ms")
-        or (_as_float(_first_present_deep(payload, "latency_seconds")) * 1000)
-    )
-    prompt_tokens = _as_int(_first_present_deep(payload, "input_tokens", "prompt_tokens", "total_input_tokens"))
-    completion_tokens = _as_int(_first_present_deep(payload, "output_tokens", "completion_tokens", "total_output_tokens"))
-    total_tokens  = _as_int(_first_present_deep(payload, "total_tokens")) or (prompt_tokens + completion_tokens)
-    estimated_cost= _as_float(_first_present_deep(payload, "estimated_cost", "estimated_cost_usd", "total_cost", "llm_cost"))
+    # ── unpack — no hardcoded fallbacks; null stays null ───────────────────
+    org_id        = payload.get("org_id") or payload.get("organization") or None
+    project_id    = payload.get("project_id") or payload.get("project_name") or None
+    tool_name     = _first_present(payload, "tool_name", "route", "endpoint") or None
+    function_name = _first_present(payload, "function_name") or payload.get("route") or None
+    route         = payload.get("route") or None
+    module_path   = payload.get("module_path") or None
+    model_name    = _first_present_deep(payload, "model_name", "model") or None
+    provider      = payload.get("provider") or None
+    decorator_type= payload.get("decorator_type") or None
+    status        = payload.get("status") or None
+    metadata      = payload.get("metadata") or {}
+    execution_env = metadata.get("execution_env") or payload.get("execution_env") or None
+    logger_version= payload.get("logger_version") or None
+    http_method   = payload.get("http_method") or metadata.get("http_method")
+    http_path     = payload.get("http_path") or metadata.get("http_path")
     contains_pii  = bool(payload.get("contains_pii", False))
     input_preview = payload.get("input_preview")
     output_preview= payload.get("output_preview")
     input_size_b  = int(float(payload.get("input_data_size_mb") or 0) * 1024 * 1024)
     output_size_b = int(float(payload.get("output_data_size_mb") or 0) * 1024 * 1024)
-    metadata      = payload.get("metadata") or {}
-    execution_env = metadata.get("execution_env") or payload.get("execution_env") or "production"
-    logger_version= payload.get("logger_version") or "unknown"
-    http_method   = payload.get("http_method") or metadata.get("http_method")
-    http_path     = payload.get("http_path") or metadata.get("http_path")
+
+    # Tokens — read exactly what the decorator logged; None if not provided
+    _raw_prompt     = _first_present_deep(payload, "input_tokens", "prompt_tokens", "total_input_tokens")
+    _raw_completion = _first_present_deep(payload, "output_tokens", "completion_tokens", "total_output_tokens")
+    _raw_total      = _first_present_deep(payload, "total_tokens")
+    prompt_tokens     = _as_int(_raw_prompt)     if _raw_prompt     is not None else None
+    completion_tokens = _as_int(_raw_completion) if _raw_completion is not None else None
+    if _raw_total is not None:
+        total_tokens = _as_int(_raw_total)
+    elif prompt_tokens is not None and completion_tokens is not None:
+        total_tokens = prompt_tokens + completion_tokens
+    else:
+        total_tokens = None
+
+    # Latency — prefer latency_ms, fall back to latency_seconds × 1000
+    _raw_latency_ms  = _first_present_deep(payload, "latency_ms")
+    _raw_latency_sec = _first_present_deep(payload, "latency_seconds")
+    if _raw_latency_ms is not None:
+        latency_ms = _as_int(_raw_latency_ms)
+    elif _raw_latency_sec is not None:
+        latency_ms = int(_as_float(_raw_latency_sec) * 1000)
+    else:
+        latency_ms = None
+
+    # Cost — read exactly what the decorator logged; None if not provided
+    _raw_cost = _first_present_deep(payload, "estimated_cost_usd", "estimated_cost", "total_cost", "llm_cost")
+    estimated_cost = _as_float(_raw_cost) if _raw_cost is not None else None
 
     # ── 1. tool_api_inventory ──────────────────────────────────────────────
     inv = (
@@ -485,7 +505,7 @@ def ingest_decorator_telemetry(
         else:
             inv.error_calls = (inv.error_calls or 0) + 1
         n = inv.total_calls or 1
-        inv.avg_latency_ms = int(((inv.avg_latency_ms or 0) * (n - 1) + latency_ms) / n)
+        inv.avg_latency_ms = int(((inv.avg_latency_ms or 0) * (n - 1) + (latency_ms or 0)) / n)
 
     # ── 2. decorator_registrations ─────────────────────────────────────────
     reg = (
@@ -549,15 +569,13 @@ def ingest_decorator_telemetry(
             else:
                 usage.error_count = (usage.error_count or 0) + 1
 
-    # ── 4. request_response_logs ───────────────────────────────────────────
-    http_context = None
-    if http_method and http_path:
-        http_context = f"{http_method} {http_path}"
+    # ── 4. request_response_logs — store exactly what the decorator sent ───
+    http_context = f"{http_method} {http_path}" if (http_method and http_path) else None
     log = RequestResponseLog(
         function_name=function_name,
-        route=tool_name,
+        route=route or tool_name,
         model_name=model_name,
-        provider=provider if provider != "unknown" else None,
+        provider=provider,
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         total_tokens=total_tokens,
@@ -575,29 +593,26 @@ def ingest_decorator_telemetry(
     db.add(log)
 
     # ── 5. full governance pipeline ────────────────────────────────────────
-    # Forward into _ingest_event so every decorator call also writes to
-    # telemetry_events, cost_breakdown, data_security_logs, alerts, and
-    # daily_org_summary — powering Dashboard, Cost, Alerts & Security, etc.
     try:
         input_mb  = Decimal(str(float(payload.get("input_data_size_mb")  or 0)))
         output_mb = Decimal(str(float(payload.get("output_data_size_mb") or 0)))
-        # Use SDK-supplied cost only when no model_name is present (so the
-        # CostEngine can't compute from model_pricing table).
-        precomputed = Decimal(str(estimated_cost)) if (estimated_cost > 0 and not model_name) else None
+        # Always use the decorator-supplied cost as precomputed so unknown
+        # models (not in model_pricing) still show the correct value on the UI.
+        precomputed = Decimal(str(estimated_cost)) if estimated_cost else None
 
         tec = TelemetryEventCreate(
             event_id=f"dec-{uuid.uuid4().hex}",
-            org_id=org_id,
+            org_id=org_id or "default",
             project_id=project_id,
-            tool_name=tool_name,
-            provider=provider if provider != "unknown" else None,
+            tool_name=tool_name or route or "unknown",
+            provider=provider,
             model_name=model_name,
-            service_type=payload.get("service_type") or decorator_type,
+            service_type=payload.get("service_type") or route or decorator_type,
             execution_type=decorator_type,
-            status=status,
-            latency_ms=latency_ms,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
+            status=status or "success",
+            latency_ms=latency_ms or 0,
+            prompt_tokens=prompt_tokens or 0,
+            completion_tokens=completion_tokens or 0,
             contains_pii=contains_pii,
             pii_type=payload.get("pii_type"),
             input_data_size_mb=input_mb,
@@ -607,6 +622,7 @@ def ingest_decorator_telemetry(
             precomputed_llm_cost=precomputed,
             metadata_json={
                 "function_name": function_name,
+                "route": route,
                 "module_path": module_path,
                 "decorator_type": decorator_type,
                 "execution_env": execution_env,
@@ -616,7 +632,7 @@ def ingest_decorator_telemetry(
             tags=payload.get("tags") or [],
         )
         telemetry = _ingest_event(db, tec)
-        log.event_id = telemetry.event_id  # link audit log → telemetry event
+        log.event_id = telemetry.event_id
     except Exception:
         pass  # never let governance pipeline failure break decorator ingest
 
