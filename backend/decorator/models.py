@@ -62,7 +62,7 @@ class ProjectModelUsage(Base):
 class ToolApiInventory(Base):
     __tablename__ = "tool_api_inventory"
     __table_args__ = (
-        UniqueConstraint("org_id", "tool_name", "function_name"),
+        UniqueConstraint("org_id", "project_id", "tool_name", "function_name"),
         {"extend_existing": True},
     )
 

@@ -118,7 +118,7 @@ def upsert_tool_inventory(
     # ── tool_api_inventory upsert ──────────────────────────────────────────
     inv = (
         db.query(ToolApiInventory)
-        .filter_by(org_id=org_id, tool_name=tool_name, function_name=function_name)
+        .filter_by(org_id=org_id, project_id=payload.get("project_id"), tool_name=tool_name, function_name=function_name)
         .first()
     )
     if inv is None:
@@ -480,7 +480,7 @@ def ingest_decorator_telemetry(
     # ── 1. tool_api_inventory ──────────────────────────────────────────────
     inv = (
         db.query(ToolApiInventory)
-        .filter_by(org_id=org_id, tool_name=tool_name, function_name=function_name)
+        .filter_by(org_id=org_id, project_id=project_id, tool_name=tool_name, function_name=function_name)
         .first()
     )
     if inv is None:
@@ -557,13 +557,18 @@ def ingest_decorator_telemetry(
             )
             db.add(usage)
         else:
-            usage.call_count              = (usage.call_count or 0) + 1
-            usage.total_prompt_tokens     = (usage.total_prompt_tokens or 0) + prompt_tokens
-            usage.total_completion_tokens = (usage.total_completion_tokens or 0) + completion_tokens
-            usage.total_tokens            = (usage.total_tokens or 0) + total_tokens
-            usage.total_cost              = float(usage.total_cost or 0) + estimated_cost
-            n = usage.call_count or 1
-            usage.avg_latency_ms = int(((usage.avg_latency_ms or 0) * (n - 1) + latency_ms) / n)
+            usage.call_count = (usage.call_count or 0) + 1
+            if prompt_tokens is not None:
+                usage.total_prompt_tokens = (usage.total_prompt_tokens or 0) + prompt_tokens
+            if completion_tokens is not None:
+                usage.total_completion_tokens = (usage.total_completion_tokens or 0) + completion_tokens
+            if total_tokens is not None:
+                usage.total_tokens = (usage.total_tokens or 0) + total_tokens
+            if estimated_cost is not None:
+                usage.total_cost = float(usage.total_cost or 0) + estimated_cost
+            if latency_ms is not None:
+                n = usage.call_count or 1
+                usage.avg_latency_ms = int(((usage.avg_latency_ms or 0) * (n - 1) + latency_ms) / n)
             if status == "success":
                 usage.success_count = (usage.success_count or 0) + 1
             else:
