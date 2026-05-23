@@ -22,6 +22,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_db, require_api_key
+from app.models import TelemetryEvent
 from app.routers.telemetry import _ingest_event
 from app.schemas import TelemetryEventCreate
 from decorator.models import (
@@ -350,14 +351,25 @@ def list_request_response_logs(
     function_name: Optional[str]  = Query(None),
     pii_detected:  Optional[bool] = Query(None),
     event_id:      Optional[str]  = Query(None),
+    org_id:        Optional[str]  = Query(None),
+    project_id:    Optional[str]  = Query(None),
     limit:         int            = Query(50, le=500),
     offset:        int            = Query(0),
     db: Session = Depends(get_db),
 ):
-    q = db.query(RequestResponseLog)
-    if function_name: q = q.filter(RequestResponseLog.function_name == function_name)
+    q = (
+        db.query(
+            RequestResponseLog,
+            TelemetryEvent.org_id.label("t_org_id"),
+            TelemetryEvent.project_id.label("t_project_id"),
+        )
+        .outerjoin(TelemetryEvent, RequestResponseLog.event_id == TelemetryEvent.event_id)
+    )
+    if function_name:           q = q.filter(RequestResponseLog.function_name == function_name)
     if pii_detected is not None: q = q.filter(RequestResponseLog.pii_detected == pii_detected)
-    if event_id:      q = q.filter(RequestResponseLog.event_id == event_id)
+    if event_id:                q = q.filter(RequestResponseLog.event_id == event_id)
+    if org_id:                  q = q.filter(TelemetryEvent.org_id == org_id)
+    if project_id:              q = q.filter(TelemetryEvent.project_id == project_id)
     total = q.count()
     rows  = q.order_by(RequestResponseLog.created_at.desc()).offset(offset).limit(limit).all()
     return {
@@ -366,6 +378,8 @@ def list_request_response_logs(
             {
                 "id":                  r.id,
                 "event_id":            r.event_id,
+                "org_id":              t_org_id,
+                "project_id":          t_project_id,
                 "function_name":       r.function_name,
                 "route":               r.route,
                 "model_name":          r.model_name,
@@ -386,7 +400,7 @@ def list_request_response_logs(
                 "pii_fields":          r.pii_fields,
                 "created_at":          r.created_at,
             }
-            for r in rows
+            for r, t_org_id, t_project_id in rows
         ],
     }
 
