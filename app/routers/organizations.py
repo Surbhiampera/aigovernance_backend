@@ -5,7 +5,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 from app.core.deps import get_db
 from app.models import ApiKey, Organization, Project, User
-from app.schemas import OrganizationCreate, OrganizationResponse
+from app.schemas import OrganizationCreate, OrganizationUpdate, OrganizationResponse
 
 router = APIRouter(prefix="/organizations", tags=["organizations"])
 
@@ -43,7 +43,7 @@ def get_organization(org_id: str, db: Session = Depends(get_db)):
 
 @router.post("/", response_model=OrganizationResponse)
 def create_organization(data: OrganizationCreate, db: Session = Depends(get_db)):
-    org = Organization(id=data.id, org_name=data.org_name, plan_type=data.plan_type, budget_limit=data.budget_limit)
+    org = Organization(id=data.id, org_name=data.org_name, plan_type=data.plan_type)
     db.add(org)
     db.commit()
     db.refresh(org)
@@ -51,7 +51,7 @@ def create_organization(data: OrganizationCreate, db: Session = Depends(get_db))
 
 
 @router.put("/{org_id}", response_model=OrganizationResponse)
-def update_organization(org_id: str, data: OrganizationCreate, db: Session = Depends(get_db)):
+def update_organization(org_id: str, data: OrganizationUpdate, db: Session = Depends(get_db)):
     org = db.query(Organization).filter(Organization.id == org_id).first()
     if not org:
         raise HTTPException(status_code=404, detail="Organization not found")

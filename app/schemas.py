@@ -430,6 +430,11 @@ class OrganizationCreate(BaseModel):
     id: str
     org_name: str
     plan_type: Optional[str] = None
+
+
+class OrganizationUpdate(BaseModel):
+    org_name: str
+    plan_type: Optional[str] = None
     budget_limit: Optional[Decimal] = None
 
 
