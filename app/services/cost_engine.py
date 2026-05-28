@@ -81,9 +81,6 @@ class CostEngine:
                     if total_tokens > 0:
                         llm_cost = (Decimal(str(total_tokens)) / Decimal("1000")) * get_cost_default_rate_per_1k()
 
-        if infra_cost == 0 and event_data.latency_ms > 0:
-            infra_cost = Decimal(str(event_data.latency_ms)) * get_cost_infra_rate_per_ms()
-
         for ext in event_data.external_tools:
             external_cost += Decimal(str(ext.cost))
 
