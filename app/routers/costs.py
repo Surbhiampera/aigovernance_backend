@@ -514,6 +514,26 @@ def cost_by_tool(
         .group_by(TelemetryEvent.model_name)
     )
     rows = _scope(rows, TelemetryEvent, org_id, project_id, db=db)
+
+    # Build tool → distinct project_ids map from the same scope
+    proj_q = (
+        db.query(
+            TelemetryEvent.model_name.label("tool_name"),
+            TelemetryEvent.project_id,
+        )
+        .filter(
+            TelemetryEvent.model_name.isnot(None),
+            TelemetryEvent.model_name != "",
+            TelemetryEvent.project_id.isnot(None),
+            TelemetryEvent.project_id != "",
+        )
+        .distinct()
+    )
+    proj_q = _scope(proj_q, TelemetryEvent, org_id, project_id, db=db)
+    tool_projects: dict = {}
+    for pr in proj_q.all():
+        tool_projects.setdefault(pr.tool_name, []).append(pr.project_id)
+
     results = []
     for r in rows.all():
         computed = _pricing(r.tool_name or "", int(r.input_tokens or 0), int(r.output_tokens or 0))
@@ -527,8 +547,12 @@ def cost_by_tool(
             "total_tokens": int(r.total_tokens or 0),
             "input_token_cost": computed["input_token_cost"],
             "output_token_cost": computed["output_token_cost"],
+            "llm_cost": computed["total_cost"],
+            "infra_cost": 0.0,
+            "external_cost": 0.0,
             "total_token_cost": computed["total_cost"],
             "total_cost": computed["total_cost"],
+            "project_ids": sorted(tool_projects.get(r.tool_name, [])),
         })
     results.sort(key=lambda x: x["total_cost"], reverse=True)
     return results
@@ -707,22 +731,36 @@ def cost_breakdown_summary(
     transparent — no hidden multipliers, no opaque adjustments.
     """
     q = db.query(
-        func.sum(TelemetryEvent.llm_cost).label("llm_cost"),
         func.sum(TelemetryEvent.infra_cost).label("infra_cost"),
         func.sum(TelemetryEvent.external_cost).label("external_cost"),
-        func.sum(TelemetryEvent.total_cost).label("total_cost"),
         func.count(TelemetryEvent.id).label("total_events"),
         func.sum(TelemetryEvent.total_tokens).label("total_tokens"),
     )
     q = _scope(q, TelemetryEvent, org_id, project_id, db=db)
     row = q.first()
 
-    llm = float(row.llm_cost or 0) if row else 0.0
-    infra = float(row.infra_cost or 0) if row else 0.0
+    infra = 0.0
     external = float(row.external_cost or 0) if row else 0.0
-    total = float(row.total_cost or 0) if row else 0.0
     events = int(row.total_events or 0) if row else 0
     tokens = int(row.total_tokens or 0) if row else 0
+
+    # LLM cost computed dynamically via the pricing service (never from DB)
+    model_q = (
+        db.query(
+            TelemetryEvent.model_name,
+            func.sum(TelemetryEvent.prompt_tokens).label("input_tokens"),
+            func.sum(TelemetryEvent.completion_tokens).label("output_tokens"),
+        )
+        .filter(TelemetryEvent.model_name.isnot(None), TelemetryEvent.model_name != "")
+        .group_by(TelemetryEvent.model_name)
+    )
+    model_q = _scope(model_q, TelemetryEvent, org_id, project_id, db=db)
+    llm = 0.0
+    for mt in model_q.all():
+        c = _pricing(mt.model_name, int(mt.input_tokens or 0), int(mt.output_tokens or 0))
+        llm = round(llm + c["total_cost"], 6)
+
+    total = round(llm + infra + external, 6)
     pct = lambda v: round((v / total * 100), 2) if total > 0 else 0.0
 
     return {
@@ -731,13 +769,13 @@ def cost_breakdown_summary(
                 "name": "llm_cost",
                 "amount": round(llm, 6),
                 "percent": pct(llm),
-                "formula": "(prompt_tokens × input_rate + completion_tokens × output_rate) ÷ 1000",
+                "formula": "(prompt_tokens × input_rate + completion_tokens × output_rate) ÷ 1,000,000",
             },
             {
                 "name": "infra_cost",
-                "amount": round(infra, 6),
-                "percent": pct(infra),
-                "formula": "latency_ms × $0.00008",
+                "amount": 0.0,
+                "percent": 0.0,
+                "formula": "not calculated",
             },
             {
                 "name": "external_cost",
@@ -746,12 +784,12 @@ def cost_breakdown_summary(
                 "formula": "Σ external_tools[i].cost (passed through, no mark-up)",
             },
         ],
-        "total_cost": round(total, 6),
+        "total_cost": total,
         "total_events": events,
         "total_tokens": tokens,
         "avg_cost_per_event": round(total / events, 6) if events else 0.0,
         "avg_cost_per_1k_tokens": round((total / tokens) * 1000, 6) if tokens else 0.0,
-        "formula": "total_cost = llm_cost + infra_cost + external_cost",
+        "formula": "total_cost = llm_cost + external_cost",
     }
 
 
@@ -817,6 +855,9 @@ def cost_per_tool_daily(
             "total_tokens": int(r.total_tokens or 0),
             "input_token_cost": computed["input_token_cost"],
             "output_token_cost": computed["output_token_cost"],
+            "llm_cost": computed["total_cost"],
+            "infra_cost": 0.0,
+            "external_cost": 0.0,
             "total_token_cost": computed["total_cost"],
             "total_cost": computed["total_cost"],
             "total_events": int(r.total_events or 0),
@@ -863,17 +904,27 @@ def spend_cap_status(
         if limit <= 0:
             continue
 
-        spent_q = db.query(func.coalesce(func.sum(DailyOrgSummary.total_cost), 0)).filter(
-            DailyOrgSummary.org_id == b.org_id
+        # Recompute spend dynamically via the pricing service — never trust the stored total_cost
+        spent_model_q = (
+            db.query(
+                DailyOrgSummary.tool_name,
+                func.coalesce(func.sum(DailyOrgSummary.total_prompt_tokens), 0).label("input_tokens"),
+                func.coalesce(func.sum(DailyOrgSummary.total_completion_tokens), 0).label("output_tokens"),
+            )
+            .filter(DailyOrgSummary.org_id == b.org_id)
+            .group_by(DailyOrgSummary.tool_name)
         )
         if b.project_id:
-            spent_q = spent_q.filter(DailyOrgSummary.project_id == b.project_id)
+            spent_model_q = spent_model_q.filter(DailyOrgSummary.project_id == b.project_id)
         if b.budget_type == "daily":
-            spent_q = spent_q.filter(DailyOrgSummary.date == today)
+            spent_model_q = spent_model_q.filter(DailyOrgSummary.date == today)
         else:
-            spent_q = spent_q.filter(DailyOrgSummary.date >= month_start)
+            spent_model_q = spent_model_q.filter(DailyOrgSummary.date >= month_start)
 
-        spent = float(spent_q.scalar() or 0)
+        spent = 0.0
+        for sr in spent_model_q.all():
+            c = _pricing(sr.tool_name or "", int(sr.input_tokens or 0), int(sr.output_tokens or 0))
+            spent = round(spent + c["total_cost"], 6)
         pct_used = round(spent / limit * 100, 1) if limit > 0 else 0.0
         threshold_pct = int(b.alert_threshold_percent or 80)
 

@@ -352,26 +352,45 @@ def get_quota_status(
             return q.filter(DailyOrgSummary.project_id == project_id)
         return q
 
-    month_q = _filter_scope(
+    # Compute costs dynamically via pricing service — no raw DB cost fields used
+    month_model_q = _filter_scope(
         db.query(
-            func.coalesce(func.sum(DailyOrgSummary.total_cost), 0).label("cost"),
+            DailyOrgSummary.tool_name,
+            func.coalesce(func.sum(DailyOrgSummary.total_prompt_tokens), 0).label("input_tokens"),
+            func.coalesce(func.sum(DailyOrgSummary.total_completion_tokens), 0).label("output_tokens"),
             func.coalesce(func.sum(DailyOrgSummary.total_tokens), 0).label("tokens"),
             func.coalesce(func.sum(DailyOrgSummary.total_events), 0).label("events"),
-        ).filter(
+        )
+        .filter(
             DailyOrgSummary.org_id == org_id,
             DailyOrgSummary.date >= month_start,
             DailyOrgSummary.date <= today,
         )
+        .group_by(DailyOrgSummary.tool_name)
     )
-    month = month_q.first()
+    month_cost = 0.0
+    month_tokens = 0
+    for r in month_model_q.all():
+        c = calculate_token_cost(r.tool_name or "", int(r.input_tokens or 0), int(r.output_tokens or 0))
+        month_cost = round(month_cost + c["total_cost"], 6)
+        month_tokens += int(r.tokens or 0)
 
-    today_q = _filter_scope(
+    today_model_q = _filter_scope(
         db.query(
-            func.coalesce(func.sum(DailyOrgSummary.total_cost), 0).label("cost"),
+            DailyOrgSummary.tool_name,
+            func.coalesce(func.sum(DailyOrgSummary.total_prompt_tokens), 0).label("input_tokens"),
+            func.coalesce(func.sum(DailyOrgSummary.total_completion_tokens), 0).label("output_tokens"),
             func.coalesce(func.sum(DailyOrgSummary.total_tokens), 0).label("tokens"),
-        ).filter(DailyOrgSummary.org_id == org_id, DailyOrgSummary.date == today)
+        )
+        .filter(DailyOrgSummary.org_id == org_id, DailyOrgSummary.date == today)
+        .group_by(DailyOrgSummary.tool_name)
     )
-    today_row = today_q.first()
+    today_cost = 0.0
+    today_tokens = 0
+    for r in today_model_q.all():
+        c = calculate_token_cost(r.tool_name or "", int(r.input_tokens or 0), int(r.output_tokens or 0))
+        today_cost = round(today_cost + c["total_cost"], 6)
+        today_tokens += int(r.tokens or 0)
 
     budget_q = db.query(Budget).filter(Budget.org_id == org_id)
     if project_id:
@@ -381,11 +400,6 @@ def get_quota_status(
     budget = budget_q.first()
 
     rate_limit = db.query(RateLimit).filter(RateLimit.org_id == org_id).first()
-
-    month_cost = float(month.cost or 0)
-    month_tokens = int(month.tokens or 0)
-    today_cost = float(today_row.cost or 0)
-    today_tokens = int(today_row.tokens or 0)
 
     limit_amount = float(budget.limit_amount or 0) if budget else None
     threshold_pct = int(budget.alert_threshold_percent or 80) if budget else 80

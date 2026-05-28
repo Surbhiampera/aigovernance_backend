@@ -223,13 +223,13 @@ def super_admin_aggregate(
     result = []
     for row in rows:
         budget = budgets.get(row.org_id)
-        total_cost = round(float(row.total_cost or 0), 4)
-        budget_limit = round(float(budget.limit_amount), 2) if budget else None
         _tc = calculate_token_cost(
             row.tool_name or "",
             int(row.prompt_tokens or 0),
             int(row.completion_tokens or 0),
         )
+        dynamic_cost = _tc["total_cost"]
+        budget_limit = round(float(budget.limit_amount), 2) if budget else None
         result.append({
             "org_id": row.org_id,
             "tool_name": row.tool_name or "-",
@@ -239,11 +239,11 @@ def super_admin_aggregate(
             "completion_tokens": int(row.completion_tokens or 0),
             "input_token_cost": _tc["input_token_cost"],
             "output_token_cost": _tc["output_token_cost"],
-            "total_token_cost": _tc["total_cost"],
-            "total_cost": total_cost,
+            "total_token_cost": dynamic_cost,
+            "total_cost": dynamic_cost,
             "avg_risk_score": round(float(row.avg_risk_score or 0), 2),
             "budget_limit": budget_limit,
-            "remaining_budget": round(budget_limit - total_cost, 2) if budget_limit is not None else None,
+            "remaining_budget": round(budget_limit - dynamic_cost, 2) if budget_limit is not None else None,
         })
     return result
 
@@ -545,13 +545,21 @@ def super_admin_insights(
     if org_id:
         budget_q = budget_q.filter(Budget.org_id == org_id)
 
-    org_cost_q = db.query(
+    org_model_cost_q = db.query(
         TelemetryEvent.org_id,
-        func.sum(TelemetryEvent.total_cost).label("total_cost"),
-    ).group_by(TelemetryEvent.org_id)
+        TelemetryEvent.model_name,
+        func.sum(TelemetryEvent.prompt_tokens).label("input_tokens"),
+        func.sum(TelemetryEvent.completion_tokens).label("output_tokens"),
+    ).filter(
+        TelemetryEvent.model_name.isnot(None),
+        TelemetryEvent.model_name != "",
+    ).group_by(TelemetryEvent.org_id, TelemetryEvent.model_name)
     if org_id:
-        org_cost_q = org_cost_q.filter(TelemetryEvent.org_id == org_id)
-    org_cost_map = {r.org_id: float(r.total_cost or 0) for r in org_cost_q.all()}
+        org_model_cost_q = org_model_cost_q.filter(TelemetryEvent.org_id == org_id)
+    org_cost_map: dict = {}
+    for r in org_model_cost_q.all():
+        c = calculate_token_cost(r.model_name, int(r.input_tokens or 0), int(r.output_tokens or 0))
+        org_cost_map[r.org_id] = round(org_cost_map.get(r.org_id, 0.0) + c["total_cost"], 6)
 
     budgets_list = budget_q.all()
     budget_org_ids = {b.org_id for b in budgets_list if b.org_id}

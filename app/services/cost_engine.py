@@ -15,7 +15,7 @@ from app.services.ai_model_pricing import MODEL_PRICING
 class CostEngine:
     def calculate(self, event_data: TelemetryEventCreate, db: Session) -> CostSummary:
         external_cost = Decimal("0")
-        infra_cost = Decimal(str(event_data.infra_cost or 0))
+        infra_cost = Decimal("0")
 
         input_tokens = event_data.prompt_tokens or 0
         output_tokens = event_data.completion_tokens or 0

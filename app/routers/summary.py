@@ -39,7 +39,7 @@ def _build_daily_response(r: DailyOrgSummary) -> DailySummaryResponse:
         total_events=r.total_events or 0,
         total_cost=total_cost,
         llm_cost=total_cost,
-        infra_cost=Decimal(str(r.infra_cost or 0)),
+        infra_cost=Decimal("0"),
         external_cost=Decimal(str(r.external_cost or 0)),
         input_tokens=r.total_prompt_tokens or 0,
         output_tokens=r.total_completion_tokens or 0,
@@ -76,7 +76,7 @@ def _build_monthly_response(r: MonthlyOrgSummary) -> MonthlySummaryResponse:
         total_events=r.total_events or 0,
         total_cost=total_cost,
         llm_cost=total_cost,
-        infra_cost=Decimal(str(r.infra_cost or 0)),
+        infra_cost=Decimal("0"),
         external_cost=Decimal(str(r.external_cost or 0)),
         input_tokens=r.total_prompt_tokens or 0,
         output_tokens=r.total_completion_tokens or 0,
@@ -317,10 +317,12 @@ def get_governance_overview(
         .all()
     )
 
+    # Use pricing-service-computed values from tool_rollup_responses (already built above)
+    # llm_cost in DailySummaryResponse is set to the dynamic token cost, never the raw DB value
     cost_by_type = {
-        "llm": sum((Decimal(str(row.llm_cost or 0)) for row in today_rows), Decimal("0")),
-        "infra": sum((Decimal(str(row.infra_cost or 0)) for row in today_rows), Decimal("0")),
-        "external": sum((Decimal(str(row.external_cost or 0)) for row in today_rows), Decimal("0")),
+        "llm": sum((t.llm_cost for t in tool_rollup_responses), Decimal("0")),
+        "infra": sum((t.infra_cost for t in tool_rollup_responses), Decimal("0")),
+        "external": sum((t.external_cost for t in tool_rollup_responses), Decimal("0")),
     }
 
     health = _build_health_metrics(db, org_id, cutoff_dt)
