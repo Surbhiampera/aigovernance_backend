@@ -22,6 +22,7 @@ from app.config import (
     get_anomaly_spike_threshold,
     get_cost_infra_rate_per_ms,
 )
+from app.services.ai_model_pricing import calculate_token_cost
 from app.services.alert_engine import AlertEngine
 from app.services.cost_engine import CostEngine
 from app.services.langfuse_bridge import mirror_event as _langfuse_mirror_event
@@ -148,8 +149,14 @@ def super_admin_logs(
     org_name_map = {o.id: o.org_name for o in db.query(Organization).filter(Organization.id.in_(org_ids)).all()} if org_ids else {}
     project_name_map = {p.id: p.project_name for p in db.query(Project).filter(Project.id.in_(project_ids)).all()} if project_ids else {}
 
-    return [
-        {
+    result = []
+    for row in rows:
+        _tc = calculate_token_cost(
+            row.model_name or "",
+            row.prompt_tokens or 0,
+            row.completion_tokens or 0,
+        )
+        result.append({
             "event_id": row.event_id,
             "created_at": row.created_at,
             "org_id": row.org_id,
@@ -162,16 +169,20 @@ def super_admin_logs(
             "service_type": row.service_type,
             "status": row.status,
             "latency_ms": row.latency_ms,
-            "total_tokens": row.total_tokens,
-            "total_cost": float(row.total_cost or 0),
+            "input_tokens": row.prompt_tokens or 0,
+            "output_tokens": row.completion_tokens or 0,
+            "total_tokens": row.total_tokens or 0,
+            "input_token_cost": _tc["input_token_cost"],
+            "output_token_cost": _tc["output_token_cost"],
+            "total_token_cost": _tc["total_cost"],
+            "total_cost": _tc["total_cost"],
             "risk_score": float(row.risk_score or 0),
             "misuse_detected": bool(row.misuse_detected),
             "abnormal_usage_spike": bool(row.abnormal_usage_spike),
             "pii_detected": bool(security_map[row.event_id].pii_detected) if row.event_id in security_map else False,
             "pii_type": security_map[row.event_id].pii_type if row.event_id in security_map else None,
-        }
-        for row in rows
-    ]
+        })
+    return result
 
 
 @router.get("/admin/aggregate")
@@ -214,6 +225,11 @@ def super_admin_aggregate(
         budget = budgets.get(row.org_id)
         total_cost = round(float(row.total_cost or 0), 4)
         budget_limit = round(float(budget.limit_amount), 2) if budget else None
+        _tc = calculate_token_cost(
+            row.tool_name or "",
+            int(row.prompt_tokens or 0),
+            int(row.completion_tokens or 0),
+        )
         result.append({
             "org_id": row.org_id,
             "tool_name": row.tool_name or "-",
@@ -221,6 +237,9 @@ def super_admin_aggregate(
             "total_tokens": int(row.total_tokens or 0),
             "prompt_tokens": int(row.prompt_tokens or 0),
             "completion_tokens": int(row.completion_tokens or 0),
+            "input_token_cost": _tc["input_token_cost"],
+            "output_token_cost": _tc["output_token_cost"],
+            "total_token_cost": _tc["total_cost"],
             "total_cost": total_cost,
             "avg_risk_score": round(float(row.avg_risk_score or 0), 2),
             "budget_limit": budget_limit,
@@ -240,13 +259,14 @@ def super_admin_registered_tools(
     from `telemetry_events` plus connector metadata so the Super Admin
     can audit the full integrated AI surface area, not only injected events.
     """
-    # Per-tool usage stats from telemetry (optionally scoped by org)
+    # Per-tool usage stats from telemetry — costs computed via pricing service
     usage_query = db.query(
         TelemetryEvent.model_name.label("tool_name"),
         TelemetryEvent.org_id.label("org_id"),
         func.count(TelemetryEvent.id).label("total_events"),
+        func.sum(TelemetryEvent.prompt_tokens).label("input_tokens"),
+        func.sum(TelemetryEvent.completion_tokens).label("output_tokens"),
         func.sum(TelemetryEvent.total_tokens).label("total_tokens"),
-        func.sum(TelemetryEvent.total_cost).label("total_cost"),
         func.max(TelemetryEvent.created_at).label("last_event_at"),
     ).group_by(TelemetryEvent.model_name, TelemetryEvent.org_id)
     if org_id:
@@ -255,11 +275,12 @@ def super_admin_registered_tools(
     for row in usage_query.all():
         if not row.tool_name:
             continue
+        _tc = calculate_token_cost(row.tool_name, int(row.input_tokens or 0), int(row.output_tokens or 0))
         usage_by_tool.setdefault(row.tool_name, []).append({
             "org_id": row.org_id,
             "total_events": int(row.total_events or 0),
             "total_tokens": int(row.total_tokens or 0),
-            "total_cost": float(row.total_cost or 0),
+            "total_cost": _tc["total_cost"],
             "last_event_at": row.last_event_at,
         })
 
@@ -379,21 +400,28 @@ def super_admin_insights(
     if org_id:
         tool_cost_q = tool_cost_q.filter(TelemetryEvent.org_id == org_id)
 
-    tool_costs = [
-        {
+    tool_costs = []
+    for r in tool_cost_q.all():
+        _tc = calculate_token_cost(
+            r.tool_name or "",
+            int(r.prompt_tokens or 0),
+            int(r.completion_tokens or 0),
+        )
+        tool_costs.append({
             "tool_name": r.tool_name,
             "provider": r.provider or "—",
             "total_events": int(r.total_events or 0),
             "prompt_tokens": int(r.prompt_tokens or 0),
             "completion_tokens": int(r.completion_tokens or 0),
             "total_tokens": int(r.total_tokens or 0),
+            "input_token_cost": _tc["input_token_cost"],
+            "output_token_cost": _tc["output_token_cost"],
+            "total_token_cost": _tc["total_cost"],
             "llm_cost": round(float(r.llm_cost or 0), 4),
             "infra_cost": round(float(r.infra_cost or 0), 4),
             "external_cost": round(float(r.external_cost or 0), 4),
             "total_cost": round(float(r.total_cost or 0), 4),
-        }
-        for r in tool_cost_q.all()
-    ]
+        })
 
     # ── Model usage vs token limits ───────────────────────────────────────────
     rate_limits = {rl.org_id: rl for rl in db.query(RateLimit).all()}
@@ -723,6 +751,7 @@ def admin_pii_detail(event_id: str, db: Session = Depends(get_db)):
     if not root_causes:
         root_causes.append("No specific high-risk indicators beyond PII pattern match")
 
+    _tc = calculate_token_cost(event.model_name or "", event.prompt_tokens or 0, event.completion_tokens or 0)
     return {
         "event_id": event.event_id,
         "created_at": event.created_at.isoformat() if event.created_at else None,
@@ -739,7 +768,10 @@ def admin_pii_detail(event_id: str, db: Session = Depends(get_db)):
         "prompt_tokens": int(event.prompt_tokens or 0),
         "completion_tokens": int(event.completion_tokens or 0),
         "total_tokens": total_tokens,
-        "total_cost": float(event.total_cost or 0),
+        "input_token_cost": _tc["input_token_cost"],
+        "output_token_cost": _tc["output_token_cost"],
+        "total_token_cost": _tc["total_cost"],
+        "total_cost": _tc["total_cost"],
         "latency_ms": int(event.latency_ms or 0),
         "data_in_mb": float(event.input_data_size_mb or 0),
         "data_out_mb": float(event.output_data_size_mb or 0),
@@ -1084,6 +1116,11 @@ def _build_event_response(db: Session, event: TelemetryEvent) -> TelemetryEventR
         .order_by(ExecutionPipeline.stage_order.asc(), ExecutionPipeline.id.asc())
         .all()
     )
+    _tc = calculate_token_cost(
+        event.model_name or "",
+        event.prompt_tokens or 0,
+        event.completion_tokens or 0,
+    )
     return TelemetryEventResponse(
         event_id=event.event_id,
         request_id=event.request_id,
@@ -1104,6 +1141,9 @@ def _build_event_response(db: Session, event: TelemetryEvent) -> TelemetryEventR
         prompt_tokens=event.prompt_tokens or 0,
         completion_tokens=event.completion_tokens or 0,
         total_tokens=event.total_tokens or 0,
+        input_token_cost=Decimal(str(_tc["input_token_cost"])),
+        output_token_cost=Decimal(str(_tc["output_token_cost"])),
+        total_token_cost=Decimal(str(_tc["total_cost"])),
         llm_cost=Decimal(str(event.llm_cost or 0)),
         infra_cost=Decimal(str(event.infra_cost or 0)),
         external_cost=Decimal(str(event.external_cost or 0)),

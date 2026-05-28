@@ -83,11 +83,14 @@ def cost_by_model(
             "model_name": r.model_name,
             "provider": r.provider or "—",
             "total_events": total,
+            "input_tokens": int(r.prompt_tokens or 0),
+            "output_tokens": int(r.completion_tokens or 0),
             "prompt_tokens": int(r.prompt_tokens or 0),
             "completion_tokens": int(r.completion_tokens or 0),
             "total_tokens": int(r.total_tokens or 0),
             "input_token_cost": computed["input_token_cost"],
             "output_token_cost": computed["output_token_cost"],
+            "total_token_cost": computed["total_cost"],
             "total_cost": computed["total_cost"],
             "avg_latency_ms": round(float(r.avg_latency_ms or 0), 1),
             "success_rate": round(float(success_rate), 1),
@@ -112,6 +115,8 @@ def cost_by_project(
             Project.environment.label("environment"),
             Organization.org_name.label("org_name"),
             func.count(TelemetryEvent.id).label("total_events"),
+            func.coalesce(func.sum(TelemetryEvent.prompt_tokens), 0).label("input_tokens"),
+            func.coalesce(func.sum(TelemetryEvent.completion_tokens), 0).label("output_tokens"),
             func.coalesce(func.sum(TelemetryEvent.total_tokens), 0).label("total_tokens"),
             func.coalesce(func.sum(TelemetryEvent.llm_cost), 0).label("llm_cost"),
             func.coalesce(func.sum(TelemetryEvent.infra_cost), 0).label("infra_cost"),
@@ -172,9 +177,12 @@ def cost_by_project(
             "project_name": r.project_name,
             "environment": r.environment,
             "total_events": r.total_events or 0,
+            "input_tokens": int(r.input_tokens or 0),
+            "output_tokens": int(r.output_tokens or 0),
             "total_tokens": int(r.total_tokens or 0),
             "input_token_cost": dc["input_token_cost"],
             "output_token_cost": dc["output_token_cost"],
+            "total_token_cost": dc["total_cost"],
             "total_cost": dc["total_cost"],
             "avg_latency_ms": round(float(r.avg_latency_ms or 0), 1),
             "tool_count": int(r.tool_count or 0),
@@ -241,9 +249,12 @@ def project_cost_breakdown(
             "vendor": r.vendor or "—",
             "cost_model": r.cost_model or "per_token",
             "total_events": r.total_events or 0,
+            "input_tokens": int(r.input_tokens or 0),
+            "output_tokens": int(r.output_tokens or 0),
             "total_tokens": int(r.total_tokens or 0),
             "input_token_cost": c["input_token_cost"],
             "output_token_cost": c["output_token_cost"],
+            "total_token_cost": c["total_cost"],
             "total_cost": c["total_cost"],
         })
 
@@ -303,6 +314,7 @@ def cost_daily(
             "total_tokens": int(r.total_tokens or 0),
             "input_token_cost": computed["input_token_cost"],
             "output_token_cost": computed["output_token_cost"],
+            "total_token_cost": computed["total_cost"],
             "total_cost": computed["total_cost"],
             "total_events": int(r.total_events or 0),
         })
@@ -343,6 +355,7 @@ def cost_monthly(
             "total_tokens": int(r.total_tokens or 0),
             "input_token_cost": computed["input_token_cost"],
             "output_token_cost": computed["output_token_cost"],
+            "total_token_cost": computed["total_cost"],
             "total_cost": computed["total_cost"],
             "total_events": int(r.total_events or 0),
         })
@@ -362,7 +375,6 @@ def cost_by_org(db: Session = Depends(get_db)):
             Organization.plan_type.label("plan_type"),
             func.count(TelemetryEvent.id).label("total_events"),
             func.coalesce(func.sum(TelemetryEvent.total_tokens), 0).label("total_tokens"),
-            func.coalesce(func.sum(TelemetryEvent.total_cost), 0).label("total_cost"),
             func.avg(TelemetryEvent.latency_ms).label("avg_latency_ms"),
         )
         .outerjoin(
@@ -370,21 +382,45 @@ def cost_by_org(db: Session = Depends(get_db)):
             and_(TelemetryEvent.org_id == Organization.id, DECORATOR_EVENT_FILTER),
         )
         .group_by(Organization.id, Organization.org_name, Organization.plan_type)
-        .order_by(func.coalesce(func.sum(TelemetryEvent.total_cost), 0).desc())
         .all()
     )
-    return [
-        {
+
+    # Dynamic costs: sub-query per (org_id, model_name) → compute via pricing service
+    model_q = (
+        db.query(
+            TelemetryEvent.org_id,
+            TelemetryEvent.model_name,
+            func.sum(TelemetryEvent.prompt_tokens).label("input_tokens"),
+            func.sum(TelemetryEvent.completion_tokens).label("output_tokens"),
+        )
+        .filter(TelemetryEvent.model_name.isnot(None), TelemetryEvent.model_name != "", DECORATOR_EVENT_FILTER)
+        .group_by(TelemetryEvent.org_id, TelemetryEvent.model_name)
+        .all()
+    )
+    org_costs: dict = {}
+    for mt in model_q:
+        c = _pricing(mt.model_name, int(mt.input_tokens or 0), int(mt.output_tokens or 0))
+        agg = org_costs.setdefault(mt.org_id or "", {"input_token_cost": 0.0, "output_token_cost": 0.0, "total_cost": 0.0})
+        agg["input_token_cost"] = round(agg["input_token_cost"] + c["input_token_cost"], 6)
+        agg["output_token_cost"] = round(agg["output_token_cost"] + c["output_token_cost"], 6)
+        agg["total_cost"] = round(agg["total_cost"] + c["total_cost"], 6)
+
+    result = []
+    for r in rows:
+        dc = org_costs.get(r.org_id or "", {"input_token_cost": 0.0, "output_token_cost": 0.0, "total_cost": 0.0})
+        result.append({
             "org_id": r.org_id,
             "org_name": r.org_name,
             "plan_type": r.plan_type,
             "total_events": r.total_events or 0,
-            "total_tokens": r.total_tokens or 0,
-            "total_cost": float(r.total_cost or 0),
+            "total_tokens": int(r.total_tokens or 0),
+            "input_token_cost": dc["input_token_cost"],
+            "output_token_cost": dc["output_token_cost"],
+            "total_cost": dc["total_cost"],
             "avg_latency_ms": round(float(r.avg_latency_ms or 0), 1),
-        }
-        for r in rows
-    ]
+        })
+    result.sort(key=lambda x: x["total_cost"], reverse=True)
+    return result
 
 
 @router.get("/totals")
@@ -392,51 +428,55 @@ def cost_totals(db: Session = Depends(get_db)):
     today = date.today()
     first_of_month = today.replace(day=1)
 
-    daily_row = (
-        db.query(
-            func.sum(DailyOrgSummary.total_cost).label("cost"),
-            func.sum(DailyOrgSummary.total_tokens).label("tokens"),
-            func.sum(DailyOrgSummary.total_events).label("events"),
+    def _daily_totals(date_filter):
+        rows = (
+            db.query(
+                DailyOrgSummary.tool_name,
+                func.sum(DailyOrgSummary.total_prompt_tokens).label("input_tokens"),
+                func.sum(DailyOrgSummary.total_completion_tokens).label("output_tokens"),
+                func.sum(DailyOrgSummary.total_tokens).label("total_tokens"),
+                func.sum(DailyOrgSummary.total_events).label("total_events"),
+            )
+            .filter(date_filter)
+            .group_by(DailyOrgSummary.tool_name)
+            .all()
         )
-        .filter(DailyOrgSummary.date == today)
-        .first()
-    )
+        cost = 0.0
+        tokens = 0
+        events = 0
+        for r in rows:
+            c = _pricing(r.tool_name or "", int(r.input_tokens or 0), int(r.output_tokens or 0))
+            cost = round(cost + c["total_cost"], 6)
+            tokens += int(r.total_tokens or 0)
+            events += int(r.total_events or 0)
+        return {"cost": cost, "tokens": tokens, "events": events}
 
-    monthly_row = (
-        db.query(
-            func.sum(DailyOrgSummary.total_cost).label("cost"),
-            func.sum(DailyOrgSummary.total_tokens).label("tokens"),
-            func.sum(DailyOrgSummary.total_events).label("events"),
+    def _all_time_totals():
+        rows = (
+            db.query(
+                TelemetryEvent.model_name,
+                func.sum(TelemetryEvent.prompt_tokens).label("input_tokens"),
+                func.sum(TelemetryEvent.completion_tokens).label("output_tokens"),
+                func.sum(TelemetryEvent.total_tokens).label("total_tokens"),
+                func.count(TelemetryEvent.id).label("total_events"),
+            )
+            .group_by(TelemetryEvent.model_name)
+            .all()
         )
-        .filter(DailyOrgSummary.date >= first_of_month)
-        .first()
-    )
-
-    all_time = (
-        db.query(
-            func.sum(TelemetryEvent.total_cost).label("cost"),
-            func.sum(TelemetryEvent.total_tokens).label("tokens"),
-            func.count(TelemetryEvent.id).label("events"),
-        )
-        .first()
-    )
+        cost = 0.0
+        tokens = 0
+        events = 0
+        for r in rows:
+            c = _pricing(r.model_name or "", int(r.input_tokens or 0), int(r.output_tokens or 0))
+            cost = round(cost + c["total_cost"], 6)
+            tokens += int(r.total_tokens or 0)
+            events += int(r.total_events or 0)
+        return {"cost": cost, "tokens": tokens, "events": events}
 
     return {
-        "today": {
-            "cost": float(daily_row.cost or 0) if daily_row else 0,
-            "tokens": int(daily_row.tokens or 0) if daily_row else 0,
-            "events": int(daily_row.events or 0) if daily_row else 0,
-        },
-        "this_month": {
-            "cost": float(monthly_row.cost or 0) if monthly_row else 0,
-            "tokens": int(monthly_row.tokens or 0) if monthly_row else 0,
-            "events": int(monthly_row.events or 0) if monthly_row else 0,
-        },
-        "all_time": {
-            "cost": float(all_time.cost or 0) if all_time else 0,
-            "tokens": int(all_time.tokens or 0) if all_time else 0,
-            "events": int(all_time.events or 0) if all_time else 0,
-        },
+        "today": _daily_totals(DailyOrgSummary.date == today),
+        "this_month": _daily_totals(DailyOrgSummary.date >= first_of_month),
+        "all_time": _all_time_totals(),
     }
 
 
@@ -482,9 +522,12 @@ def cost_by_tool(
             "vendor": r.vendor or "—",
             "cost_model": r.cost_model or "per_token",
             "total_events": r.total_events or 0,
+            "input_tokens": int(r.input_tokens or 0),
+            "output_tokens": int(r.output_tokens or 0),
             "total_tokens": int(r.total_tokens or 0),
             "input_token_cost": computed["input_token_cost"],
             "output_token_cost": computed["output_token_cost"],
+            "total_token_cost": computed["total_cost"],
             "total_cost": computed["total_cost"],
         })
     results.sort(key=lambda x: x["total_cost"], reverse=True)
@@ -502,28 +545,49 @@ def cost_by_provider(
         db.query(
             TelemetryEvent.provider,
             func.count(TelemetryEvent.id).label("total_events"),
+            func.sum(TelemetryEvent.prompt_tokens).label("input_tokens"),
+            func.sum(TelemetryEvent.completion_tokens).label("output_tokens"),
             func.sum(TelemetryEvent.total_tokens).label("total_tokens"),
-            func.sum(TelemetryEvent.llm_cost).label("llm_cost"),
-            func.sum(TelemetryEvent.infra_cost).label("infra_cost"),
-            func.sum(TelemetryEvent.external_cost).label("external_cost"),
-            func.sum(TelemetryEvent.total_cost).label("total_cost"),
         )
         .group_by(TelemetryEvent.provider)
-        .order_by(func.sum(TelemetryEvent.total_cost).desc())
     )
     rows = _scope(rows, TelemetryEvent, org_id, project_id, db=db)
-    return [
-        {
+
+    # Sub-query: (provider, model_name) → compute per-model costs via pricing service
+    model_q = (
+        db.query(
+            TelemetryEvent.provider,
+            TelemetryEvent.model_name,
+            func.sum(TelemetryEvent.prompt_tokens).label("input_tokens"),
+            func.sum(TelemetryEvent.completion_tokens).label("output_tokens"),
+        )
+        .filter(TelemetryEvent.model_name.isnot(None), TelemetryEvent.model_name != "")
+        .group_by(TelemetryEvent.provider, TelemetryEvent.model_name)
+    )
+    model_q = _scope(model_q, TelemetryEvent, org_id, project_id, db=db)
+    provider_costs: dict = {}
+    for mt in model_q.all():
+        c = _pricing(mt.model_name, int(mt.input_tokens or 0), int(mt.output_tokens or 0))
+        agg = provider_costs.setdefault(mt.provider or "", {"input_token_cost": 0.0, "output_token_cost": 0.0, "total_cost": 0.0})
+        agg["input_token_cost"] = round(agg["input_token_cost"] + c["input_token_cost"], 6)
+        agg["output_token_cost"] = round(agg["output_token_cost"] + c["output_token_cost"], 6)
+        agg["total_cost"] = round(agg["total_cost"] + c["total_cost"], 6)
+
+    results = []
+    for r in rows.all():
+        dc = provider_costs.get(r.provider or "", {"input_token_cost": 0.0, "output_token_cost": 0.0, "total_cost": 0.0})
+        results.append({
             "provider": r.provider or "—",
             "total_events": r.total_events or 0,
+            "input_tokens": int(r.input_tokens or 0),
+            "output_tokens": int(r.output_tokens or 0),
             "total_tokens": int(r.total_tokens or 0),
-            "llm_cost": float(r.llm_cost or 0),
-            "infra_cost": float(r.infra_cost or 0),
-            "external_cost": float(r.external_cost or 0),
-            "total_cost": float(r.total_cost or 0),
-        }
-        for r in rows.all()
-    ]
+            "input_token_cost": dc["input_token_cost"],
+            "output_token_cost": dc["output_token_cost"],
+            "total_cost": dc["total_cost"],
+        })
+    results.sort(key=lambda x: x["total_cost"], reverse=True)
+    return results
 
 
 @router.get("/by-execution-type")
@@ -538,23 +602,46 @@ def cost_by_execution_type(
             TelemetryEvent.execution_type,
             func.count(TelemetryEvent.id).label("total_events"),
             func.sum(TelemetryEvent.total_tokens).label("total_tokens"),
-            func.sum(TelemetryEvent.total_cost).label("total_cost"),
             func.avg(TelemetryEvent.latency_ms).label("avg_latency_ms"),
         )
         .group_by(TelemetryEvent.execution_type)
-        .order_by(func.sum(TelemetryEvent.total_cost).desc())
     )
     rows = _scope(rows, TelemetryEvent, org_id, project_id, db=db)
-    return [
-        {
+
+    # Sub-query: (execution_type, model_name) → dynamic costs
+    model_q = (
+        db.query(
+            TelemetryEvent.execution_type,
+            TelemetryEvent.model_name,
+            func.sum(TelemetryEvent.prompt_tokens).label("input_tokens"),
+            func.sum(TelemetryEvent.completion_tokens).label("output_tokens"),
+        )
+        .filter(TelemetryEvent.model_name.isnot(None), TelemetryEvent.model_name != "")
+        .group_by(TelemetryEvent.execution_type, TelemetryEvent.model_name)
+    )
+    model_q = _scope(model_q, TelemetryEvent, org_id, project_id, db=db)
+    exec_costs: dict = {}
+    for mt in model_q.all():
+        c = _pricing(mt.model_name, int(mt.input_tokens or 0), int(mt.output_tokens or 0))
+        agg = exec_costs.setdefault(mt.execution_type or "", {"input_token_cost": 0.0, "output_token_cost": 0.0, "total_cost": 0.0})
+        agg["input_token_cost"] = round(agg["input_token_cost"] + c["input_token_cost"], 6)
+        agg["output_token_cost"] = round(agg["output_token_cost"] + c["output_token_cost"], 6)
+        agg["total_cost"] = round(agg["total_cost"] + c["total_cost"], 6)
+
+    results = []
+    for r in rows.all():
+        dc = exec_costs.get(r.execution_type or "", {"input_token_cost": 0.0, "output_token_cost": 0.0, "total_cost": 0.0})
+        results.append({
             "execution_type": r.execution_type or "—",
             "total_events": r.total_events or 0,
             "total_tokens": int(r.total_tokens or 0),
-            "total_cost": float(r.total_cost or 0),
+            "input_token_cost": dc["input_token_cost"],
+            "output_token_cost": dc["output_token_cost"],
+            "total_cost": dc["total_cost"],
             "avg_latency_ms": round(float(r.avg_latency_ms or 0), 1),
-        }
-        for r in rows.all()
-    ]
+        })
+    results.sort(key=lambda x: x["total_cost"], reverse=True)
+    return results
 
 
 @router.get("/by-service-type")
@@ -569,21 +656,44 @@ def cost_by_service_type(
             TelemetryEvent.service_type,
             func.count(TelemetryEvent.id).label("total_events"),
             func.sum(TelemetryEvent.total_tokens).label("total_tokens"),
-            func.sum(TelemetryEvent.total_cost).label("total_cost"),
         )
         .group_by(TelemetryEvent.service_type)
-        .order_by(func.sum(TelemetryEvent.total_cost).desc())
     )
     rows = _scope(rows, TelemetryEvent, org_id, project_id, db=db)
-    return [
-        {
+
+    # Sub-query: (service_type, model_name) → dynamic costs
+    model_q = (
+        db.query(
+            TelemetryEvent.service_type,
+            TelemetryEvent.model_name,
+            func.sum(TelemetryEvent.prompt_tokens).label("input_tokens"),
+            func.sum(TelemetryEvent.completion_tokens).label("output_tokens"),
+        )
+        .filter(TelemetryEvent.model_name.isnot(None), TelemetryEvent.model_name != "")
+        .group_by(TelemetryEvent.service_type, TelemetryEvent.model_name)
+    )
+    model_q = _scope(model_q, TelemetryEvent, org_id, project_id, db=db)
+    svc_costs: dict = {}
+    for mt in model_q.all():
+        c = _pricing(mt.model_name, int(mt.input_tokens or 0), int(mt.output_tokens or 0))
+        agg = svc_costs.setdefault(mt.service_type or "", {"input_token_cost": 0.0, "output_token_cost": 0.0, "total_cost": 0.0})
+        agg["input_token_cost"] = round(agg["input_token_cost"] + c["input_token_cost"], 6)
+        agg["output_token_cost"] = round(agg["output_token_cost"] + c["output_token_cost"], 6)
+        agg["total_cost"] = round(agg["total_cost"] + c["total_cost"], 6)
+
+    results = []
+    for r in rows.all():
+        dc = svc_costs.get(r.service_type or "", {"input_token_cost": 0.0, "output_token_cost": 0.0, "total_cost": 0.0})
+        results.append({
             "service_type": r.service_type or "—",
             "total_events": r.total_events or 0,
             "total_tokens": int(r.total_tokens or 0),
-            "total_cost": float(r.total_cost or 0),
-        }
-        for r in rows.all()
-    ]
+            "input_token_cost": dc["input_token_cost"],
+            "output_token_cost": dc["output_token_cost"],
+            "total_cost": dc["total_cost"],
+        })
+    results.sort(key=lambda x: x["total_cost"], reverse=True)
+    return results
 
 
 @router.get("/breakdown")
@@ -707,6 +817,7 @@ def cost_per_tool_daily(
             "total_tokens": int(r.total_tokens or 0),
             "input_token_cost": computed["input_token_cost"],
             "output_token_cost": computed["output_token_cost"],
+            "total_token_cost": computed["total_cost"],
             "total_cost": computed["total_cost"],
             "total_events": int(r.total_events or 0),
             "email_volume": email_map.get((str(r.date), r.tool_name), 0),

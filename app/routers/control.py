@@ -33,6 +33,7 @@ from app.models import (
 )
 from app.routers.telemetry import _ingest_event
 from app.schemas import ModelUsageItem, ToolUsageItemEnhanced
+from app.services.ai_model_pricing import calculate_token_cost
 from app.services.control_ingest import SDKEvent, sdk_ingest_service, unified_trace_processor
 
 router = APIRouter(prefix="/control", tags=["control"])
@@ -153,16 +154,19 @@ def control_ingest(
     telemetry_create = sdk_ingest_service.to_telemetry(sdk_event, db)
     event = _ingest_event(db, telemetry_create)
     db.commit()
+    _tc = calculate_token_cost(event.model_name or "", event.prompt_tokens or 0, event.completion_tokens or 0)
     return {
         "status": "ingested",
         "event_id": event.event_id,
-        "total_cost": float(event.total_cost or 0),
-        "llm_cost": float(event.llm_cost or 0),
-        "infra_cost": float(event.infra_cost or 0),
-        "external_cost": float(event.external_cost or 0),
-        "total_tokens": event.total_tokens or 0,
         "input_tokens": event.prompt_tokens or 0,
         "output_tokens": event.completion_tokens or 0,
+        "total_tokens": event.total_tokens or 0,
+        "input_token_cost": _tc["input_token_cost"],
+        "output_token_cost": _tc["output_token_cost"],
+        "total_token_cost": _tc["total_cost"],
+        "total_cost": _tc["total_cost"],
+        "infra_cost": float(event.infra_cost or 0),
+        "external_cost": float(event.external_cost or 0),
     }
 
 
@@ -179,11 +183,16 @@ def control_ingest_batch(
         try:
             telemetry_create = sdk_ingest_service.to_telemetry(sdk_event, db)
             event = _ingest_event(db, telemetry_create)
+            _tc = calculate_token_cost(event.model_name or "", event.prompt_tokens or 0, event.completion_tokens or 0)
             results.append({
                 "event_id": event.event_id,
                 "status": "ingested",
-                "total_cost": float(event.total_cost or 0),
+                "input_tokens": event.prompt_tokens or 0,
+                "output_tokens": event.completion_tokens or 0,
                 "total_tokens": event.total_tokens or 0,
+                "input_token_cost": _tc["input_token_cost"],
+                "output_token_cost": _tc["output_token_cost"],
+                "total_cost": _tc["total_cost"],
             })
         except HTTPException as exc:
             db.rollback()
@@ -220,16 +229,19 @@ def control_ingest_unified_trace(
         db.add(record)
     db.commit()
 
+    _tc = calculate_token_cost(event.model_name or "", event.prompt_tokens or 0, event.completion_tokens or 0)
     return {
         "status": "ingested",
         "event_id": event.event_id,
         "trace_id": event.trace_id,
         "workflow_name": payload.workflow_name,
-        "total_tokens": event.total_tokens or 0,
         "total_input_tokens": event.prompt_tokens or 0,
         "total_output_tokens": event.completion_tokens or 0,
-        "total_cost": round(float(event.total_cost or 0), 6),
-        "total_llm_cost": round(float(event.llm_cost or 0), 6),
+        "total_tokens": event.total_tokens or 0,
+        "input_token_cost": _tc["input_token_cost"],
+        "output_token_cost": _tc["output_token_cost"],
+        "total_token_cost": _tc["total_cost"],
+        "total_cost": _tc["total_cost"],
         "total_tool_cost": round(float(event.external_cost or 0), 6),
         "model_count": len(result.model_records),
         "tool_count": len(result.tool_records),
@@ -267,6 +279,24 @@ def get_unified_trace(
     )
 
     meta = event.metadata_json or {}
+    _tc = calculate_token_cost(event.model_name or "", event.prompt_tokens or 0, event.completion_tokens or 0)
+
+    models_out = []
+    for m in model_rows:
+        mc = calculate_token_cost(m.model_name or "", m.input_tokens or 0, m.output_tokens or 0)
+        models_out.append({
+            "model_name": m.model_name,
+            "provider": m.provider,
+            "input_tokens": m.input_tokens or 0,
+            "output_tokens": m.output_tokens or 0,
+            "total_tokens": m.total_tokens or 0,
+            "input_token_cost": mc["input_token_cost"],
+            "output_token_cost": mc["output_token_cost"],
+            "total_token_cost": mc["total_cost"],
+            "cost": mc["total_cost"],
+            "latency_ms": m.latency_ms or 0,
+        })
+
     return {
         "event_id": event.event_id,
         "trace_id": event.trace_id,
@@ -278,26 +308,17 @@ def get_unified_trace(
         "total_input_tokens": event.prompt_tokens or 0,
         "total_output_tokens": event.completion_tokens or 0,
         "total_tokens": event.total_tokens or 0,
-        "total_cost": round(float(event.total_cost or 0), 6),
-        "total_llm_cost": round(float(event.llm_cost or 0), 6),
+        "input_token_cost": _tc["input_token_cost"],
+        "output_token_cost": _tc["output_token_cost"],
+        "total_token_cost": _tc["total_cost"],
+        "total_cost": _tc["total_cost"],
         "total_tool_cost": round(float(event.external_cost or 0), 6),
         "infra_cost": round(float(event.infra_cost or 0), 6),
         "total_execution_time_ms": event.latency_ms or 0,
         "risk_score": round(float(event.risk_score or 0), 2),
         "model_count": len(model_rows),
         "tool_count": len(tool_rows),
-        "models": [
-            {
-                "model_name": m.model_name,
-                "provider": m.provider,
-                "input_tokens": m.input_tokens or 0,
-                "output_tokens": m.output_tokens or 0,
-                "total_tokens": m.total_tokens or 0,
-                "cost": round(float(m.llm_cost or 0), 6),
-                "latency_ms": m.latency_ms or 0,
-            }
-            for m in model_rows
-        ],
+        "models": models_out,
         "tools": [
             {
                 "tool_name": t.tool_name,
@@ -433,14 +454,20 @@ def get_project_trace(
             model_agg[mkey] = {
                 "model": mkey, "provider": e.provider, "events": 0,
                 "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
-                "total_cost": 0.0, "avg_latency_ms": 0.0,
+                "input_token_cost": 0.0, "output_token_cost": 0.0, "total_cost": 0.0,
+                "avg_latency_ms": 0.0,
             }
         ma = model_agg[mkey]
         ma["events"] += 1
-        ma["input_tokens"] += e.prompt_tokens or 0
-        ma["output_tokens"] += e.completion_tokens or 0
+        in_tok = e.prompt_tokens or 0
+        out_tok = e.completion_tokens or 0
+        ma["input_tokens"] += in_tok
+        ma["output_tokens"] += out_tok
         ma["total_tokens"] += e.total_tokens or 0
-        ma["total_cost"] += float(e.total_cost or 0)
+        _tc = calculate_token_cost(mkey, in_tok, out_tok)
+        ma["input_token_cost"] = round(ma["input_token_cost"] + _tc["input_token_cost"], 6)
+        ma["output_token_cost"] = round(ma["output_token_cost"] + _tc["output_token_cost"], 6)
+        ma["total_cost"] = round(ma["total_cost"] + _tc["total_cost"], 6)
         ma["avg_latency_ms"] = (
             (ma["avg_latency_ms"] * (ma["events"] - 1) + (e.latency_ms or 0)) / ma["events"]
         )
@@ -468,7 +495,7 @@ def get_project_trace(
     total_input = sum(e.prompt_tokens or 0 for e in events)
     total_output = sum(e.completion_tokens or 0 for e in events)
     total_tokens = sum(e.total_tokens or 0 for e in events)
-    total_cost = round(sum(float(e.total_cost or 0) for e in events), 6)
+    total_cost = round(sum(ma["total_cost"] for ma in model_agg.values()), 6)
     unified_trace_count = sum(
         1 for e in events
         if isinstance(e.metadata_json, dict) and e.metadata_json.get("is_unified_trace")
@@ -484,7 +511,7 @@ def get_project_trace(
         "total_tokens": total_tokens,
         "total_cost": total_cost,
         "model_breakdown": [
-            {**v, "total_cost": round(v["total_cost"], 6), "avg_latency_ms": round(v["avg_latency_ms"], 1)}
+            {**v, "total_cost": round(v["total_cost"], 6), "total_token_cost": round(v["total_cost"], 6), "avg_latency_ms": round(v["avg_latency_ms"], 1)}
             for v in model_agg.values()
         ],
         "tool_breakdown": [
@@ -504,8 +531,7 @@ def get_project_trace(
                 "input_tokens": e.prompt_tokens or 0,
                 "output_tokens": e.completion_tokens or 0,
                 "total_tokens": e.total_tokens or 0,
-                "total_cost": round(float(e.total_cost or 0), 6),
-                "llm_cost": round(float(e.llm_cost or 0), 6),
+                **calculate_token_cost(e.model_name or "", e.prompt_tokens or 0, e.completion_tokens or 0),
                 "status": e.status,
                 "latency_ms": e.latency_ms or 0,
                 "created_at": e.created_at.isoformat() if e.created_at else None,
@@ -679,8 +705,10 @@ def get_cost_breakdown(
 
     rows = q.order_by(func.sum(TelemetryEvent.total_cost).desc()).all()
 
-    return [
-        {
+    result = []
+    for r in rows:
+        _tc = calculate_token_cost(r.model or "", int(r.input_tokens or 0), int(r.output_tokens or 0))
+        result.append({
             "org_id": r.org_id,
             "org_name": r.org_name,
             "project_id": r.project_id,
@@ -691,10 +719,11 @@ def get_cost_breakdown(
             "input_tokens": int(r.input_tokens or 0),
             "output_tokens": int(r.output_tokens or 0),
             "total_tokens": int(r.total_tokens or 0),
-            "llm_cost": round(float(r.llm_cost or 0), 6),
+            "input_token_cost": _tc["input_token_cost"],
+            "output_token_cost": _tc["output_token_cost"],
+            "total_token_cost": _tc["total_cost"],
+            "total_cost": _tc["total_cost"],
             "infra_cost": round(float(r.infra_cost or 0), 6),
             "external_cost": round(float(r.external_cost or 0), 6),
-            "total_cost": round(float(r.total_cost or 0), 6),
-        }
-        for r in rows
-    ]
+        })
+    return result

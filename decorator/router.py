@@ -25,6 +25,7 @@ from app.core.deps import get_db, require_api_key
 from app.models import TelemetryEvent
 from app.routers.telemetry import _ingest_event
 from app.schemas import TelemetryEventCreate
+from app.services.ai_model_pricing import calculate_token_cost
 from decorator.models import (
     DecoratorRegistration,
     ProjectModelUsage,
@@ -329,10 +330,12 @@ def list_project_model_usage(
                 "provider":                r.provider,
                 "date":                    str(r.date),
                 "call_count":              r.call_count,
-                "total_prompt_tokens":     r.total_prompt_tokens,
-                "total_completion_tokens": r.total_completion_tokens,
-                "total_tokens":            r.total_tokens,
-                "total_cost":              float(r.total_cost or 0),
+                "input_tokens":            r.total_prompt_tokens or 0,
+                "output_tokens":           r.total_completion_tokens or 0,
+                "total_prompt_tokens":     r.total_prompt_tokens or 0,
+                "total_completion_tokens": r.total_completion_tokens or 0,
+                "total_tokens":            r.total_tokens or 0,
+                **calculate_token_cost(r.model_name or "", r.total_prompt_tokens or 0, r.total_completion_tokens or 0),
                 "avg_latency_ms":          r.avg_latency_ms,
                 "success_count":           r.success_count,
                 "error_count":             r.error_count,

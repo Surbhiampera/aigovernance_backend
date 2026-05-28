@@ -149,6 +149,9 @@ class TelemetryEventResponse(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    input_token_cost: Decimal = Decimal("0")
+    output_token_cost: Decimal = Decimal("0")
+    total_token_cost: Decimal = Decimal("0")
     llm_cost: Decimal = Decimal("0")
     infra_cost: Decimal = Decimal("0")
     external_cost: Decimal = Decimal("0")
@@ -185,8 +188,11 @@ class DailySummaryResponse(BaseModel):
     llm_cost: Decimal
     infra_cost: Decimal
     external_cost: Decimal
+    input_tokens: int = 0
+    output_tokens: int = 0
     input_token_cost: Decimal = Decimal("0")
     output_token_cost: Decimal = Decimal("0")
+    total_token_cost: Decimal = Decimal("0")
     total_prompt_tokens: int = 0
     total_completion_tokens: int = 0
     total_tokens: int = 0
@@ -212,8 +218,11 @@ class MonthlySummaryResponse(BaseModel):
     llm_cost: Decimal
     infra_cost: Decimal
     external_cost: Decimal
+    input_tokens: int = 0
+    output_tokens: int = 0
     input_token_cost: Decimal = Decimal("0")
     output_token_cost: Decimal = Decimal("0")
+    total_token_cost: Decimal = Decimal("0")
     total_tokens: int = 0
     total_prompt_tokens: int = 0
     total_completion_tokens: int = 0

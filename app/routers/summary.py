@@ -41,8 +41,11 @@ def _build_daily_response(r: DailyOrgSummary) -> DailySummaryResponse:
         llm_cost=total_cost,
         infra_cost=Decimal(str(r.infra_cost or 0)),
         external_cost=Decimal(str(r.external_cost or 0)),
+        input_tokens=r.total_prompt_tokens or 0,
+        output_tokens=r.total_completion_tokens or 0,
         input_token_cost=Decimal(str(computed["input_token_cost"])),
         output_token_cost=Decimal(str(computed["output_token_cost"])),
+        total_token_cost=total_cost,
         total_prompt_tokens=r.total_prompt_tokens or 0,
         total_completion_tokens=r.total_completion_tokens or 0,
         total_tokens=r.total_tokens or 0,
@@ -75,8 +78,11 @@ def _build_monthly_response(r: MonthlyOrgSummary) -> MonthlySummaryResponse:
         llm_cost=total_cost,
         infra_cost=Decimal(str(r.infra_cost or 0)),
         external_cost=Decimal(str(r.external_cost or 0)),
+        input_tokens=r.total_prompt_tokens or 0,
+        output_tokens=r.total_completion_tokens or 0,
         input_token_cost=Decimal(str(computed["input_token_cost"])),
         output_token_cost=Decimal(str(computed["output_token_cost"])),
+        total_token_cost=total_cost,
         total_tokens=r.total_tokens or 0,
         total_prompt_tokens=r.total_prompt_tokens or 0,
         total_completion_tokens=r.total_completion_tokens or 0,
@@ -154,11 +160,15 @@ def get_usage_trends(
     db: Session = Depends(get_db),
 ):
     cutoff = date.today() - timedelta(days=days - 1)
+
+    # Per-row stats (no raw cost fetched from DB)
     query = (
         db.query(
             DailyOrgSummary.date,
+            DailyOrgSummary.tool_name,
             func.sum(DailyOrgSummary.total_events).label("total_events"),
-            func.sum(DailyOrgSummary.total_cost).label("total_cost"),
+            func.sum(DailyOrgSummary.total_prompt_tokens).label("input_tokens"),
+            func.sum(DailyOrgSummary.total_completion_tokens).label("output_tokens"),
             func.sum(DailyOrgSummary.total_tokens).label("total_tokens"),
             func.avg(DailyOrgSummary.avg_latency_ms).label("avg_latency_ms"),
             func.sum(DailyOrgSummary.success_count).label("success_count"),
@@ -167,7 +177,7 @@ def get_usage_trends(
             func.sum(DailyOrgSummary.anomaly_count).label("anomaly_count"),
         )
         .filter(DailyOrgSummary.date >= cutoff)
-        .group_by(DailyOrgSummary.date)
+        .group_by(DailyOrgSummary.date, DailyOrgSummary.tool_name)
         .order_by(DailyOrgSummary.date.asc())
     )
     if org_id:
@@ -175,21 +185,34 @@ def get_usage_trends(
     else:
         query = query.filter(DailyOrgSummary.org_id.in_(active_orgs_subq(db)))
 
-    rows = query.all()
-    return [
-        {
-            "date": str(r.date),
-            "total_events": r.total_events or 0,
-            "total_cost": float(r.total_cost or 0),
-            "total_tokens": r.total_tokens or 0,
-            "avg_latency_ms": round(float(r.avg_latency_ms or 0), 2),
-            "success_count": r.success_count or 0,
-            "failure_count": r.failure_count or 0,
-            "avg_risk_score": round(float(r.avg_risk_score or 0), 2),
-            "anomaly_count": r.anomaly_count or 0,
-        }
-        for r in rows
-    ]
+    # Aggregate per date using dynamic pricing
+    from app.services.ai_model_pricing import calculate_token_cost
+    date_agg: dict = {}
+    for r in query.all():
+        computed = calculate_token_cost(r.tool_name or "", int(r.input_tokens or 0), int(r.output_tokens or 0))
+        key = str(r.date)
+        agg = date_agg.setdefault(key, {
+            "date": key, "total_events": 0, "total_cost": 0.0, "total_tokens": 0,
+            "avg_latency_ms": 0.0, "success_count": 0, "failure_count": 0,
+            "avg_risk_score": 0.0, "anomaly_count": 0, "_rows": 0,
+        })
+        agg["total_events"] += int(r.total_events or 0)
+        agg["total_cost"] = round(agg["total_cost"] + computed["total_cost"], 6)
+        agg["total_tokens"] += int(r.total_tokens or 0)
+        agg["success_count"] += int(r.success_count or 0)
+        agg["failure_count"] += int(r.failure_count or 0)
+        agg["anomaly_count"] += int(r.anomaly_count or 0)
+        n = agg["_rows"]
+        agg["avg_latency_ms"] = round(((agg["avg_latency_ms"] * n) + float(r.avg_latency_ms or 0)) / (n + 1), 2)
+        agg["avg_risk_score"] = round(((agg["avg_risk_score"] * n) + float(r.avg_risk_score or 0)) / (n + 1), 2)
+        agg["_rows"] += 1
+
+    result = []
+    for v in date_agg.values():
+        v.pop("_rows")
+        result.append(v)
+    result.sort(key=lambda x: x["date"])
+    return result
 
 
 @router.get("/overview", response_model=GovernanceOverviewResponse)
