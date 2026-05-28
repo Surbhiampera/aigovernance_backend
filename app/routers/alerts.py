@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_db
+from app.core.visibility import active_orgs_subq
 from app.models import Alert, Organization, Project, TelemetryEvent
 from app.schemas import AlertResponse
 
@@ -72,6 +73,8 @@ def list_alerts(
         query = query.filter(Alert.status == status)
     if org_id:
         query = query.filter(Alert.org_id == org_id)
+    else:
+        query = query.filter(Alert.org_id.in_(active_orgs_subq(db)))
     if project_id:
         query = query.filter(Alert.project_id == project_id)
     rows = query.order_by(Alert.created_at.desc()).all()

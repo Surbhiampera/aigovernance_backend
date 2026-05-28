@@ -1,31 +1,18 @@
-from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
+
 from app.core.deps import get_db
-from app.models import ApiKey, Organization, Project, User
+from app.models import (
+    Alert, ApiKey, Budget, ConnectorSyncLog, CostBreakdown, DailyOrgSummary,
+    DataSecurityLog, ExecutionPipeline, GovernanceRule, MonthlyOrgSummary,
+    Organization, Project, RateLimit, TelemetryEvent, ToolConnector,
+    TraceModelUsage, TraceToolUsage, UsageAnomaly, User,
+)
 from app.schemas import OrganizationCreate, OrganizationUpdate, OrganizationResponse
+from decorator.models import DecoratorRegistration, ProjectModelUsage, RequestResponseLog, ToolApiInventory
 
 router = APIRouter(prefix="/organizations", tags=["organizations"])
-
-# Non-FK tables that carry org_id and should be cleaned up on delete.
-# (FK tables — projects, users, api_keys, rate_limits — are handled via ORM below.)
-_ORG_CHILD_TABLES = [
-    "telemetry_events",
-    "cost_breakdown",
-    "data_security_logs",
-    "alerts",
-    "usage_anomalies",
-    "governance_rules",
-    "trace_model_usage",
-    "trace_tool_usage",
-    "execution_pipeline",
-    "daily_org_summary",
-    "monthly_org_summary",
-    "rate_limit_violations",
-    "tool_connectors",
-]
 
 
 @router.get("/", response_model=list[OrganizationResponse])
@@ -64,39 +51,56 @@ def update_organization(org_id: str, data: OrganizationUpdate, db: Session = Dep
 
 
 @router.delete("/{org_id}")
-def delete_organization(
-    org_id: str,
-    cascade: bool = Query(True, description="Also delete child projects/users/api_keys/telemetry"),
-    db: Session = Depends(get_db),
-):
+def delete_organization(org_id: str, db: Session = Depends(get_db)):
     org = db.query(Organization).filter(Organization.id == org_id).first()
     if not org:
         raise HTTPException(status_code=404, detail="Organization not found")
 
     try:
-        if cascade:
-            # Clear FK-bound children first (no ON DELETE CASCADE in schema).
-            db.query(ApiKey).filter(ApiKey.org_id == org_id).delete(synchronize_session=False)
-            db.query(User).filter(User.org_id == org_id).delete(synchronize_session=False)
-            db.query(Project).filter(Project.org_id == org_id).delete(synchronize_session=False)
+        connector_ids_subq = (
+            db.query(ToolConnector.id).filter(ToolConnector.org_id == org_id).subquery()
+        )
+        db.query(ConnectorSyncLog).filter(
+            ConnectorSyncLog.connector_id.in_(connector_ids_subq)
+        ).delete(synchronize_session=False)
 
-            # Best-effort cleanup of non-FK tables that carry org_id.
-            for tbl in _ORG_CHILD_TABLES:
-                try:
-                    db.execute(text(f"DELETE FROM {tbl} WHERE org_id = :oid"), {"oid": org_id})
-                except SQLAlchemyError:
-                    db.rollback()  # ignore missing table / missing column
+        event_ids_subq = (
+            db.query(TelemetryEvent.event_id).filter(TelemetryEvent.org_id == org_id).subquery()
+        )
+        telemetry_ids_subq = (
+            db.query(TelemetryEvent.id).filter(TelemetryEvent.org_id == org_id).subquery()
+        )
+
+        db.query(DataSecurityLog).filter(DataSecurityLog.org_id == org_id).delete(synchronize_session=False)
+        db.query(Alert).filter(Alert.org_id == org_id).delete(synchronize_session=False)
+        db.query(Alert).filter(Alert.telemetry_id.in_(telemetry_ids_subq)).delete(synchronize_session=False)
+        db.query(CostBreakdown).filter(CostBreakdown.event_id.in_(event_ids_subq)).delete(synchronize_session=False)
+        db.query(ExecutionPipeline).filter(ExecutionPipeline.event_id.in_(event_ids_subq)).delete(synchronize_session=False)
+        db.query(RequestResponseLog).filter(RequestResponseLog.event_id.in_(event_ids_subq)).delete(synchronize_session=False)
+
+        db.query(TraceModelUsage).filter(TraceModelUsage.org_id == org_id).delete(synchronize_session=False)
+        db.query(TraceToolUsage).filter(TraceToolUsage.org_id == org_id).delete(synchronize_session=False)
+        db.query(TelemetryEvent).filter(TelemetryEvent.org_id == org_id).delete(synchronize_session=False)
+
+        db.query(UsageAnomaly).filter(UsageAnomaly.org_id == org_id).delete(synchronize_session=False)
+        db.query(GovernanceRule).filter(GovernanceRule.org_id == org_id).delete(synchronize_session=False)
+        db.query(DailyOrgSummary).filter(DailyOrgSummary.org_id == org_id).delete(synchronize_session=False)
+        db.query(MonthlyOrgSummary).filter(MonthlyOrgSummary.org_id == org_id).delete(synchronize_session=False)
+        db.query(RateLimit).filter(RateLimit.org_id == org_id).delete(synchronize_session=False)
+        db.query(ToolConnector).filter(ToolConnector.org_id == org_id).delete(synchronize_session=False)
+        db.query(DecoratorRegistration).filter(DecoratorRegistration.org_id == org_id).delete(synchronize_session=False)
+        db.query(ProjectModelUsage).filter(ProjectModelUsage.org_id == org_id).delete(synchronize_session=False)
+        db.query(ToolApiInventory).filter(ToolApiInventory.org_id == org_id).delete(synchronize_session=False)
+
+        db.query(Budget).filter(Budget.org_id == org_id).delete(synchronize_session=False)
+        db.query(ApiKey).filter(ApiKey.org_id == org_id).delete(synchronize_session=False)
+        db.query(User).filter(User.org_id == org_id).delete(synchronize_session=False)
+        db.query(Project).filter(Project.org_id == org_id).delete(synchronize_session=False)
 
         db.delete(org)
         db.commit()
-    except IntegrityError as exc:
-        db.rollback()
-        raise HTTPException(
-            status_code=409,
-            detail=f"Cannot delete organization — related records still exist: {exc.orig}",
-        )
     except SQLAlchemyError as exc:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Database error while deleting: {exc}")
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 
-    return {"detail": "Organization deleted", "org_id": org_id, "cascade": cascade}
+    return {"detail": "Organization deleted", "org_id": org_id}

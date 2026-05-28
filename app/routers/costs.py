@@ -7,6 +7,7 @@ from sqlalchemy import and_, case, func
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_db
+from app.core.visibility import active_orgs_subq
 from app.models import (
     Alert,
     Budget,
@@ -28,9 +29,11 @@ router = APIRouter(prefix="/costs", tags=["costs"])
 DECORATOR_EVENT_FILTER = TelemetryEvent.event_id.like("dec-%")
 
 
-def _scope(query, model, org_id, project_id=None):
+def _scope(query, model, org_id, project_id=None, db=None):
     if org_id:
         query = query.filter(model.org_id == org_id)
+    elif db is not None:
+        query = query.filter(model.org_id.in_(active_orgs_subq(db)))
     if project_id and hasattr(model, "project_id"):
         query = query.filter(model.project_id == project_id)
     return query
@@ -60,6 +63,8 @@ def cost_by_model(
     )
     if org_id:
         rows = rows.filter(TelemetryEvent.org_id == org_id)
+    else:
+        rows = rows.filter(TelemetryEvent.org_id.in_(active_orgs_subq(db)))
     if project_id:
         rows = rows.filter(TelemetryEvent.project_id == project_id)
 
@@ -427,7 +432,7 @@ def cost_by_tool(
         .group_by(TelemetryEvent.model_name)
         .order_by(func.sum(TelemetryEvent.total_cost).desc())
     )
-    rows = _scope(rows, TelemetryEvent, org_id, project_id)
+    rows = _scope(rows, TelemetryEvent, org_id, project_id, db=db)
     return [
         {
             "tool_name": r.tool_name,
@@ -464,7 +469,7 @@ def cost_by_provider(
         .group_by(TelemetryEvent.provider)
         .order_by(func.sum(TelemetryEvent.total_cost).desc())
     )
-    rows = _scope(rows, TelemetryEvent, org_id, project_id)
+    rows = _scope(rows, TelemetryEvent, org_id, project_id, db=db)
     return [
         {
             "provider": r.provider or "—",
@@ -497,7 +502,7 @@ def cost_by_execution_type(
         .group_by(TelemetryEvent.execution_type)
         .order_by(func.sum(TelemetryEvent.total_cost).desc())
     )
-    rows = _scope(rows, TelemetryEvent, org_id, project_id)
+    rows = _scope(rows, TelemetryEvent, org_id, project_id, db=db)
     return [
         {
             "execution_type": r.execution_type or "—",
@@ -527,7 +532,7 @@ def cost_by_service_type(
         .group_by(TelemetryEvent.service_type)
         .order_by(func.sum(TelemetryEvent.total_cost).desc())
     )
-    rows = _scope(rows, TelemetryEvent, org_id, project_id)
+    rows = _scope(rows, TelemetryEvent, org_id, project_id, db=db)
     return [
         {
             "service_type": r.service_type or "—",
@@ -557,7 +562,7 @@ def cost_breakdown_summary(
         func.count(TelemetryEvent.id).label("total_events"),
         func.sum(TelemetryEvent.total_tokens).label("total_tokens"),
     )
-    q = _scope(q, TelemetryEvent, org_id, project_id)
+    q = _scope(q, TelemetryEvent, org_id, project_id, db=db)
     row = q.first()
 
     llm = float(row.llm_cost or 0) if row else 0.0

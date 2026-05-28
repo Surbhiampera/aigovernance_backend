@@ -7,6 +7,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_db
+from app.core.visibility import active_orgs_subq
 from app.models import DataSecurityLog, UsageAnomaly
 from app.routers.alerts_security import _enrich_anomalies
 from app.schemas import DataSecurityLogResponse, UsageAnomalyResponse
@@ -30,6 +31,8 @@ def list_security_logs(
         query = query.filter(DataSecurityLog.misuse_pattern_detected == misuse_detected)
     if org_id:
         query = query.filter(DataSecurityLog.org_id == org_id)
+    else:
+        query = query.filter(DataSecurityLog.org_id.in_(active_orgs_subq(db)))
     if project_id:
         query = query.filter(DataSecurityLog.project_id == project_id)
     if start_date is not None:
@@ -50,6 +53,8 @@ def list_usage_anomalies(
         query = query.filter(UsageAnomaly.status == status)
     if org_id:
         query = query.filter(UsageAnomaly.org_id == org_id)
+    else:
+        query = query.filter(UsageAnomaly.org_id.in_(active_orgs_subq(db)))
     if project_id:
         query = query.filter(UsageAnomaly.project_id == project_id)
     if start_date is not None:
@@ -67,10 +72,14 @@ def get_security_summary(
 ):
     cutoff_dt = datetime.combine(start_date, time.min) if start_date is not None else None
 
+    _active = active_orgs_subq(db)
+
     def _log_q():
         q = db.query(func.count(DataSecurityLog.id))
         if org_id:
             q = q.filter(DataSecurityLog.org_id == org_id)
+        else:
+            q = q.filter(DataSecurityLog.org_id.in_(_active))
         if project_id:
             q = q.filter(DataSecurityLog.project_id == project_id)
         if cutoff_dt is not None:
@@ -87,6 +96,9 @@ def get_security_summary(
     if org_id:
         avg_risk_q = avg_risk_q.filter(DataSecurityLog.org_id == org_id)
         max_risk_q = max_risk_q.filter(DataSecurityLog.org_id == org_id)
+    else:
+        avg_risk_q = avg_risk_q.filter(DataSecurityLog.org_id.in_(_active))
+        max_risk_q = max_risk_q.filter(DataSecurityLog.org_id.in_(_active))
     if project_id:
         avg_risk_q = avg_risk_q.filter(DataSecurityLog.project_id == project_id)
         max_risk_q = max_risk_q.filter(DataSecurityLog.project_id == project_id)
@@ -97,6 +109,8 @@ def get_security_summary(
     anomaly_q = db.query(func.count(UsageAnomaly.id)).filter(UsageAnomaly.status == "open")
     if org_id:
         anomaly_q = anomaly_q.filter(UsageAnomaly.org_id == org_id)
+    else:
+        anomaly_q = anomaly_q.filter(UsageAnomaly.org_id.in_(_active))
     if project_id:
         anomaly_q = anomaly_q.filter(UsageAnomaly.project_id == project_id)
     if cutoff_dt is not None:

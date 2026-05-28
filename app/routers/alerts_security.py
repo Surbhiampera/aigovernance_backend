@@ -7,6 +7,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_db
+from app.core.visibility import active_orgs_subq
 from app.models import Alert, DataSecurityLog, Organization, Project, TelemetryEvent, UsageAnomaly
 from app.routers.alerts import _enrich_alerts
 from app.schemas import AlertResponse, DataSecurityLogResponse, UsageAnomalyResponse
@@ -29,6 +30,8 @@ def list_alerts(
         query = query.filter(Alert.status == status)
     if org_id:
         query = query.filter(Alert.org_id == org_id)
+    else:
+        query = query.filter(Alert.org_id.in_(active_orgs_subq(db)))
     if project_id:
         query = query.filter(Alert.project_id == project_id)
     if start_date is not None:
@@ -105,6 +108,8 @@ def list_security_logs(
         query = query.filter(DataSecurityLog.misuse_pattern_detected == misuse_detected)
     if org_id:
         query = query.filter(DataSecurityLog.org_id == org_id)
+    else:
+        query = query.filter(DataSecurityLog.org_id.in_(active_orgs_subq(db)))
     if project_id:
         query = query.filter(DataSecurityLog.project_id == project_id)
     if start_date is not None:
@@ -168,6 +173,8 @@ def list_usage_anomalies(
         query = query.filter(UsageAnomaly.status == status)
     if org_id:
         query = query.filter(UsageAnomaly.org_id == org_id)
+    else:
+        query = query.filter(UsageAnomaly.org_id.in_(active_orgs_subq(db)))
     if project_id:
         query = query.filter(UsageAnomaly.project_id == project_id)
     if start_date is not None:

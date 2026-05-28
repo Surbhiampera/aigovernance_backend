@@ -7,6 +7,7 @@ from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_db
+from app.core.visibility import active_orgs_subq
 from app.models import Alert, DailyOrgSummary, GovernanceRule, TelemetryEvent, ToolConnector, UsageAnomaly
 from app.routers.telemetry import _build_event_response
 from app.schemas import (
@@ -24,7 +25,12 @@ router = APIRouter(prefix="/summary", tags=["summary"])
 @router.get("/today", response_model=TodaySummaryResponse)
 def get_today_summary(db: Session = Depends(get_db)):
     today = date.today()
-    rows = db.query(DailyOrgSummary).filter(DailyOrgSummary.date == today).all()
+    rows = (
+        db.query(DailyOrgSummary)
+        .filter(DailyOrgSummary.date == today)
+        .filter(DailyOrgSummary.org_id.in_(active_orgs_subq(db)))
+        .all()
+    )
     total_cost = sum((Decimal(str(r.total_cost or 0)) for r in rows), Decimal("0"))
     total_events = sum((r.total_events or 0 for r in rows), 0)
     return TodaySummaryResponse(
@@ -49,6 +55,8 @@ def get_daily_summary(
         query = query.filter(DailyOrgSummary.date <= end)
     if org_id:
         query = query.filter(DailyOrgSummary.org_id == org_id)
+    else:
+        query = query.filter(DailyOrgSummary.org_id.in_(active_orgs_subq(db)))
     if project_id:
         query = query.filter(DailyOrgSummary.project_id == project_id)
     return query.order_by(DailyOrgSummary.date.asc(), DailyOrgSummary.tool_name.asc()).all()
@@ -65,6 +73,8 @@ def get_monthly_summary(
     query = db.query(MonthlyOrgSummary)
     if org_id:
         query = query.filter(MonthlyOrgSummary.org_id == org_id)
+    else:
+        query = query.filter(MonthlyOrgSummary.org_id.in_(active_orgs_subq(db)))
     if project_id:
         query = query.filter(MonthlyOrgSummary.project_id == project_id)
     return query.order_by(MonthlyOrgSummary.month.desc(), MonthlyOrgSummary.tool_name.asc()).all()
@@ -95,6 +105,8 @@ def get_usage_trends(
     )
     if org_id:
         query = query.filter(DailyOrgSummary.org_id == org_id)
+    else:
+        query = query.filter(DailyOrgSummary.org_id.in_(active_orgs_subq(db)))
 
     rows = query.all()
     return [
@@ -146,11 +158,14 @@ def get_governance_overview(
         datetime.combine(cutoff_date, time.min) if cutoff_date is not None else None
     )
 
+    _active = active_orgs_subq(db)
     today_query = db.query(DailyOrgSummary)
     if cutoff_date is not None:
         today_query = today_query.filter(DailyOrgSummary.date >= cutoff_date)
     if org_id:
         today_query = today_query.filter(DailyOrgSummary.org_id == org_id)
+    else:
+        today_query = today_query.filter(DailyOrgSummary.org_id.in_(_active))
     today_rows = today_query.all()
 
     total_cost = sum((Decimal(str(row.total_cost or 0)) for row in today_rows), Decimal("0"))
@@ -190,12 +205,20 @@ def get_governance_overview(
         recent_events_query = recent_events_query.filter(TelemetryEvent.org_id == org_id)
         alerts_count_query = alerts_count_query.filter(Alert.org_id == org_id)
         anomalies_count_query = anomalies_count_query.filter(UsageAnomaly.org_id == org_id)
+    else:
+        recent_alerts_query = recent_alerts_query.filter(Alert.org_id.in_(_active))
+        recent_anomalies_query = recent_anomalies_query.filter(UsageAnomaly.org_id.in_(_active))
+        recent_events_query = recent_events_query.filter(TelemetryEvent.org_id.in_(_active))
+        alerts_count_query = alerts_count_query.filter(Alert.org_id.in_(_active))
+        anomalies_count_query = anomalies_count_query.filter(UsageAnomaly.org_id.in_(_active))
 
     sev_filters = [Alert.status == "active"]
     if cutoff_dt is not None:
         sev_filters.append(Alert.created_at >= cutoff_dt)
     if org_id:
         sev_filters.append(Alert.org_id == org_id)
+    else:
+        sev_filters.append(Alert.org_id.in_(_active))
     severity_rows = (
         db.query(Alert.severity, func.count(Alert.id))
         .filter(*sev_filters)
@@ -220,6 +243,8 @@ def get_governance_overview(
         highest_risk = highest_risk.filter(TelemetryEvent.created_at >= cutoff_dt)
     if org_id:
         highest_risk = highest_risk.filter(TelemetryEvent.org_id == org_id)
+    else:
+        highest_risk = highest_risk.filter(TelemetryEvent.org_id.in_(_active))
 
     success_rate = Decimal("100")
     if total_success + total_failure > 0:
@@ -258,6 +283,8 @@ def _build_health_metrics(db: Session, org_id: Optional[str], cutoff_dt: Optiona
         query = query.filter(TelemetryEvent.created_at >= cutoff_dt)
     if org_id:
         query = query.filter(TelemetryEvent.org_id == org_id)
+    else:
+        query = query.filter(TelemetryEvent.org_id.in_(active_orgs_subq(db)))
     row = query.first()
     total_events = Decimal(str(row.events or 0))
     success_events = Decimal(str(row.success or 0))

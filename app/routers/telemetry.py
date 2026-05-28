@@ -7,6 +7,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_db
+from app.core.visibility import active_orgs_subq
 from app.models import Alert, Budget, CostBreakdown, DataSecurityLog, DailyOrgSummary, ExecutionPipeline, Organization, Project, RateLimit, TelemetryEvent, ToolConnector, ToolRegistry, UsageAnomaly
 from app.schemas import (
     BatchTelemetryIngest,
@@ -84,6 +85,8 @@ def list_telemetry_logs(
     query = db.query(TelemetryEvent)
     if org_id:
         query = query.filter(TelemetryEvent.org_id == org_id)
+    else:
+        query = query.filter(TelemetryEvent.org_id.in_(active_orgs_subq(db)))
     if tool_name:
         query = query.filter(TelemetryEvent.model_name == tool_name)
     if provider:
@@ -118,6 +121,8 @@ def super_admin_logs(
     query = db.query(TelemetryEvent)
     if org_id:
         query = query.filter(TelemetryEvent.org_id == org_id)
+    else:
+        query = query.filter(TelemetryEvent.org_id.in_(active_orgs_subq(db)))
     if tool_name:
         query = query.filter(TelemetryEvent.model_name == tool_name)
     if provider:
