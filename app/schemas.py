@@ -101,6 +101,8 @@ class CostSummary(BaseModel):
     external_cost: Decimal = Decimal("0")
     infra_cost: Decimal = Decimal("0")
     total_cost: Decimal = Decimal("0")
+    input_token_cost: Decimal = Decimal("0")
+    output_token_cost: Decimal = Decimal("0")
 
 
 class CostBreakdownResponse(BaseModel):
@@ -183,6 +185,8 @@ class DailySummaryResponse(BaseModel):
     llm_cost: Decimal
     infra_cost: Decimal
     external_cost: Decimal
+    input_token_cost: Decimal = Decimal("0")
+    output_token_cost: Decimal = Decimal("0")
     total_prompt_tokens: int = 0
     total_completion_tokens: int = 0
     total_tokens: int = 0
@@ -208,6 +212,8 @@ class MonthlySummaryResponse(BaseModel):
     llm_cost: Decimal
     infra_cost: Decimal
     external_cost: Decimal
+    input_token_cost: Decimal = Decimal("0")
+    output_token_cost: Decimal = Decimal("0")
     total_tokens: int = 0
     total_prompt_tokens: int = 0
     total_completion_tokens: int = 0

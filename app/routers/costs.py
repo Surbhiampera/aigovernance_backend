@@ -18,8 +18,14 @@ from app.models import (
     TelemetryEvent,
     ToolRegistry,
 )
+from app.services.ai_model_pricing import calculate_token_cost
 
 router = APIRouter(prefix="/costs", tags=["costs"])
+
+
+def _pricing(model_name: str, input_tokens: int, output_tokens: int) -> dict:
+    """Thin wrapper so all endpoints use the same call site."""
+    return calculate_token_cost(model_name, input_tokens, output_tokens)
 
 
 # Telemetry events ingested by the governance_logger decorator are stamped
@@ -72,14 +78,17 @@ def cost_by_model(
     for r in rows.all():
         total = r.total_events or 0
         success_rate = Decimal("100") if total == 0 else (Decimal(str(r.success_count or 0)) / Decimal(str(total))) * Decimal("100")
+        computed = _pricing(r.model_name or "", int(r.prompt_tokens or 0), int(r.completion_tokens or 0))
         results.append({
             "model_name": r.model_name,
             "provider": r.provider or "—",
             "total_events": total,
-            "prompt_tokens": r.prompt_tokens or 0,
-            "completion_tokens": r.completion_tokens or 0,
-            "total_tokens": r.total_tokens or 0,
-            "total_cost": float(r.total_cost or 0),
+            "prompt_tokens": int(r.prompt_tokens or 0),
+            "completion_tokens": int(r.completion_tokens or 0),
+            "total_tokens": int(r.total_tokens or 0),
+            "input_token_cost": computed["input_token_cost"],
+            "output_token_cost": computed["output_token_cost"],
+            "total_cost": computed["total_cost"],
             "avg_latency_ms": round(float(r.avg_latency_ms or 0), 1),
             "success_rate": round(float(success_rate), 1),
         })
@@ -128,24 +137,49 @@ def cost_by_project(
     if org_id:
         rows = rows.filter(Project.org_id == org_id)
 
-    return [
-        {
+    # Per-(project, model) token aggregates — used for dynamic cost computation
+    model_tokens_q = (
+        db.query(
+            TelemetryEvent.project_id,
+            TelemetryEvent.model_name,
+            func.sum(TelemetryEvent.prompt_tokens).label("input_tokens"),
+            func.sum(TelemetryEvent.completion_tokens).label("output_tokens"),
+        )
+        .filter(TelemetryEvent.model_name.isnot(None), TelemetryEvent.model_name != "")
+        .group_by(TelemetryEvent.project_id, TelemetryEvent.model_name)
+    )
+    if org_id:
+        model_tokens_q = model_tokens_q.filter(TelemetryEvent.org_id == org_id)
+
+    # project_id → {input_token_cost, output_token_cost, total_cost}
+    project_dynamic_costs: dict = {}
+    for mt in model_tokens_q.all():
+        c = _pricing(mt.model_name, int(mt.input_tokens or 0), int(mt.output_tokens or 0))
+        pid = mt.project_id or ""
+        agg = project_dynamic_costs.setdefault(pid, {"input_token_cost": 0.0, "output_token_cost": 0.0, "total_cost": 0.0})
+        agg["input_token_cost"] = round(agg["input_token_cost"] + c["input_token_cost"], 6)
+        agg["output_token_cost"] = round(agg["output_token_cost"] + c["output_token_cost"], 6)
+        agg["total_cost"] = round(agg["total_cost"] + c["total_cost"], 6)
+
+    result = []
+    for r in rows.all():
+        pid = r.project_id or ""
+        dc = project_dynamic_costs.get(pid, {"input_token_cost": 0.0, "output_token_cost": 0.0, "total_cost": 0.0})
+        result.append({
             "project_id": r.project_id,
             "org_id": r.org_id,
             "org_name": r.org_name,
             "project_name": r.project_name,
             "environment": r.environment,
             "total_events": r.total_events or 0,
-            "total_tokens": r.total_tokens or 0,
-            "llm_cost": float(r.llm_cost or 0),
-            "infra_cost": float(r.infra_cost or 0),
-            "external_cost": float(r.external_cost or 0),
-            "total_cost": float(r.total_cost or 0),
+            "total_tokens": int(r.total_tokens or 0),
+            "input_token_cost": dc["input_token_cost"],
+            "output_token_cost": dc["output_token_cost"],
+            "total_cost": dc["total_cost"],
             "avg_latency_ms": round(float(r.avg_latency_ms or 0), 1),
             "tool_count": int(r.tool_count or 0),
-        }
-        for r in rows.all()
-    ]
+        })
+    return result
 
 
 @router.get("/project-breakdown")
@@ -186,46 +220,44 @@ def project_cost_breakdown(
             func.max(ToolRegistry.vendor).label("vendor"),
             func.max(ToolRegistry.cost_model).label("cost_model"),
             func.count(TelemetryEvent.id).label("total_events"),
+            func.sum(TelemetryEvent.prompt_tokens).label("input_tokens"),
+            func.sum(TelemetryEvent.completion_tokens).label("output_tokens"),
             func.sum(TelemetryEvent.total_tokens).label("total_tokens"),
-            func.sum(TelemetryEvent.llm_cost).label("llm_cost"),
-            func.sum(TelemetryEvent.infra_cost).label("infra_cost"),
-            func.sum(TelemetryEvent.external_cost).label("external_cost"),
-            func.sum(TelemetryEvent.total_cost).label("total_cost"),
         )
         .outerjoin(ToolRegistry, ToolRegistry.tool_name == TelemetryEvent.model_name)
         .filter(*filters)
         .filter(TelemetryEvent.model_name.isnot(None), TelemetryEvent.model_name != "")
         .group_by(TelemetryEvent.model_name)
-        .order_by(func.sum(TelemetryEvent.total_cost).desc())
         .all()
     )
 
-    tools = [
-        {
+    tools = []
+    dynamic_total = 0.0
+    for r in tool_rows:
+        c = _pricing(r.tool_name or "", int(r.input_tokens or 0), int(r.output_tokens or 0))
+        dynamic_total += c["total_cost"]
+        tools.append({
             "tool_name": r.tool_name,
             "vendor": r.vendor or "—",
             "cost_model": r.cost_model or "per_token",
             "total_events": r.total_events or 0,
             "total_tokens": int(r.total_tokens or 0),
-            "llm_cost": float(r.llm_cost or 0),
-            "infra_cost": float(r.infra_cost or 0),
-            "external_cost": float(r.external_cost or 0),
-            "total_cost": float(r.total_cost or 0),
-            "cost_share_pct": pct(float(r.total_cost or 0)),
-        }
-        for r in tool_rows
-    ]
+            "input_token_cost": c["input_token_cost"],
+            "output_token_cost": c["output_token_cost"],
+            "total_cost": c["total_cost"],
+        })
+
+    # Recompute cost_share_pct using dynamic totals
+    for t in tools:
+        t["cost_share_pct"] = round((t["total_cost"] / dynamic_total * 100), 1) if dynamic_total > 0 else 0.0
+
+    # Sort by computed cost desc
+    tools.sort(key=lambda x: x["total_cost"], reverse=True)
 
     return {
         "project_id": project_id,
         "org_id": org_id,
-        "total_cost": round(total_cost, 6),
-        "llm_cost": round(llm, 6),
-        "infra_cost": round(infra, 6),
-        "external_cost": round(external, 6),
-        "llm_pct": pct(llm),
-        "infra_pct": pct(infra),
-        "external_pct": pct(external),
+        "total_cost": round(dynamic_total, 6),
         "total_events": int(totals.total_events or 0) if totals else 0,
         "total_tokens": int(totals.total_tokens or 0) if totals else 0,
         "avg_latency_ms": round(float(totals.avg_latency_ms or 0), 1) if totals else 0.0,
@@ -246,7 +278,8 @@ def cost_daily(
         db.query(
             DailyOrgSummary.date,
             DailyOrgSummary.tool_name,
-            func.sum(DailyOrgSummary.total_cost).label("total_cost"),
+            func.sum(DailyOrgSummary.total_prompt_tokens).label("input_tokens"),
+            func.sum(DailyOrgSummary.total_completion_tokens).label("output_tokens"),
             func.sum(DailyOrgSummary.total_tokens).label("total_tokens"),
             func.sum(DailyOrgSummary.total_events).label("total_events"),
         )
@@ -259,16 +292,21 @@ def cost_daily(
     if project_id:
         query = query.filter(DailyOrgSummary.project_id == project_id)
 
-    return [
-        {
+    results = []
+    for r in query.all():
+        computed = _pricing(r.tool_name, int(r.input_tokens or 0), int(r.output_tokens or 0))
+        results.append({
             "date": str(r.date),
             "tool_name": r.tool_name,
-            "total_cost": float(r.total_cost or 0),
-            "total_tokens": r.total_tokens or 0,
-            "total_events": r.total_events or 0,
-        }
-        for r in query.all()
-    ]
+            "input_tokens": int(r.input_tokens or 0),
+            "output_tokens": int(r.output_tokens or 0),
+            "total_tokens": int(r.total_tokens or 0),
+            "input_token_cost": computed["input_token_cost"],
+            "output_token_cost": computed["output_token_cost"],
+            "total_cost": computed["total_cost"],
+            "total_events": int(r.total_events or 0),
+        })
+    return results
 
 
 @router.get("/monthly")
@@ -281,7 +319,8 @@ def cost_monthly(
         db.query(
             MonthlyOrgSummary.month,
             MonthlyOrgSummary.tool_name,
-            func.sum(MonthlyOrgSummary.total_cost).label("total_cost"),
+            func.sum(MonthlyOrgSummary.total_prompt_tokens).label("input_tokens"),
+            func.sum(MonthlyOrgSummary.total_completion_tokens).label("output_tokens"),
             func.sum(MonthlyOrgSummary.total_tokens).label("total_tokens"),
             func.sum(MonthlyOrgSummary.total_events).label("total_events"),
         )
@@ -293,16 +332,21 @@ def cost_monthly(
     if project_id:
         query = query.filter(MonthlyOrgSummary.project_id == project_id)
 
-    return [
-        {
+    results = []
+    for r in query.all():
+        computed = _pricing(r.tool_name, int(r.input_tokens or 0), int(r.output_tokens or 0))
+        results.append({
             "month": str(r.month),
             "tool_name": r.tool_name,
-            "total_cost": float(r.total_cost or 0),
-            "total_tokens": r.total_tokens or 0,
-            "total_events": r.total_events or 0,
-        }
-        for r in query.all()
-    ]
+            "input_tokens": int(r.input_tokens or 0),
+            "output_tokens": int(r.output_tokens or 0),
+            "total_tokens": int(r.total_tokens or 0),
+            "input_token_cost": computed["input_token_cost"],
+            "output_token_cost": computed["output_token_cost"],
+            "total_cost": computed["total_cost"],
+            "total_events": int(r.total_events or 0),
+        })
+    return results
 
 
 @router.get("/by-org")
@@ -421,32 +465,30 @@ def cost_by_tool(
             func.max(ToolRegistry.vendor).label("vendor"),
             func.max(ToolRegistry.cost_model).label("cost_model"),
             func.count(TelemetryEvent.id).label("total_events"),
+            func.sum(TelemetryEvent.prompt_tokens).label("input_tokens"),
+            func.sum(TelemetryEvent.completion_tokens).label("output_tokens"),
             func.sum(TelemetryEvent.total_tokens).label("total_tokens"),
-            func.sum(TelemetryEvent.llm_cost).label("llm_cost"),
-            func.sum(TelemetryEvent.infra_cost).label("infra_cost"),
-            func.sum(TelemetryEvent.external_cost).label("external_cost"),
-            func.sum(TelemetryEvent.total_cost).label("total_cost"),
         )
         .outerjoin(ToolRegistry, ToolRegistry.tool_name == TelemetryEvent.model_name)
         .filter(TelemetryEvent.model_name.isnot(None), TelemetryEvent.model_name != "")
         .group_by(TelemetryEvent.model_name)
-        .order_by(func.sum(TelemetryEvent.total_cost).desc())
     )
     rows = _scope(rows, TelemetryEvent, org_id, project_id, db=db)
-    return [
-        {
+    results = []
+    for r in rows.all():
+        computed = _pricing(r.tool_name or "", int(r.input_tokens or 0), int(r.output_tokens or 0))
+        results.append({
             "tool_name": r.tool_name,
             "vendor": r.vendor or "—",
             "cost_model": r.cost_model or "per_token",
             "total_events": r.total_events or 0,
             "total_tokens": int(r.total_tokens or 0),
-            "llm_cost": float(r.llm_cost or 0),
-            "infra_cost": float(r.infra_cost or 0),
-            "external_cost": float(r.external_cost or 0),
-            "total_cost": float(r.total_cost or 0),
-        }
-        for r in rows.all()
-    ]
+            "input_token_cost": computed["input_token_cost"],
+            "output_token_cost": computed["output_token_cost"],
+            "total_cost": computed["total_cost"],
+        })
+    results.sort(key=lambda x: x["total_cost"], reverse=True)
+    return results
 
 
 @router.get("/by-provider")
@@ -618,7 +660,6 @@ def cost_per_tool_daily(
         db.query(
             DailyOrgSummary.date,
             DailyOrgSummary.tool_name,
-            func.sum(DailyOrgSummary.total_cost).label("total_cost"),
             func.sum(DailyOrgSummary.total_prompt_tokens).label("input_tokens"),
             func.sum(DailyOrgSummary.total_completion_tokens).label("output_tokens"),
             func.sum(DailyOrgSummary.total_tokens).label("total_tokens"),
@@ -626,7 +667,7 @@ def cost_per_tool_daily(
         )
         .filter(DailyOrgSummary.date >= cutoff)
         .group_by(DailyOrgSummary.date, DailyOrgSummary.tool_name)
-        .order_by(DailyOrgSummary.date.desc(), func.sum(DailyOrgSummary.total_cost).desc())
+        .order_by(DailyOrgSummary.date.desc())
     )
     if org_id:
         query = query.filter(DailyOrgSummary.org_id == org_id)
@@ -653,19 +694,26 @@ def cost_per_tool_daily(
         email_q = email_q.filter(TelemetryEvent.project_id == project_id)
     email_map = {(str(r.date), r.tool_name): int(r.email_count) for r in email_q.all()}
 
-    return [
-        {
+    rows = []
+    for r in query.all():
+        in_tok = int(r.input_tokens or 0)
+        out_tok = int(r.output_tokens or 0)
+        computed = _pricing(r.tool_name, in_tok, out_tok)
+        rows.append({
             "date": str(r.date),
             "tool_name": r.tool_name,
-            "input_tokens": int(r.input_tokens or 0),
-            "output_tokens": int(r.output_tokens or 0),
+            "input_tokens": in_tok,
+            "output_tokens": out_tok,
             "total_tokens": int(r.total_tokens or 0),
-            "total_cost": float(r.total_cost or 0),
+            "input_token_cost": computed["input_token_cost"],
+            "output_token_cost": computed["output_token_cost"],
+            "total_cost": computed["total_cost"],
             "total_events": int(r.total_events or 0),
             "email_volume": email_map.get((str(r.date), r.tool_name), 0),
-        }
-        for r in query.all()
-    ]
+        })
+    # Re-sort by computed total_cost desc after pricing applied
+    rows.sort(key=lambda x: (x["date"], -x["total_cost"]))
+    return rows
 
 
 @router.get("/spend-cap-status")

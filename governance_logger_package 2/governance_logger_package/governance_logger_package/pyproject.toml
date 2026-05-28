@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "governance-logger"
+version = "1.2.0"
+description = "AI Governance telemetry decorator - one line to track any FastAPI route or Python function."
+requires-python = ">=3.8"
+
+[project.optional-dependencies]
+fastapi = ["fastapi>=0.95"]
+async = ["httpx>=0.24"]
+requests = ["requests>=2.28"]

@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.core.deps import get_db
 from app.core.visibility import active_orgs_subq
-from app.models import Alert, DailyOrgSummary, GovernanceRule, TelemetryEvent, ToolConnector, UsageAnomaly
+from app.models import Alert, DailyOrgSummary, GovernanceRule, MonthlyOrgSummary, TelemetryEvent, ToolConnector, UsageAnomaly
 from app.routers.telemetry import _build_event_response
 from app.schemas import (
     AlertResponse,
@@ -18,8 +18,74 @@ from app.schemas import (
     TodaySummaryResponse,
     UsageAnomalyResponse,
 )
+from app.services.ai_model_pricing import calculate_token_cost
 
 router = APIRouter(prefix="/summary", tags=["summary"])
+
+
+def _build_daily_response(r: DailyOrgSummary) -> DailySummaryResponse:
+    """Build DailySummaryResponse with costs computed dynamically from the pricing catalogue."""
+    computed = calculate_token_cost(
+        r.tool_name,
+        r.total_prompt_tokens or 0,
+        r.total_completion_tokens or 0,
+    )
+    total_cost = Decimal(str(computed["total_cost"]))
+    return DailySummaryResponse(
+        org_id=r.org_id,
+        project_id=r.project_id,
+        tool_name=r.tool_name,
+        date=r.date,
+        total_events=r.total_events or 0,
+        total_cost=total_cost,
+        llm_cost=total_cost,
+        infra_cost=Decimal(str(r.infra_cost or 0)),
+        external_cost=Decimal(str(r.external_cost or 0)),
+        input_token_cost=Decimal(str(computed["input_token_cost"])),
+        output_token_cost=Decimal(str(computed["output_token_cost"])),
+        total_prompt_tokens=r.total_prompt_tokens or 0,
+        total_completion_tokens=r.total_completion_tokens or 0,
+        total_tokens=r.total_tokens or 0,
+        avg_latency_ms=r.avg_latency_ms or 0,
+        success_count=r.success_count or 0,
+        failure_count=r.failure_count or 0,
+        anomaly_count=r.anomaly_count or 0,
+        misuse_count=r.misuse_count or 0,
+        total_input_mb=Decimal(str(r.total_input_mb or 0)),
+        total_output_mb=Decimal(str(r.total_output_mb or 0)),
+        avg_risk_score=Decimal(str(r.avg_risk_score or 0)),
+    )
+
+
+def _build_monthly_response(r: MonthlyOrgSummary) -> MonthlySummaryResponse:
+    """Build MonthlySummaryResponse with costs computed dynamically from the pricing catalogue."""
+    computed = calculate_token_cost(
+        r.tool_name,
+        r.total_prompt_tokens or 0,
+        r.total_completion_tokens or 0,
+    )
+    total_cost = Decimal(str(computed["total_cost"]))
+    return MonthlySummaryResponse(
+        org_id=r.org_id,
+        project_id=r.project_id,
+        tool_name=r.tool_name,
+        month=r.month,
+        total_events=r.total_events or 0,
+        total_cost=total_cost,
+        llm_cost=total_cost,
+        infra_cost=Decimal(str(r.infra_cost or 0)),
+        external_cost=Decimal(str(r.external_cost or 0)),
+        input_token_cost=Decimal(str(computed["input_token_cost"])),
+        output_token_cost=Decimal(str(computed["output_token_cost"])),
+        total_tokens=r.total_tokens or 0,
+        total_prompt_tokens=r.total_prompt_tokens or 0,
+        total_completion_tokens=r.total_completion_tokens or 0,
+        avg_latency_ms=r.avg_latency_ms or 0,
+        success_count=r.success_count or 0,
+        failure_count=r.failure_count or 0,
+        anomaly_count=r.anomaly_count or 0,
+        misuse_count=r.misuse_count or 0,
+    )
 
 
 @router.get("/today", response_model=TodaySummaryResponse)
@@ -31,12 +97,13 @@ def get_today_summary(db: Session = Depends(get_db)):
         .filter(DailyOrgSummary.org_id.in_(active_orgs_subq(db)))
         .all()
     )
-    total_cost = sum((Decimal(str(r.total_cost or 0)) for r in rows), Decimal("0"))
-    total_events = sum((r.total_events or 0 for r in rows), 0)
+    tool_responses = [_build_daily_response(r) for r in rows]
+    total_cost = sum((t.total_cost for t in tool_responses), Decimal("0"))
+    total_events = sum((t.total_events for t in tool_responses), 0)
     return TodaySummaryResponse(
         total_cost=total_cost,
         total_events=total_events,
-        tools=[DailySummaryResponse.model_validate(r) for r in rows],
+        tools=tool_responses,
     )
 
 
@@ -59,7 +126,7 @@ def get_daily_summary(
         query = query.filter(DailyOrgSummary.org_id.in_(active_orgs_subq(db)))
     if project_id:
         query = query.filter(DailyOrgSummary.project_id == project_id)
-    return query.order_by(DailyOrgSummary.date.asc(), DailyOrgSummary.tool_name.asc()).all()
+    return [_build_daily_response(r) for r in query.order_by(DailyOrgSummary.date.asc(), DailyOrgSummary.tool_name.asc()).all()]
 
 
 @router.get("/monthly", response_model=list[MonthlySummaryResponse])
@@ -77,7 +144,7 @@ def get_monthly_summary(
         query = query.filter(MonthlyOrgSummary.org_id.in_(active_orgs_subq(db)))
     if project_id:
         query = query.filter(MonthlyOrgSummary.project_id == project_id)
-    return query.order_by(MonthlyOrgSummary.month.desc(), MonthlyOrgSummary.tool_name.asc()).all()
+    return [_build_monthly_response(r) for r in query.order_by(MonthlyOrgSummary.month.desc(), MonthlyOrgSummary.tool_name.asc()).all()]
 
 
 @router.get("/trends")
@@ -168,7 +235,8 @@ def get_governance_overview(
         today_query = today_query.filter(DailyOrgSummary.org_id.in_(_active))
     today_rows = today_query.all()
 
-    total_cost = sum((Decimal(str(row.total_cost or 0)) for row in today_rows), Decimal("0"))
+    tool_rollup_responses = [_build_daily_response(row) for row in today_rows]
+    total_cost = sum((t.total_cost for t in tool_rollup_responses), Decimal("0"))
     total_events = sum((row.total_events or 0 for row in today_rows), 0)
     total_tokens = sum((row.total_tokens or 0 for row in today_rows), 0)
     total_success = sum((row.success_count or 0 for row in today_rows), 0)
@@ -265,7 +333,7 @@ def get_governance_overview(
         alerts_by_severity={severity or "unknown": count for severity, count in severity_rows},
         cost_by_type={key: value.quantize(Decimal("0.000001")) for key, value in cost_by_type.items()},
         health=health,
-        tool_rollup=[DailySummaryResponse.model_validate(row) for row in today_rows],
+        tool_rollup=tool_rollup_responses,
         recent_alerts=[AlertResponse.model_validate(row) for row in recent_alerts],
         recent_anomalies=[UsageAnomalyResponse.model_validate(row) for row in recent_anomalies],
         recent_events=[_build_event_response(db, row) for row in recent_events],
