@@ -115,14 +115,137 @@ def _safe_preview(obj: Any, max_chars: int = 500) -> tuple:
         return "", 0, False, []
 
 
+# ── Model name aliases (kept in sync with backend ai_model_pricing.MODEL_ALIASES) ──
+_MODEL_ALIASES: dict = {
+    "groq-llama":        "llama-3.3-70b-versatile",
+    "groq-llama3":       "llama-3.3-70b-versatile",
+    "llama3":            "llama-3.3-70b-versatile",
+    "llama-3":           "llama-3.3-70b-versatile",
+    "llama3-70b":        "llama-3.3-70b-versatile",
+    "llama-3-70b":       "llama-3.3-70b-versatile",
+    "llama-3.3-70b":     "llama-3.3-70b-versatile",
+    "azure-gpt":         "gpt-4o",
+    "azure-gpt4o":       "gpt-4o",
+    "azure-gpt-4o":      "gpt-4o",
+    "gpt4o":             "gpt-4o",
+    "gpt-4o-latest":     "gpt-4o",
+    "gpt4":              "gpt-4",
+    "gpt-35-turbo":      "gpt-3.5-turbo",
+    "gpt-35-turbo-16k":  "gpt-3.5-turbo",
+    "claude-3-5-sonnet": "claude-3-5-sonnet-20241022",
+    "claude-3-5-haiku":  "claude-3-5-haiku-20241022",
+    "claude-3-haiku":    "claude-3-5-haiku-20241022",
+    "claude-3-opus":     "claude-3-opus-20240229",
+    "claude-sonnet":     "claude-3-5-sonnet-20241022",
+    "claude-haiku":      "claude-3-5-haiku-20241022",
+    "claude-opus":       "claude-3-opus-20240229",
+    "gemini-pro":        "gemini-1.5-pro",
+    "gemini-flash":      "gemini-2.0-flash",
+    "mistral-large":     "mistral-large-2411",
+    "mistral-small":     "mistral-small-2503",
+}
+
+
+def _normalize_model_name(model_name: Optional[str]) -> Optional[str]:
+    """Resolve shorthand / deployment aliases to canonical model names."""
+    if not model_name:
+        return model_name
+    return (
+        _MODEL_ALIASES.get(model_name)
+        or _MODEL_ALIASES.get(model_name.lower())
+        or model_name
+    )
+
+
+def _is_stream(obj: Any) -> bool:
+    if obj is None:
+        return False
+    name = type(obj).__name__.lower()
+    return any(x in name for x in ("stream", "asyncgenerator")) and not isinstance(obj, (str, bytes, dict, list))
+
+
+class _SyncStreamCapture:
+    """Proxy a sync LLM stream; fire on_complete(prompt, completion) when exhausted."""
+
+    def __init__(self, stream: Any, on_complete: "Callable[[int, int], None]") -> None:
+        self._stream = stream
+        self._on_complete = on_complete
+        self._prompt = 0
+        self._completion = 0
+
+    def __iter__(self):
+        for chunk in self._stream:
+            usage = getattr(chunk, "usage", None)
+            if usage is not None:
+                self._prompt = int(getattr(usage, "prompt_tokens", None) or 0)
+                self._completion = int(getattr(usage, "completion_tokens", None) or 0)
+            yield chunk
+        self._on_complete(self._prompt, self._completion)
+
+    def __enter__(self):
+        return self._stream.__enter__() if hasattr(self._stream, "__enter__") else self
+
+    def __exit__(self, *args):
+        if hasattr(self._stream, "__exit__"):
+            self._stream.__exit__(*args)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+
+class _AsyncStreamCapture:
+    """Proxy an async LLM stream; fire on_complete(prompt, completion) when exhausted."""
+
+    def __init__(self, stream: Any, on_complete: "Callable[[int, int], None]") -> None:
+        self._stream = stream
+        self._on_complete = on_complete
+        self._prompt = 0
+        self._completion = 0
+
+    def __aiter__(self):
+        return self._aiter_impl()
+
+    async def _aiter_impl(self):
+        async for chunk in self._stream:
+            usage = getattr(chunk, "usage", None)
+            if usage is not None:
+                self._prompt = int(getattr(usage, "prompt_tokens", None) or 0)
+                self._completion = int(getattr(usage, "completion_tokens", None) or 0)
+            yield chunk
+        self._on_complete(self._prompt, self._completion)
+
+    async def __aenter__(self):
+        if hasattr(self._stream, "__aenter__"):
+            return await self._stream.__aenter__()
+        return self
+
+    async def __aexit__(self, *args):
+        if hasattr(self._stream, "__aexit__"):
+            await self._stream.__aexit__(*args)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+
 # ── Token extraction — works with any SDK response shape ─────────────────────
 
 def _extract_tokens(response: Any) -> tuple:
-    """Return (prompt_tokens, completion_tokens) from any SDK / dict response."""
+    """
+    Return (prompt_tokens, completion_tokens) from any LLM SDK / dict response.
+
+    Supports: OpenAI / Groq / Azure (response.usage.prompt_tokens),
+              Anthropic (response.usage.input_tokens),
+              Google Gemini (response.usage_metadata.prompt_token_count),
+              raw dict shapes, and nested response wrappers.
+    Streaming objects return (0, 0).
+    """
     if response is None:
         return 0, 0
 
-    # 1. SDK objects: response.usage.prompt_tokens / .input_tokens
+    if _is_stream(response):
+        return 0, 0
+
+    # 1. OpenAI / Groq / Azure / Anthropic SDK object
     usage = getattr(response, "usage", None)
     if usage is not None:
         p = getattr(usage, "prompt_tokens", None) or getattr(usage, "input_tokens", None) or 0
@@ -130,31 +253,36 @@ def _extract_tokens(response: Any) -> tuple:
         if p or c:
             return int(p), int(c)
 
-    # 2. Dict with nested usage block
+    # 2. Google Gemini: response.usage_metadata.prompt_token_count + candidates_token_count
+    usage_metadata = getattr(response, "usage_metadata", None)
+    if usage_metadata is not None:
+        p = getattr(usage_metadata, "prompt_token_count", None) or 0
+        c = getattr(usage_metadata, "candidates_token_count", None) or 0
+        if p or c:
+            return int(p), int(c)
+        total = getattr(usage_metadata, "total_token_count", None) or 0
+        if total:
+            return int(total), 0
+
+    # 3. Dict with nested usage block
     if isinstance(response, dict):
-        u = response.get("usage") or {}
-        p = u.get("prompt_tokens") or u.get("input_tokens") or 0
-        c = u.get("completion_tokens") or u.get("output_tokens") or 0
-        if p or c:
-            return int(p), int(c)
-        # 3. Top-level token keys
-        p = response.get("prompt_tokens") or response.get("input_tokens") or 0
-        c = response.get("completion_tokens") or response.get("output_tokens") or 0
-        if p or c:
-            return int(p), int(c)
-        # 4. Nested response/result wrapper
+        for candidate in (response.get("usage"), response.get("metrics"), response):
+            if isinstance(candidate, dict):
+                p = candidate.get("prompt_tokens") or candidate.get("input_tokens") or candidate.get("total_input_tokens") or 0
+                c = candidate.get("completion_tokens") or candidate.get("output_tokens") or candidate.get("total_output_tokens") or 0
+                if p or c:
+                    return int(p), int(c)
         nested = response.get("response") or response.get("result")
         if nested is not None and nested is not response:
             p, c = _extract_tokens(nested)
             if p or c:
                 return p, c
-        # 5. total_tokens only
         t = response.get("total_tokens") or 0
         if t:
             return int(t), 0
         return 0, 0
 
-    # 6. Pydantic / dataclass with top-level token attributes
+    # 4. Pydantic / dataclass with top-level token attributes
     p = getattr(response, "prompt_tokens", None) or getattr(response, "input_tokens", None) or 0
     c = getattr(response, "completion_tokens", None) or getattr(response, "output_tokens", None) or 0
     return int(p), int(c)
@@ -422,35 +550,59 @@ def governance_logger(
                         input_data, max_preview_chars
                     )
 
+                streaming = False
                 try:
                     result = await fn(*args, **kwargs)
+
+                    if _is_stream(result):
+                        streaming = True
+                        lms = int((time.time() - start) * 1000)
+
+                        def _on_async_done(p: int, c: int) -> None:
+                            rm = _normalize_model_name(_extract_model(None, model_name))
+                            pl = _build_payload(
+                                None, "success", None, lms,
+                                http_method, http_path,
+                                input_preview, input_size, input_pii, input_pii_types,
+                                org_id, project_id, hdr_user_id,
+                                p, c, rm, resolved_trace_id,
+                            )
+                            threading.Thread(
+                                target=_http_post_sync,
+                                args=(_ingest_url, pl, _api_key),
+                                daemon=True,
+                            ).start()
+
+                        return _AsyncStreamCapture(result, _on_async_done)
+
                     return result
                 except Exception as exc:
                     status    = "error"
                     error_msg = str(exc)
                     raise
                 finally:
-                    latency_ms     = int((time.time() - start) * 1000)
-                    prompt_tokens, completion_tokens = _extract_tokens(result)
-                    resolved_model = _extract_model(result, model_name)
-                    payload = _build_payload(
-                        result, status, error_msg, latency_ms,
-                        http_method, http_path,
-                        input_preview, input_size, input_pii, input_pii_types,
-                        org_id, project_id, hdr_user_id,
-                        prompt_tokens, completion_tokens,
-                        resolved_model, resolved_trace_id,
-                    )
-                    try:
-                        asyncio.get_running_loop().create_task(
-                            _http_post_async(_ingest_url, payload, _api_key)
+                    if not streaming:
+                        latency_ms     = int((time.time() - start) * 1000)
+                        prompt_tokens, completion_tokens = _extract_tokens(result)
+                        resolved_model = _normalize_model_name(_extract_model(result, model_name))
+                        payload = _build_payload(
+                            result, status, error_msg, latency_ms,
+                            http_method, http_path,
+                            input_preview, input_size, input_pii, input_pii_types,
+                            org_id, project_id, hdr_user_id,
+                            prompt_tokens, completion_tokens,
+                            resolved_model, resolved_trace_id,
                         )
-                    except RuntimeError:
-                        threading.Thread(
-                            target=_http_post_sync,
-                            args=(_ingest_url, payload, _api_key),
-                            daemon=True,
-                        ).start()
+                        try:
+                            asyncio.get_running_loop().create_task(
+                                _http_post_async(_ingest_url, payload, _api_key)
+                            )
+                        except RuntimeError:
+                            threading.Thread(
+                                target=_http_post_sync,
+                                args=(_ingest_url, payload, _api_key),
+                                daemon=True,
+                            ).start()
 
             if _HAS_FASTAPI and not has_request_param:
                 params = list(sig.parameters.values())
@@ -494,30 +646,55 @@ def governance_logger(
                         input_data, max_preview_chars
                     )
 
+                streaming = False
                 try:
                     result = fn(*args, **kwargs)
+
+                    if _is_stream(result):
+                        streaming = True
+                        lms = int((time.time() - start) * 1000)
+
+                        def _on_sync_done(p: int, c: int) -> None:
+                            rm = _normalize_model_name(_extract_model(None, model_name))
+                            pl = _build_payload(
+                                None, "success", None, lms,
+                                http_method, http_path,
+                                input_preview, input_size, input_pii, input_pii_types,
+                                org_id, project_id, hdr_user_id,
+                                p, c, rm, resolved_trace_id,
+                            )
+                            threading.Thread(
+                                target=_http_post_sync,
+                                args=(_ingest_url, pl, _api_key),
+                                daemon=True,
+                            ).start()
+
+                        return _SyncStreamCapture(result, _on_sync_done)
+
                     return result
                 except Exception as exc:
                     status    = "error"
                     error_msg = str(exc)
                     raise
                 finally:
-                    latency_ms     = int((time.time() - start) * 1000)
-                    prompt_tokens, completion_tokens = _extract_tokens(result)
-                    resolved_model = _extract_model(result, model_name)
-                    payload = _build_payload(
-                        result, status, error_msg, latency_ms,
-                        http_method, http_path,
-                        input_preview, input_size, input_pii, input_pii_types,
-                        org_id, project_id, hdr_user_id,
-                        prompt_tokens, completion_tokens,
-                        resolved_model, resolved_trace_id,
-                    )
-                    threading.Thread(
-                        target=_http_post_sync,
-                        args=(_ingest_url, payload, _api_key),
-                        daemon=True,
-                    ).start()
+                    if not streaming:
+                        latency_ms     = int((time.time() - start) * 1000)
+                        prompt_tokens, completion_tokens = _extract_tokens(result)
+                        resolved_model = _normalize_model_name(_extract_model(result, model_name))
+                        payload = _build_payload(
+                            result, status, error_msg, latency_ms,
+                            http_method, http_path,
+                            input_preview, input_size, input_pii, input_pii_types,
+                            org_id, project_id, hdr_user_id,
+                            prompt_tokens, completion_tokens,
+                            resolved_model, resolved_trace_id,
+                        )
+                    if not streaming:
+                        threading.Thread(
+                            target=_http_post_sync,
+                            args=(_ingest_url, payload, _api_key),
+                            daemon=True,
+                        ).start()
 
             if _HAS_FASTAPI and not has_request_param:
                 params = list(sig.parameters.values())

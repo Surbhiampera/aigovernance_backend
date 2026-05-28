@@ -114,14 +114,147 @@ def _args_to_dict(fn: Callable, args: tuple, kwargs: dict) -> dict:
         return {"args": list(args), "kwargs": kwargs}
 
 
+# ── Model name aliases (kept in sync with backend ai_model_pricing.MODEL_ALIASES) ──
+_MODEL_ALIASES: dict = {
+    "groq-llama":        "llama-3.3-70b-versatile",
+    "groq-llama3":       "llama-3.3-70b-versatile",
+    "llama3":            "llama-3.3-70b-versatile",
+    "llama-3":           "llama-3.3-70b-versatile",
+    "llama3-70b":        "llama-3.3-70b-versatile",
+    "llama-3-70b":       "llama-3.3-70b-versatile",
+    "llama-3.3-70b":     "llama-3.3-70b-versatile",
+    "azure-gpt":         "gpt-4o",
+    "azure-gpt4o":       "gpt-4o",
+    "azure-gpt-4o":      "gpt-4o",
+    "gpt4o":             "gpt-4o",
+    "gpt-4o-latest":     "gpt-4o",
+    "gpt4":              "gpt-4",
+    "gpt-35-turbo":      "gpt-3.5-turbo",
+    "gpt-35-turbo-16k":  "gpt-3.5-turbo",
+    "claude-3-5-sonnet": "claude-3-5-sonnet-20241022",
+    "claude-3-5-haiku":  "claude-3-5-haiku-20241022",
+    "claude-3-haiku":    "claude-3-5-haiku-20241022",
+    "claude-3-opus":     "claude-3-opus-20240229",
+    "claude-sonnet":     "claude-3-5-sonnet-20241022",
+    "claude-haiku":      "claude-3-5-haiku-20241022",
+    "claude-opus":       "claude-3-opus-20240229",
+    "gemini-pro":        "gemini-1.5-pro",
+    "gemini-flash":      "gemini-2.0-flash",
+    "mistral-large":     "mistral-large-2411",
+    "mistral-small":     "mistral-small-2503",
+}
+
+
+def _normalize_model_name(model_name: Optional[str]) -> Optional[str]:
+    """Resolve shorthand / deployment aliases to canonical model names."""
+    if not model_name:
+        return model_name
+    return (
+        _MODEL_ALIASES.get(model_name)
+        or _MODEL_ALIASES.get(model_name.lower())
+        or model_name
+    )
+
+
+def _is_stream(obj: Any) -> bool:
+    """Return True if obj is a streaming response that tokens cannot be read from yet."""
+    if obj is None:
+        return False
+    name = type(obj).__name__.lower()
+    return any(x in name for x in ("stream", "asyncgenerator")) and not isinstance(obj, (str, bytes, dict, list))
+
+
+class _SyncStreamCapture:
+    """
+    Transparent proxy around a sync OpenAI/Groq stream.
+    Captures usage from the last chunk and fires on_complete(prompt, completion)
+    when the stream is exhausted.
+    Pass stream_options={"include_usage": True} to the LLM call so the final
+    chunk carries usage data.
+    """
+
+    def __init__(self, stream: Any, on_complete: "Callable[[int, int], None]") -> None:
+        self._stream = stream
+        self._on_complete = on_complete
+        self._prompt = 0
+        self._completion = 0
+
+    def __iter__(self):
+        for chunk in self._stream:
+            usage = getattr(chunk, "usage", None)
+            if usage is not None:
+                self._prompt = int(getattr(usage, "prompt_tokens", None) or 0)
+                self._completion = int(getattr(usage, "completion_tokens", None) or 0)
+            yield chunk
+        self._on_complete(self._prompt, self._completion)
+
+    def __enter__(self):
+        return self._stream.__enter__() if hasattr(self._stream, "__enter__") else self
+
+    def __exit__(self, *args):
+        if hasattr(self._stream, "__exit__"):
+            self._stream.__exit__(*args)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+
+class _AsyncStreamCapture:
+    """
+    Transparent proxy around an async OpenAI/Groq stream.
+    Captures usage from the last chunk and fires on_complete(prompt, completion).
+    """
+
+    def __init__(self, stream: Any, on_complete: "Callable[[int, int], None]") -> None:
+        self._stream = stream
+        self._on_complete = on_complete
+        self._prompt = 0
+        self._completion = 0
+
+    def __aiter__(self):
+        return self._aiter_impl()
+
+    async def _aiter_impl(self):
+        async for chunk in self._stream:
+            usage = getattr(chunk, "usage", None)
+            if usage is not None:
+                self._prompt = int(getattr(usage, "prompt_tokens", None) or 0)
+                self._completion = int(getattr(usage, "completion_tokens", None) or 0)
+            yield chunk
+        self._on_complete(self._prompt, self._completion)
+
+    async def __aenter__(self):
+        if hasattr(self._stream, "__aenter__"):
+            return await self._stream.__aenter__()
+        return self
+
+    async def __aexit__(self, *args):
+        if hasattr(self._stream, "__aexit__"):
+            await self._stream.__aexit__(*args)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+
 def _extract_tokens(response: Any) -> tuple[int, int]:
     """
-    Try to extract prompt/completion token counts from SDK objects, dicts, and
-    common nested route response shapes. Returns (prompt_tokens, completion_tokens).
+    Extract (prompt_tokens, completion_tokens) from any LLM SDK response.
+
+    Supports: OpenAI, Groq, Azure (response.usage.prompt_tokens),
+              Anthropic (response.usage.input_tokens),
+              Google Gemini (response.usage_metadata.prompt_token_count),
+              raw dict shapes, and nested response wrappers.
+    Streaming objects return (0, 0) — use _SyncStreamCapture / _AsyncStreamCapture.
     """
     if response is None:
         return 0, 0
 
+    # Streaming objects cannot yield tokens until exhausted
+    if _is_stream(response):
+        return 0, 0
+
+    # 1. OpenAI / Groq / Azure: response.usage.prompt_tokens + completion_tokens
+    #    Anthropic: response.usage.input_tokens + output_tokens
     usage = getattr(response, "usage", None)
     if usage is not None:
         prompt = (
@@ -137,6 +270,18 @@ def _extract_tokens(response: Any) -> tuple[int, int]:
         if prompt or completion:
             return int(prompt), int(completion)
 
+    # 2. Google Gemini: response.usage_metadata.prompt_token_count + candidates_token_count
+    usage_metadata = getattr(response, "usage_metadata", None)
+    if usage_metadata is not None:
+        prompt = getattr(usage_metadata, "prompt_token_count", None) or 0
+        completion = getattr(usage_metadata, "candidates_token_count", None) or 0
+        if prompt or completion:
+            return int(prompt), int(completion)
+        total = getattr(usage_metadata, "total_token_count", None) or 0
+        if total:
+            return int(total), 0
+
+    # 3. Dict responses (raw JSON from any provider)
     if isinstance(response, dict):
         for candidate in (
             response.get("usage"),
@@ -145,13 +290,23 @@ def _extract_tokens(response: Any) -> tuple[int, int]:
             response,
         ):
             if isinstance(candidate, dict):
-                prompt = candidate.get("prompt_tokens") or candidate.get("input_tokens") or candidate.get("total_input_tokens") or 0
-                completion = candidate.get("completion_tokens") or candidate.get("output_tokens") or candidate.get("total_output_tokens") or 0
+                prompt = (
+                    candidate.get("prompt_tokens")
+                    or candidate.get("input_tokens")
+                    or candidate.get("total_input_tokens")
+                    or 0
+                )
+                completion = (
+                    candidate.get("completion_tokens")
+                    or candidate.get("output_tokens")
+                    or candidate.get("total_output_tokens")
+                    or 0
+                )
                 if prompt or completion:
                     return int(prompt), int(completion)
 
         nested_response = response.get("response") or response.get("result")
-        if nested_response is not response:
+        if nested_response is not None and nested_response is not response:
             prompt, completion = _extract_tokens(nested_response)
             if prompt or completion:
                 return prompt, completion
@@ -160,6 +315,7 @@ def _extract_tokens(response: Any) -> tuple[int, int]:
         if total:
             return int(total), 0
 
+    # 4. Pydantic / dataclass top-level attributes
     prompt = getattr(response, "prompt_tokens", None) or getattr(response, "input_tokens", None) or 0
     completion = getattr(response, "completion_tokens", None) or getattr(response, "output_tokens", None) or 0
     return int(prompt), int(completion)
@@ -171,7 +327,7 @@ def _extract_model(response: Any, fallback: Optional[str] = None) -> Optional[st
         if model:
             return model
         nested_response = response.get("response") or response.get("result")
-        if nested_response is not response:
+        if nested_response is not None and nested_response is not response:
             nested_model = _extract_model(nested_response, None)
             if nested_model:
                 return nested_model
@@ -501,6 +657,7 @@ class GovernanceDecorator:
         status = "success"
         error_msg = None
         result = None
+        streaming = False
 
         input_preview, input_size, input_pii = self._capture_input(fn, args, kwargs, capture_io)
 
@@ -510,21 +667,40 @@ class GovernanceDecorator:
                     result = fn(*args, **kwargs)
             else:
                 result = fn(*args, **kwargs)
+
+            if _is_stream(result):
+                streaming = True
+                latency_ms = int((time.time() - start) * 1000)
+
+                def _on_stream_done(p: int, c: int) -> None:
+                    self._emit(
+                        None, "success", None, latency_ms,
+                        input_preview, input_size, input_pii,
+                        fn_qualname, fn_module,
+                        decorator_type, model_name, provider, service_type,
+                        capture_io, extra,
+                        _prompt_tokens=p, _completion_tokens=c,
+                    )
+                    self._update_inventory(fn_qualname, fn_module, decorator_type, "success", latency_ms)
+
+                return _SyncStreamCapture(result, _on_stream_done)
+
             return result
         except Exception as exc:
             status = "error"
             error_msg = str(exc)
             raise
         finally:
-            latency_ms = int((time.time() - start) * 1000)
-            self._emit(
-                result, status, error_msg, latency_ms,
-                input_preview, input_size, input_pii,
-                fn_qualname, fn_module,
-                decorator_type, model_name, provider, service_type,
-                capture_io, extra,
-            )
-            self._update_inventory(fn_qualname, fn_module, decorator_type, status, latency_ms)
+            if not streaming:
+                latency_ms = int((time.time() - start) * 1000)
+                self._emit(
+                    result, status, error_msg, latency_ms,
+                    input_preview, input_size, input_pii,
+                    fn_qualname, fn_module,
+                    decorator_type, model_name, provider, service_type,
+                    capture_io, extra,
+                )
+                self._update_inventory(fn_qualname, fn_module, decorator_type, status, latency_ms)
 
     # ── Internal: async execution ────────────────────────────────────────────
 
@@ -538,6 +714,7 @@ class GovernanceDecorator:
         status = "success"
         error_msg = None
         result = None
+        streaming = False
 
         input_preview, input_size, input_pii = self._capture_input(fn, args, kwargs, capture_io)
 
@@ -547,21 +724,40 @@ class GovernanceDecorator:
                     result = await fn(*args, **kwargs)
             else:
                 result = await fn(*args, **kwargs)
+
+            if _is_stream(result):
+                streaming = True
+                latency_ms = int((time.time() - start) * 1000)
+
+                def _on_stream_done(p: int, c: int) -> None:
+                    self._emit(
+                        None, "success", None, latency_ms,
+                        input_preview, input_size, input_pii,
+                        fn_qualname, fn_module,
+                        decorator_type, model_name, provider, service_type,
+                        capture_io, extra,
+                        _prompt_tokens=p, _completion_tokens=c,
+                    )
+                    self._update_inventory(fn_qualname, fn_module, decorator_type, "success", latency_ms)
+
+                return _AsyncStreamCapture(result, _on_stream_done)
+
             return result
         except Exception as exc:
             status = "error"
             error_msg = str(exc)
             raise
         finally:
-            latency_ms = int((time.time() - start) * 1000)
-            self._emit(
-                result, status, error_msg, latency_ms,
-                input_preview, input_size, input_pii,
-                fn_qualname, fn_module,
-                decorator_type, model_name, provider, service_type,
-                capture_io, extra,
-            )
-            self._update_inventory(fn_qualname, fn_module, decorator_type, status, latency_ms)
+            if not streaming:
+                latency_ms = int((time.time() - start) * 1000)
+                self._emit(
+                    result, status, error_msg, latency_ms,
+                    input_preview, input_size, input_pii,
+                    fn_qualname, fn_module,
+                    decorator_type, model_name, provider, service_type,
+                    capture_io, extra,
+                )
+                self._update_inventory(fn_qualname, fn_module, decorator_type, status, latency_ms)
 
     # ── Internal: helpers ────────────────────────────────────────────────────
 
@@ -582,13 +778,19 @@ class GovernanceDecorator:
         fn_qualname, fn_module,
         decorator_type, model_name, provider, service_type,
         capture_io, extra,
+        _prompt_tokens: Optional[int] = None,
+        _completion_tokens: Optional[int] = None,
     ) -> None:
         try:
-            prompt_tokens, completion_tokens = _extract_tokens(result)
-            resolved_model = _extract_model(result, model_name)
+            if _prompt_tokens is None:
+                _prompt_tokens, _completion_tokens = _extract_tokens(result)
+            if _completion_tokens is None:
+                _completion_tokens = 0
+
+            resolved_model = _normalize_model_name(_extract_model(result, model_name))
 
             output_preview, output_size, output_pii = "", 0, False
-            if capture_io and result is not None:
+            if capture_io and result is not None and not _is_stream(result):
                 output_preview, output_size, output_pii = _safe_preview(
                     result, self._max_preview_chars
                 )
@@ -618,8 +820,8 @@ class GovernanceDecorator:
                 "execution_env":        self._execution_env,
                 "sdk_version":          self._sdk_version,
                 "tool_version":         self._tool_version,
-                "input_tokens":         prompt_tokens,
-                "output_tokens":        completion_tokens,
+                "input_tokens":         _prompt_tokens,
+                "output_tokens":        _completion_tokens,
                 "latency_ms":           latency_ms,
                 "status":               status,
                 "input_data_size_mb":   round(input_size / (1024 * 1024), 6),

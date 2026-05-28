@@ -95,9 +95,76 @@ MODEL_PRICING: dict[str, ModelPricing] = {
 }
 
 
+# ── Model name aliases ────────────────────────────────────────────────────────
+# Maps shorthand / deployment names → canonical MODEL_PRICING keys.
+# Kept here so every backend endpoint benefits automatically.
+MODEL_ALIASES: dict[str, str] = {
+    # Groq hosted Llama variants
+    "groq-llama":              "llama-3.3-70b-versatile",
+    "groq-llama3":             "llama-3.3-70b-versatile",
+    "llama3":                  "llama-3.3-70b-versatile",
+    "llama-3":                 "llama-3.3-70b-versatile",
+    "llama3-70b":              "llama-3.3-70b-versatile",
+    "llama-3-70b":             "llama-3.3-70b-versatile",
+    "llama-3.3-70b":           "llama-3.3-70b-versatile",
+    "llama-3.1-70b":           "llama-3.1-70b-instruct",
+    "llama-3.1-8b":            "llama-3.1-8b-instruct",
+    "llama-3.1-405b":          "llama-3.1-405b-instruct",
+    # Azure deployment name aliases → canonical OpenAI names
+    "gpt4o":                   "gpt-4o",
+    "gpt-4o-latest":           "gpt-4o",
+    "gpt-4o-deployment":       "gpt-4o",
+    "azure-gpt":               "gpt-4o",
+    "azure-gpt4o":             "gpt-4o",
+    "azure-gpt-4o":            "gpt-4o",
+    "gpt4":                    "gpt-4",
+    "gpt-4-32k":               "gpt-4",
+    "gpt-35-turbo":            "gpt-3.5-turbo",
+    "gpt-35-turbo-16k":        "gpt-3.5-turbo",
+    "gpt35":                   "gpt-3.5-turbo",
+    # Claude shorthand
+    "claude-3-5-sonnet":       "claude-3-5-sonnet-20241022",
+    "claude-3-5-haiku":        "claude-3-5-haiku-20241022",
+    "claude-3-haiku":          "claude-3-5-haiku-20241022",
+    "claude-3-opus":           "claude-3-opus-20240229",
+    "claude-sonnet":           "claude-3-5-sonnet-20241022",
+    "claude-haiku":            "claude-3-5-haiku-20241022",
+    "claude-opus":             "claude-3-opus-20240229",
+    "claude-sonnet-4":         "claude-sonnet-4-5",
+    "claude-haiku-4":          "claude-haiku-4-5",
+    "claude-opus-4":           "claude-opus-4-5",
+    # Gemini shorthand
+    "gemini-pro":              "gemini-1.5-pro",
+    "gemini-flash":            "gemini-2.0-flash",
+    "gemini-2.5":              "gemini-2.5-pro",
+    "gemini-2.0":              "gemini-2.0-flash",
+    "gemini-1.5":              "gemini-1.5-pro",
+    # Mistral shorthand
+    "mistral-large":           "mistral-large-2411",
+    "mistral-small":           "mistral-small-2503",
+    "codestral":               "codestral-2501",
+}
+
+
+def normalize_model_name(model_name: str) -> str:
+    """Resolve aliases and casing variations to a canonical MODEL_PRICING key."""
+    if not model_name:
+        return model_name
+    if model_name in MODEL_PRICING:
+        return model_name
+    if model_name in MODEL_ALIASES:
+        return MODEL_ALIASES[model_name]
+    lower = model_name.lower()
+    if lower in MODEL_PRICING:
+        return lower
+    if lower in MODEL_ALIASES:
+        return MODEL_ALIASES[lower]
+    return model_name
+
+
 def get_model_pricing(model_name: str) -> Optional[ModelPricing]:
-    """Return ModelPricing for model_name, or None if not in catalogue."""
-    return MODEL_PRICING.get(model_name)
+    """Return ModelPricing for model_name (resolves aliases), or None if unknown."""
+    return MODEL_PRICING.get(normalize_model_name(model_name))
 
 
 def calculate_token_cost(
@@ -110,9 +177,11 @@ def calculate_token_cost(
     from the MODEL_PRICING catalogue.
 
     Rates are USD per 1 million tokens (input_per_1m / output_per_1m).
+    Resolves model aliases before lookup.
     Returns zeroed costs for unknown models — never falls back to static values.
     """
-    pricing = MODEL_PRICING.get(model_name)
+    canonical = normalize_model_name(model_name or "")
+    pricing = MODEL_PRICING.get(canonical)
     if pricing and (input_tokens > 0 or output_tokens > 0):
         input_cost = round((input_tokens / 1_000_000) * pricing.input_per_1m, 6)
         output_cost = round((output_tokens / 1_000_000) * pricing.output_per_1m, 6)

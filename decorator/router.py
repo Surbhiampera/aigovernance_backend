@@ -12,6 +12,7 @@ GET  /decorator/logs                  — per-call input/output audit trail
 GET  /decorator/stats                 — high-level summary counts
 """
 
+import logging
 import uuid
 from datetime import date
 from decimal import Decimal
@@ -25,13 +26,15 @@ from app.core.deps import get_db, require_api_key
 from app.models import TelemetryEvent
 from app.routers.telemetry import _ingest_event
 from app.schemas import TelemetryEventCreate
-from app.services.ai_model_pricing import calculate_token_cost
+from app.services.ai_model_pricing import MODEL_PRICING, calculate_token_cost, normalize_model_name
 from decorator.models import (
     DecoratorRegistration,
     ProjectModelUsage,
     RequestResponseLog,
     ToolApiInventory,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["decorator"])
 
@@ -410,6 +413,13 @@ def list_request_response_logs(
                 "pii_detected":       r.pii_detected,
                 "pii_fields":         r.pii_fields,
                 "created_at":         r.created_at,
+                "token_capture_status": (
+                    "captured" if (r.prompt_tokens or r.completion_tokens)
+                    else "missing"
+                ),
+                "model_in_catalogue": (
+                    r.model_name in MODEL_PRICING if r.model_name else None
+                ),
             }
             for r, t_org_id, t_project_id, t_tool_name in rows
         ],
@@ -462,8 +472,18 @@ def ingest_decorator_telemetry(
     function_name = _first_present(payload, "function_name") or payload.get("route") or None
     route         = payload.get("route") or None
     module_path   = payload.get("module_path") or None
-    model_name    = _first_present_deep(payload, "model_name", "model") or None
-    provider      = payload.get("provider") or None
+    raw_model_name = _first_present_deep(payload, "model_name", "model") or None
+    model_name     = normalize_model_name(raw_model_name) if raw_model_name else None
+    provider       = payload.get("provider") or None
+
+    # Warn when a known-LLM call arrives with a model name not in pricing catalogue
+    if model_name and model_name not in MODEL_PRICING:
+        logger.warning(
+            "Unknown model_name in decorator ingest — cost will be $0. "
+            "Add it to MODEL_PRICING or MODEL_ALIASES. "
+            "org=%s tool=%s raw_model=%s normalized=%s",
+            payload.get("org_id"), payload.get("tool_name"), raw_model_name, model_name,
+        )
     decorator_type= payload.get("decorator_type") or None
     status        = payload.get("status") or None
     metadata      = payload.get("metadata") or {}
@@ -664,6 +684,11 @@ def ingest_decorator_telemetry(
                 "decorator_type": decorator_type,
                 "execution_env": execution_env,
                 "trace_id": trace_id,
+                "token_capture_status": (
+                    "captured" if (prompt_tokens or completion_tokens)
+                    else ("streaming" if metadata.get("is_streaming") else "missing")
+                ),
+                "model_in_catalogue": model_name in MODEL_PRICING if model_name else None,
                 **{k: v for k, v in metadata.items()
                    if isinstance(v, (str, int, float, bool, type(None)))},
             },
