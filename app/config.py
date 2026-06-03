@@ -77,6 +77,10 @@ def get_cost_infra_rate_per_ms() -> Decimal:
     return _dec("COST_INFRA_RATE_PER_MS", "0.00008")
 
 
+def get_cost_infra_rate_per_mb() -> Decimal:
+    return _dec("COST_INFRA_RATE_PER_MB", "0.00001")
+
+
 # ── Anomaly detection thresholds ───────────────────────────────────────────
 def get_anomaly_spike_ratio() -> Decimal:
     """Ratio of observed/baseline above which a scheduled anomaly is recorded."""

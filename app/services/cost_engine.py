@@ -6,6 +6,7 @@ from app.config import (
     get_cost_default_per_second_rate,
     get_cost_default_rate_per_1k,
     get_cost_infra_rate_per_ms,
+    get_cost_infra_rate_per_mb,
 )
 from app.models import ModelPricing, ToolRegistry
 from app.schemas import CostSummary, TelemetryEventCreate
@@ -15,7 +16,24 @@ from app.services.ai_model_pricing import MODEL_PRICING
 class CostEngine:
     def calculate(self, event_data: TelemetryEventCreate, db: Session) -> CostSummary:
         external_cost = Decimal("0")
-        infra_cost = Decimal("0")
+
+        # Infra cost priority:
+        # 1. Caller supplied a pre-computed value (e.g. actual Azure cost per request)
+        # 2. Decorator supplied input/output data sizes → data-transfer cost + compute time cost
+        # 3. Latency-only fallback using COST_INFRA_RATE_PER_MS env rate
+        if event_data.infra_cost and event_data.infra_cost > 0:
+            infra_cost = Decimal(str(event_data.infra_cost))
+        else:
+            latency_ms = Decimal(str(max(int(event_data.latency_ms or 0), 0)))
+            input_mb = Decimal(str(event_data.input_data_size_mb or 0))
+            output_mb = Decimal(str(event_data.output_data_size_mb or 0))
+            rate_per_ms = get_cost_infra_rate_per_ms()
+            # compute cost from actual latency (time the infra was busy)
+            compute_cost = latency_ms * rate_per_ms
+            # data transfer cost: $0.00001 per MB in/out (overridable via env)
+            rate_per_mb = get_cost_infra_rate_per_mb()
+            transfer_cost = (input_mb + output_mb) * rate_per_mb
+            infra_cost = (compute_cost + transfer_cost).quantize(Decimal("0.000001"))
 
         input_tokens = event_data.prompt_tokens or 0
         output_tokens = event_data.completion_tokens or 0
