@@ -1,4 +1,5 @@
 from decimal import Decimal
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import case, func
@@ -32,6 +33,8 @@ def register_tool(tool_data: ToolRegistryCreate, db: Session = Depends(get_db)):
         tool.vendor = tool_data.vendor
         tool.cost_model = tool_data.cost_model
         tool.base_cost = tool_data.base_cost
+        if tool_data.project_id is not None:
+            tool.project_id = tool_data.project_id
     else:
         tool = ToolRegistry(
             tool_name=tool_data.tool_name,
@@ -39,8 +42,21 @@ def register_tool(tool_data: ToolRegistryCreate, db: Session = Depends(get_db)):
             vendor=tool_data.vendor,
             cost_model=tool_data.cost_model,
             base_cost=tool_data.base_cost,
+            project_id=tool_data.project_id,
         )
         db.add(tool)
+    db.commit()
+    db.refresh(tool)
+    return tool
+
+
+@router.patch("/{tool_name}/project", response_model=ToolRegistryResponse)
+def assign_tool_project(tool_name: str, project_id: Optional[str] = Query(None), db: Session = Depends(get_db)):
+    """Assign or clear the project for a registered tool."""
+    tool = db.query(ToolRegistry).filter(ToolRegistry.tool_name == tool_name).first()
+    if not tool:
+        raise HTTPException(status_code=404, detail="Tool not found")
+    tool.project_id = project_id or None
     db.commit()
     db.refresh(tool)
     return tool

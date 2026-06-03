@@ -80,6 +80,7 @@ class ToolRegistry(Base):
     vendor = Column(String(100), nullable=True)
     cost_model = Column(String(50), nullable=True)
     base_cost = Column(Numeric(12, 6), default=0)
+    project_id = Column(String(100), nullable=True)
     created_at = Column(DateTime, server_default=func.now())
 
 

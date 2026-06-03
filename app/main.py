@@ -76,6 +76,8 @@ _SAFE_ALTERS = [
     # trace + user identity on log rows (migration 005)
     "ALTER TABLE request_response_logs ADD COLUMN IF NOT EXISTS trace_id VARCHAR(120)",
     "ALTER TABLE request_response_logs ADD COLUMN IF NOT EXISTS user_id VARCHAR(100)",
+    # tool → project assignment (migration 006)
+    "ALTER TABLE tool_registry ADD COLUMN IF NOT EXISTS project_id VARCHAR(100)",
 ]
 
 _ALL_ROUTERS = [

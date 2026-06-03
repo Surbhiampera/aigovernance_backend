@@ -245,6 +245,7 @@ class ToolRegistryCreate(BaseModel):
     vendor: Optional[str] = None
     cost_model: Optional[str] = None
     base_cost: Decimal = Decimal("0")
+    project_id: Optional[str] = None
 
 
 class ToolRegistryResponse(BaseModel):
@@ -256,6 +257,7 @@ class ToolRegistryResponse(BaseModel):
     vendor: Optional[str] = None
     cost_model: Optional[str] = None
     base_cost: Optional[Decimal] = None
+    project_id: Optional[str] = None
     created_at: Optional[datetime] = None
 
 

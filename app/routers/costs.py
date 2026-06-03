@@ -504,6 +504,7 @@ def cost_by_tool(
             TelemetryEvent.model_name.label("tool_name"),
             func.max(ToolRegistry.vendor).label("vendor"),
             func.max(ToolRegistry.cost_model).label("cost_model"),
+            func.max(ToolRegistry.project_id).label("registry_project_id"),
             func.count(TelemetryEvent.id).label("total_events"),
             func.sum(TelemetryEvent.prompt_tokens).label("input_tokens"),
             func.sum(TelemetryEvent.completion_tokens).label("output_tokens"),
@@ -515,12 +516,14 @@ def cost_by_tool(
     )
     rows = _scope(rows, TelemetryEvent, org_id, project_id, db=db)
 
-    # Build tool → distinct project_ids map from the same scope
+    # Build tool → project info from telemetry events (primary source)
     proj_q = (
         db.query(
             TelemetryEvent.model_name.label("tool_name"),
             TelemetryEvent.project_id,
+            Project.project_name,
         )
+        .outerjoin(Project, Project.id == TelemetryEvent.project_id)
         .filter(
             TelemetryEvent.model_name.isnot(None),
             TelemetryEvent.model_name != "",
@@ -530,13 +533,26 @@ def cost_by_tool(
         .distinct()
     )
     proj_q = _scope(proj_q, TelemetryEvent, org_id, project_id, db=db)
-    tool_projects: dict = {}
+    tool_projects: dict = {}       # tool_name → [project_id, ...]
+    tool_project_names: dict = {}  # tool_name → {project_id: display_name}
     for pr in proj_q.all():
         tool_projects.setdefault(pr.tool_name, []).append(pr.project_id)
+        display = pr.project_name or pr.project_id
+        tool_project_names.setdefault(pr.tool_name, {})[pr.project_id] = display
+
+    # Build project_id → project_name lookup for registry fallback resolution
+    all_projects = {p.id: (p.project_name or p.id) for p in db.query(Project).all()}
 
     results = []
     for r in rows.all():
         computed = _pricing(r.tool_name or "", int(r.input_tokens or 0), int(r.output_tokens or 0))
+        pids = tool_projects.get(r.tool_name, [])
+        pnames = dict(tool_project_names.get(r.tool_name, {}))
+        # Fall back to ToolRegistry.project_id when no telemetry-level project found
+        if not pids and r.registry_project_id:
+            reg_pid = r.registry_project_id
+            pids = [reg_pid]
+            pnames[reg_pid] = all_projects.get(reg_pid, reg_pid)
         results.append({
             "tool_name": r.tool_name,
             "vendor": r.vendor or "—",
@@ -552,7 +568,8 @@ def cost_by_tool(
             "external_cost": 0.0,
             "total_token_cost": computed["total_cost"],
             "total_cost": computed["total_cost"],
-            "project_ids": sorted(tool_projects.get(r.tool_name, [])),
+            "project_ids": sorted(pids),
+            "project_names": pnames,
         })
     results.sort(key=lambda x: x["total_cost"], reverse=True)
     return results
