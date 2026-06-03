@@ -127,7 +127,7 @@ def cost_by_project(
         )
         .outerjoin(
             TelemetryEvent,
-            and_(TelemetryEvent.project_id == Project.id, DECORATOR_EVENT_FILTER),
+            TelemetryEvent.project_id == Project.id,
         )
         .outerjoin(Organization, Organization.id == Project.org_id)
         .group_by(
