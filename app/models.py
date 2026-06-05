@@ -450,3 +450,341 @@ from decorator.models import (  # noqa: F401
     RequestResponseLog,
     ToolApiInventory,
 )
+
+# =============================================================================
+# Proxy-layer models (migration 009 + 011)
+# =============================================================================
+
+class AiRoute(Base):
+    __tablename__ = "ai_routes"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(BigInteger, primary_key=True)
+    route_id = Column(String(120), unique=True, nullable=False)
+    org_id = Column(String(100), ForeignKey("organizations.id"), nullable=False)
+    project_id = Column(String(100), ForeignKey("projects.id"), nullable=True)
+    project_ref_id = Column(String(100), nullable=True)
+    route_name = Column(String(255), nullable=False)
+    route_path = Column(String(500), nullable=True)
+    route_type = Column(String(50), nullable=True)
+    http_method = Column(String(10), default="POST")
+    upstream_url = Column(String(500), nullable=True)
+    default_provider = Column(String(100), nullable=True)
+    default_model = Column(String(120), nullable=True)
+    allowed_models = Column(JSON, nullable=True)
+    model_selection_strategy = Column(String(50), nullable=True)
+    description = Column(Text, nullable=True)
+    tags = Column(JSON, nullable=True)
+    is_active = Column(Boolean, default=True)
+    requires_auth = Column(Boolean, default=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now())
+
+
+class AiRequest(Base):
+    __tablename__ = "ai_requests"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(BigInteger, primary_key=True)
+    request_id = Column(String(120), unique=True, nullable=False)
+    org_id = Column(String(100), ForeignKey("organizations.id"), nullable=False)
+    project_id = Column(String(100), ForeignKey("projects.id"), nullable=True)
+    project_ref_id = Column(String(100), nullable=True)
+    trace_id = Column(String(120), nullable=True)
+    span_id = Column(String(120), nullable=True)
+    parent_span_id = Column(String(120), nullable=True)
+    session_id = Column(String(120), nullable=True)
+    conversation_id = Column(String(120), nullable=True)
+    route_id = Column(String(120), ForeignKey("ai_routes.route_id", ondelete="SET NULL"), nullable=True)
+    request_type = Column(String(50), default="chat_completion")
+    request_status = Column(String(30), default="pending")
+    user_id = Column(String(100), nullable=True)
+    user_email = Column(String(150), nullable=True)
+    user_role = Column(String(50), nullable=True)
+    api_key_id = Column(String(120), nullable=True)
+    client_ip = Column(String(50), nullable=True)
+    user_agent = Column(String(500), nullable=True)
+    provider = Column(String(100), nullable=True)
+    model_name = Column(String(120), nullable=True)
+    model_version = Column(String(50), nullable=True)
+    requested_model = Column(String(120), nullable=True)
+    routed_model = Column(String(120), nullable=True)
+    function_name = Column(String(255), nullable=True)
+    tool_name = Column(String(150), nullable=True)
+    source_system = Column(String(255), nullable=True)
+    request_payload = Column(JSON, nullable=True)
+    prompt_text = Column(Text, nullable=True)
+    sanitized_prompt_text = Column(Text, nullable=True)
+    system_prompt = Column(Text, nullable=True)
+    messages = Column(JSON, nullable=True)
+    request_parameters = Column(JSON, nullable=True)
+    request_headers = Column(JSON, nullable=True)
+    request_metadata = Column(JSON, nullable=True)
+    input_token_estimate = Column(Integer, default=0)
+    prompt_char_count = Column(Integer, default=0)
+    num_messages = Column(Integer, default=0)
+    has_system_prompt = Column(Boolean, default=False)
+    has_tool_definitions = Column(Boolean, default=False)
+    has_images = Column(Boolean, default=False)
+    pii_detected = Column(Boolean, default=False)
+    pii_types = Column(JSON, nullable=True)
+    pii_masked = Column(Boolean, default=False)
+    pii_action_taken = Column(String(20), nullable=True)
+    content_policy_flags = Column(JSON, nullable=True)
+    received_at = Column(DateTime, server_default=func.now())
+    processing_started_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class AiResponse(Base):
+    __tablename__ = "ai_responses"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(BigInteger, primary_key=True)
+    response_id = Column(String(120), unique=True, nullable=False)
+    request_id = Column(String(120), ForeignKey("ai_requests.request_id", ondelete="CASCADE"), nullable=False)
+    org_id = Column(String(100), nullable=False)
+    project_id = Column(String(100), nullable=True)
+    project_ref_id = Column(String(100), nullable=True)
+    provider = Column(String(100), nullable=True)
+    model_name = Column(String(120), nullable=True)
+    model_version = Column(String(50), nullable=True)
+    response_status = Column(String(30), default="pending")
+    finish_reason = Column(String(50), nullable=True)
+    is_streaming = Column(Boolean, default=False)
+    is_cached = Column(Boolean, default=False)
+    response_payload = Column(JSON, nullable=True)
+    response_text = Column(Text, nullable=True)
+    tool_calls = Column(JSON, nullable=True)
+    tool_call_results = Column(JSON, nullable=True)
+    response_metadata = Column(JSON, nullable=True)
+    output_char_count = Column(Integer, default=0)
+    num_tool_calls = Column(Integer, default=0)
+    error_code = Column(String(50), nullable=True)
+    error_type = Column(String(100), nullable=True)
+    error_message = Column(Text, nullable=True)
+    provider_request_id = Column(String(255), nullable=True)
+    provider_response_id = Column(String(255), nullable=True)
+    output_pii_detected = Column(Boolean, default=False)
+    output_pii_types = Column(JSON, nullable=True)
+    response_started_at = Column(DateTime, nullable=True)
+    response_completed_at = Column(DateTime, nullable=True)
+    first_token_at = Column(DateTime, nullable=True)
+    latency_ms = Column(Integer, default=0)
+    ttft_ms = Column(Integer, default=0)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class TokenUsage(Base):
+    __tablename__ = "token_usage"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(BigInteger, primary_key=True)
+    token_usage_id = Column(String(120), unique=True, nullable=False)
+    request_id = Column(String(120), ForeignKey("ai_requests.request_id", ondelete="CASCADE"), nullable=False)
+    response_id = Column(String(120), ForeignKey("ai_responses.response_id", ondelete="SET NULL"), nullable=True)
+    org_id = Column(String(100), nullable=False)
+    project_id = Column(String(100), nullable=True)
+    project_ref_id = Column(String(100), nullable=True)
+    provider = Column(String(100), nullable=True)
+    model_name = Column(String(120), nullable=True)
+    model_version = Column(String(50), nullable=True)
+    prompt_tokens = Column(Integer, default=0)
+    completion_tokens = Column(Integer, default=0)
+    total_tokens = Column(Integer, default=0)
+    input_tokens = Column(Integer, default=0)
+    cached_tokens = Column(Integer, default=0)
+    uncached_tokens = Column(Integer, default=0)
+    output_tokens = Column(Integer, default=0)
+    reasoning_tokens = Column(Integer, default=0)
+    tool_definition_tokens = Column(Integer, default=0)
+    system_tokens = Column(Integer, default=0)
+    context_window_limit = Column(Integer, nullable=True)
+    context_utilization_pct = Column(Numeric(6, 3), nullable=True)
+    raw_usage = Column(JSON, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class RequestCost(Base):
+    __tablename__ = "request_cost"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(BigInteger, primary_key=True)
+    cost_id = Column(String(120), unique=True, nullable=False)
+    request_id = Column(String(120), ForeignKey("ai_requests.request_id", ondelete="CASCADE"), nullable=False)
+    response_id = Column(String(120), ForeignKey("ai_responses.response_id", ondelete="SET NULL"), nullable=True)
+    org_id = Column(String(100), nullable=False)
+    project_id = Column(String(100), nullable=True)
+    project_ref_id = Column(String(100), nullable=True)
+    provider = Column(String(100), nullable=True)
+    model_name = Column(String(120), nullable=True)
+    input_token_cost = Column(Numeric(14, 8), default=0)
+    cached_token_cost = Column(Numeric(14, 8), default=0)
+    output_token_cost = Column(Numeric(14, 8), default=0)
+    tool_cost = Column(Numeric(14, 8), default=0)
+    infra_cost = Column(Numeric(14, 8), default=0)
+    gateway_cost = Column(Numeric(14, 8), default=0)
+    llm_cost = Column(Numeric(14, 8), default=0)
+    total_cost = Column(Numeric(14, 8), default=0)
+    currency = Column(String(10), default="USD")
+    pricing_version = Column(String(50), nullable=True)
+    pricing_snapshot = Column(JSON, nullable=True)
+    cost_model_type = Column(String(50), nullable=True)
+    discount_pct = Column(Numeric(6, 3), default=0)
+    adjusted_total_cost = Column(Numeric(14, 8), default=0)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class RouteExecution(Base):
+    __tablename__ = "route_executions"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(BigInteger, primary_key=True)
+    execution_id = Column(String(120), unique=True, nullable=False)
+    request_id = Column(String(120), ForeignKey("ai_requests.request_id", ondelete="CASCADE"), nullable=False)
+    route_id = Column(String(120), ForeignKey("ai_routes.route_id", ondelete="SET NULL"), nullable=True)
+    org_id = Column(String(100), nullable=False)
+    project_id = Column(String(100), nullable=True)
+    project_ref_id = Column(String(100), nullable=True)
+    execution_status = Column(String(30), default="pending")
+    routing_strategy = Column(String(50), nullable=True)
+    routing_reason = Column(Text, nullable=True)
+    original_model = Column(String(120), nullable=True)
+    selected_model = Column(String(120), nullable=True)
+    selected_provider = Column(String(100), nullable=True)
+    proxy_type = Column(String(50), nullable=True)
+    upstream_url = Column(String(500), nullable=True)
+    upstream_request_id = Column(String(255), nullable=True)
+    pipeline_stages = Column(JSON, nullable=True)
+    attempt_number = Column(Integer, default=1)
+    retry_count = Column(Integer, default=0)
+    retry_reasons = Column(JSON, nullable=True)
+    last_failure_reason = Column(Text, nullable=True)
+    total_latency_ms = Column(Integer, default=0)
+    routing_latency_ms = Column(Integer, default=0)
+    proxy_latency_ms = Column(Integer, default=0)
+    upstream_latency_ms = Column(Integer, default=0)
+    governance_check_ms = Column(Integer, default=0)
+    quota_checked = Column(Boolean, default=False)
+    quota_remaining = Column(Integer, nullable=True)
+    policy_applied = Column(JSON, nullable=True)
+    blocked_by_policy = Column(Boolean, default=False)
+    block_reason = Column(Text, nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(BigInteger, primary_key=True)
+    audit_id = Column(String(120), unique=True, nullable=False)
+    org_id = Column(String(100), nullable=False)
+    project_id = Column(String(100), nullable=True)
+    project_ref_id = Column(String(100), nullable=True)
+    actor_type = Column(String(50), nullable=False)
+    actor_id = Column(String(100), nullable=True)
+    actor_email = Column(String(150), nullable=True)
+    actor_ip = Column(String(50), nullable=True)
+    audit_category = Column(String(50), nullable=False)
+    audit_action = Column(String(100), nullable=False)
+    audit_status = Column(String(30), default="success")
+    entity_type = Column(String(100), nullable=True)
+    entity_id = Column(String(120), nullable=True)
+    request_id = Column(String(120), nullable=True)
+    trace_id = Column(String(120), nullable=True)
+    old_value = Column(JSON, nullable=True)
+    new_value = Column(JSON, nullable=True)
+    change_summary = Column(Text, nullable=True)
+    policy_triggered = Column(Boolean, default=False)
+    compliance_relevant = Column(Boolean, default=False)
+    requires_review = Column(Boolean, default=False)
+    audit_metadata = Column(JSON, nullable=True)
+    occurred_at = Column(DateTime, server_default=func.now())
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class ProviderConfig(Base):
+    __tablename__ = "provider_configs"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(BigInteger, primary_key=True)
+    config_id = Column(String(120), unique=True, nullable=False)
+    org_id = Column(String(100), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False)
+    project_id = Column(String(100), ForeignKey("projects.id", ondelete="SET NULL"), nullable=True)
+    provider = Column(String(100), nullable=False)
+    api_key = Column(Text, nullable=False)
+    api_key_hint = Column(String(20), nullable=True)
+    base_url = Column(String(500), nullable=True)
+    model_allowlist = Column(JSON, nullable=True)
+    max_rpm = Column(Integer, nullable=True)
+    max_tpm = Column(Integer, nullable=True)
+    is_active = Column(Boolean, default=True)
+    created_by = Column(String(100), nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now())
+
+
+class PiiPolicy(Base):
+    __tablename__ = "pii_policies"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(BigInteger, primary_key=True)
+    policy_id = Column(String(120), unique=True, nullable=False)
+    org_id = Column(String(100), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=True)
+    pii_type = Column(String(100), nullable=False)
+    risk_level = Column(String(20), default="medium")
+    action = Column(String(20), default="mask")
+    mask_pattern = Column(String(100), default="[{pii_type}]")
+    log_detection = Column(Boolean, default=True)
+    priority = Column(Integer, default=0)
+    description = Column(Text, nullable=True)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now())
+
+
+class ModelVersion(Base):
+    __tablename__ = "model_versions"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(BigInteger, primary_key=True)
+    provider = Column(String(100), nullable=False)
+    model_name = Column(String(120), nullable=False)
+    version_tag = Column(String(50), nullable=True)
+    full_model_id = Column(String(200), nullable=True)
+    context_window = Column(Integer, nullable=True)
+    max_output_tokens = Column(Integer, nullable=True)
+    supports_functions = Column(Boolean, default=False)
+    supports_vision = Column(Boolean, default=False)
+    supports_streaming = Column(Boolean, default=False)
+    supports_reasoning = Column(Boolean, default=False)
+    is_active = Column(Boolean, default=True)
+    released_at = Column(DateTime, nullable=True)
+    deprecated_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class ModelDeployment(Base):
+    __tablename__ = "model_deployments"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(BigInteger, primary_key=True)
+    deployment_id = Column(String(120), unique=True, nullable=False)
+    org_id = Column(String(100), ForeignKey("organizations.id"), nullable=False)
+    project_id = Column(String(100), ForeignKey("projects.id"), nullable=True)
+    provider = Column(String(100), nullable=False)
+    model_name = Column(String(120), nullable=False)
+    deployment_name = Column(String(255), nullable=True)
+    endpoint_url = Column(String(500), nullable=True)
+    deployment_type = Column(String(50), default="api")
+    auth_type = Column(String(50), nullable=True)
+    api_key_ref = Column(String(500), nullable=True)
+    default_parameters = Column(JSON, nullable=True)
+    rate_limit_rpm = Column(Integer, nullable=True)
+    rate_limit_tpm = Column(Integer, nullable=True)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now())

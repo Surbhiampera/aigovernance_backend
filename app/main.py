@@ -26,6 +26,7 @@ from app.routers import (
     tools,
     workers,
 )
+from app.routers.proxy import router as proxy_router
 from decorator.router import router as decorator_router
 
 logging.basicConfig(
@@ -140,6 +141,10 @@ api_v1 = APIRouter(prefix="/api/v1")
 for _router in _ALL_ROUTERS:
     api_v1.include_router(_router)
 app.include_router(api_v1)
+
+# Proxy router registered at root — not versioned, as it must be a stable URL
+# for external teams' SDK base_url configuration.
+app.include_router(proxy_router)
 
 
 @app.get("/health")

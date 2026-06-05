@@ -27,6 +27,7 @@ from app.services.alert_engine import AlertEngine
 from app.services.cost_engine import CostEngine
 from app.services.langfuse_bridge import mirror_event as _langfuse_mirror_event
 from app.services.security_engine import SecurityEngine
+from app.services.token_counter import fill_missing_token_counts
 
 router = APIRouter(prefix="/telemetry", tags=["telemetry"])
 
@@ -864,6 +865,15 @@ def _ingest_event(db: Session, event_data: TelemetryEventCreate) -> TelemetryEve
 
     started_at = event_data.started_at or datetime.utcnow()
     completed_at = event_data.completed_at or (started_at + timedelta(milliseconds=event_data.latency_ms))
+
+    # Auto-count tokens from text when the caller didn't supply counts.
+    event_data.prompt_tokens, event_data.completion_tokens = fill_missing_token_counts(
+        input_text=event_data.input_preview,
+        output_text=event_data.output_preview,
+        prompt_tokens=event_data.prompt_tokens,
+        completion_tokens=event_data.completion_tokens,
+        model_name=event_data.model_name,
+    )
     total_tokens = event_data.prompt_tokens + event_data.completion_tokens
 
     cost_summary = cost_engine.calculate(event_data, db)
