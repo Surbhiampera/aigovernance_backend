@@ -59,6 +59,12 @@ class ApiKey(Base):
     project_id = Column(String(100), ForeignKey("projects.id"), nullable=True)
     key_name = Column(String(100), nullable=True)
     provider = Column(String(100), nullable=True)
+    hashed_key = Column(String(64), nullable=True)
+    raw_key_hint = Column(String(30), nullable=True)
+    is_proxy_key = Column(Boolean, default=False)
+    is_active = Column(Boolean, default=True)
+    expires_at = Column(DateTime, nullable=True)
+    last_used_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
 
 

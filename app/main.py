@@ -79,6 +79,13 @@ _SAFE_ALTERS = [
     "ALTER TABLE request_response_logs ADD COLUMN IF NOT EXISTS user_id VARCHAR(100)",
     # tool → project assignment (migration 006)
     "ALTER TABLE tool_registry ADD COLUMN IF NOT EXISTS project_id VARCHAR(100)",
+    # governance keys (migration 007)
+    "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS hashed_key VARCHAR(64)",
+    "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS raw_key_hint VARCHAR(30)",
+    "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS is_proxy_key BOOLEAN DEFAULT FALSE",
+    "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE",
+    "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP",
+    "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMP",
 ]
 
 _ALL_ROUTERS = [
