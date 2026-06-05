@@ -8,6 +8,13 @@ from pydantic import BaseModel, ConfigDict, Field
 class ExternalToolCost(BaseModel):
     name: str
     cost: Decimal
+    
+    
+    
+    
+    
+    
+    
 
 
 class PipelineStageCreate(BaseModel):
