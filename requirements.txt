@@ -9,6 +9,6 @@ python-jose[cryptography]
 httpx
 openpyxl
 python-multipart
-
-# Optional — required only for WhatsApp notifications via Twilio
 twilio
+tiktoken
+anthropic

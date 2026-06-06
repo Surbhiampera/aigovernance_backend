@@ -1,0 +1,152 @@
+from contextlib import asynccontextmanager
+
+from fastapi import APIRouter, FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.config import get_cors_origins
+from app.routers import (
+    alerts,
+    alerts_security,
+    apikeys,
+    audit_logs,
+    auth,
+    budgets,
+    chat,
+    control,
+    costs,
+    governance,
+    ingestion,
+    lookups,
+    models,
+    organizations,
+    pricing,
+    projects,
+    security,
+    summary,
+    telemetry,
+    tools,
+    workers,
+)
+from app.routers.proxy import router as proxy_router
+
+_SAFE_ALTERS = [
+    "ALTER TABLE tool_connectors ADD COLUMN IF NOT EXISTS org_id VARCHAR(100)",
+    "ALTER TABLE tool_connectors ADD COLUMN IF NOT EXISTS project_id VARCHAR(100)",
+    "ALTER TABLE tool_connectors ADD COLUMN IF NOT EXISTS api_key VARCHAR(500)",
+    "ALTER TABLE tool_connectors ADD COLUMN IF NOT EXISTS last_ingested_at TIMESTAMP",
+    "ALTER TABLE tool_connectors ADD COLUMN IF NOT EXISTS sync_enabled BOOLEAN DEFAULT TRUE",
+    "ALTER TABLE tool_connectors ADD COLUMN IF NOT EXISTS pull_interval_minutes INTEGER DEFAULT 15",
+    "ALTER TABLE tool_connectors ADD COLUMN IF NOT EXISTS last_sync_status VARCHAR(30)",
+    "ALTER TABLE tool_connectors ADD COLUMN IF NOT EXISTS last_sync_error TEXT",
+    "ALTER TABLE tool_connectors ADD COLUMN IF NOT EXISTS total_events_pulled INTEGER DEFAULT 0",
+    "ALTER TABLE governance_rules ADD COLUMN IF NOT EXISTS org_id VARCHAR(100)",
+    "ALTER TABLE governance_rules ADD COLUMN IF NOT EXISTS project_id VARCHAR(100)",
+    # Org/project traceability columns
+    "ALTER TABLE alerts ADD COLUMN IF NOT EXISTS project_id VARCHAR(100)",
+    "ALTER TABLE alerts ADD COLUMN IF NOT EXISTS tool_name VARCHAR(150)",
+    "ALTER TABLE data_security_logs ADD COLUMN IF NOT EXISTS org_id VARCHAR(100)",
+    "ALTER TABLE data_security_logs ADD COLUMN IF NOT EXISTS project_id VARCHAR(100)",
+    "ALTER TABLE usage_anomalies ADD COLUMN IF NOT EXISTS project_id VARCHAR(100)",
+    # Decorator-framework columns (migration 003)
+    "ALTER TABLE telemetry_events ADD COLUMN IF NOT EXISTS tool_name VARCHAR(150)",
+    "ALTER TABLE telemetry_events ADD COLUMN IF NOT EXISTS function_name VARCHAR(255)",
+    "ALTER TABLE telemetry_events ADD COLUMN IF NOT EXISTS module_path VARCHAR(500)",
+    "ALTER TABLE telemetry_events ADD COLUMN IF NOT EXISTS decorator_type VARCHAR(50)",
+    "ALTER TABLE telemetry_events ADD COLUMN IF NOT EXISTS execution_env VARCHAR(50) DEFAULT 'production'",
+    "ALTER TABLE telemetry_events ADD COLUMN IF NOT EXISTS sdk_version VARCHAR(20)",
+    "ALTER TABLE telemetry_events ADD COLUMN IF NOT EXISTS tool_version VARCHAR(50)",
+    "ALTER TABLE telemetry_events ADD COLUMN IF NOT EXISTS input_preview TEXT",
+    "ALTER TABLE telemetry_events ADD COLUMN IF NOT EXISTS output_preview TEXT",
+    "ALTER TABLE trace_model_usage ADD COLUMN IF NOT EXISTS function_name VARCHAR(255)",
+    "ALTER TABLE trace_model_usage ADD COLUMN IF NOT EXISTS call_sequence INTEGER DEFAULT 0",
+    # request_response_logs — per-call LLM metrics (migration 004)
+    "ALTER TABLE request_response_logs ADD COLUMN IF NOT EXISTS route VARCHAR(255)",
+    "ALTER TABLE request_response_logs ADD COLUMN IF NOT EXISTS model_name VARCHAR(120)",
+    "ALTER TABLE request_response_logs ADD COLUMN IF NOT EXISTS provider VARCHAR(100)",
+    "ALTER TABLE request_response_logs ADD COLUMN IF NOT EXISTS prompt_tokens INTEGER DEFAULT 0",
+    "ALTER TABLE request_response_logs ADD COLUMN IF NOT EXISTS completion_tokens INTEGER DEFAULT 0",
+    "ALTER TABLE request_response_logs ADD COLUMN IF NOT EXISTS total_tokens INTEGER DEFAULT 0",
+    "ALTER TABLE request_response_logs ADD COLUMN IF NOT EXISTS latency_ms INTEGER DEFAULT 0",
+    "ALTER TABLE request_response_logs ADD COLUMN IF NOT EXISTS estimated_cost_usd NUMERIC(14,8) DEFAULT 0",
+    # trace + user identity on log rows (migration 005)
+    "ALTER TABLE request_response_logs ADD COLUMN IF NOT EXISTS trace_id VARCHAR(120)",
+    "ALTER TABLE request_response_logs ADD COLUMN IF NOT EXISTS user_id VARCHAR(100)",
+    # tool → project assignment (migration 006)
+    "ALTER TABLE tool_registry ADD COLUMN IF NOT EXISTS project_id VARCHAR(100)",
+    # governance keys (migration 007)
+    "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS hashed_key VARCHAR(64)",
+    "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS raw_key_hint VARCHAR(30)",
+    "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS is_proxy_key BOOLEAN DEFAULT FALSE",
+    "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE",
+    "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP",
+    "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMP",
+    # RBAC role on API keys (migration 008)
+    "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS role VARCHAR(50)",
+]
+
+_ALL_ROUTERS = [
+    auth.router, telemetry.router, summary.router, tools.router, models.router,
+    alerts.router, costs.router, security.router, alerts_security.router,
+    governance.router, organizations.router, projects.router, budgets.router,
+    pricing.router, apikeys.router, workers.router, lookups.router,
+    ingestion.router, control.router, audit_logs.router, chat.router,
+]
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    from sqlalchemy import text
+    from app.database import Base, engine
+    from app.scheduler import start_scheduler, stop_scheduler
+
+    try:
+        Base.metadata.create_all(bind=engine)
+        with engine.connect() as conn:
+            for stmt in _SAFE_ALTERS:
+                try:
+                    conn.execute(text(stmt))
+                except Exception:
+                    pass
+            conn.commit()
+    except Exception:
+        pass
+
+    start_scheduler()
+    try:
+        yield
+    finally:
+        stop_scheduler()
+        engine.dispose()
+
+
+app = FastAPI(
+    title="AI Governance Tool",
+    version="2.0.0",
+    description="Vendor-agnostic AI governance platform — zero hardcoding, schema-driven.",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=get_cors_origins(),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+for _router in _ALL_ROUTERS:
+    app.include_router(_router)
+
+api_v1 = APIRouter(prefix="/api/v1")
+for _router in _ALL_ROUTERS:
+    api_v1.include_router(_router)
+app.include_router(api_v1)
+
+# Proxy router registered at root — not versioned, as it must be a stable URL
+# for external teams' SDK base_url configuration.
+app.include_router(proxy_router)
+
+
+@app.get("/health")
+def health_check():
+    return {"status": "healthy", "version": "2.0.0"}
