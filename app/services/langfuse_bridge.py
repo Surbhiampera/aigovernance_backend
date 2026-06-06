@@ -21,13 +21,10 @@ The mirror runs once per ingest — see ``mirror_event`` below.
 """
 from __future__ import annotations
 
-import logging
 import os
 from typing import Any, Optional
 
 from app.schemas import TelemetryEventCreate
-
-logger = logging.getLogger(__name__)
 
 _client: Any = None
 _initialised: bool = False
@@ -53,7 +50,6 @@ def _get_client() -> Any:
         from langfuse import Langfuse  # type: ignore
     except Exception as exc:  # pragma: no cover - optional dep
         _disabled_reason = f"langfuse package not installed ({exc})"
-        logger.info("Langfuse mirror disabled: %s", _disabled_reason)
         return None
 
     public_key = os.getenv("LANGFUSE_PUBLIC_KEY")
@@ -61,15 +57,12 @@ def _get_client() -> Any:
     host = os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
     if not public_key or not secret_key:
         _disabled_reason = "LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY not set"
-        logger.info("Langfuse mirror disabled: %s", _disabled_reason)
         return None
 
     try:
         _client = Langfuse(public_key=public_key, secret_key=secret_key, host=host)
-        logger.info("Langfuse mirror initialised (host=%s)", host)
     except Exception as exc:  # pragma: no cover
         _disabled_reason = f"Langfuse client init failed: {exc}"
-        logger.warning("Langfuse mirror disabled: %s", _disabled_reason)
         _client = None
     return _client
 
@@ -167,8 +160,8 @@ def mirror_event(
         except Exception:  # scoring is purely cosmetic
             pass
 
-    except Exception as exc:  # pragma: no cover
-        logger.debug("Langfuse mirror skipped for event %s: %s", event.event_id, exc)
+    except Exception:  # pragma: no cover
+        pass
 
 
 def status() -> dict:

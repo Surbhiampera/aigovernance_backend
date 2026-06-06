@@ -10,7 +10,7 @@ from app.models import (
     TelemetryEvent, TraceModelUsage, TraceToolUsage,
 )
 from app.schemas import ApiKeyCreate, ApiKeyResponse
-from decorator.models import RequestResponseLog
+from app.models import RequestResponseLog
 
 router = APIRouter(prefix="/api-keys", tags=["api-keys"])
 

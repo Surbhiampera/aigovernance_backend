@@ -1,4 +1,3 @@
-import logging
 import os
 from typing import Generator
 
@@ -7,7 +6,8 @@ from sqlalchemy.orm import Session
 
 from app.database import SessionLocal
 
-_logger = logging.getLogger(__name__)
+# Recognized role values in ascending privilege order
+ROLES = ("viewer", "security_reviewer", "admin")
 
 
 def get_db() -> Generator:
@@ -36,12 +36,34 @@ def require_api_key(
 
     master = os.getenv("GOVERNANCE_MASTER_KEY", "")
     if master and x_api_key == master:
-        return {"key_name": "master", "org_id": None}
+        return {"key_name": "master", "org_id": None, "role": "admin"}
 
     from app.models import ApiKey
     key_record = db.query(ApiKey).filter(ApiKey.id == x_api_key).first()
     if not key_record:
-        _logger.warning("Rejected request: unknown API key (prefix=%s...)", x_api_key[:8])
         raise HTTPException(status_code=401, detail="Invalid or revoked API key")
 
     return key_record
+
+
+def require_role(*allowed_roles: str):
+    """Dependency factory: enforce one of *allowed_roles* on the calling API key.
+
+    Master key is always treated as 'admin'.  Keys with role=None default to
+    'viewer'.  Usage::
+
+        @router.get("/sensitive")
+        def endpoint(_key=Depends(require_role("admin", "security_reviewer"))):
+            ...
+    """
+    def _check(key=Depends(require_api_key)):
+        role = key.get("role") if isinstance(key, dict) else getattr(key, "role", None)
+        effective_role = role or "viewer"
+        if effective_role not in allowed_roles:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Role '{effective_role}' is not permitted for this endpoint. "
+                       f"Required: {list(allowed_roles)}",
+            )
+        return key
+    return _check

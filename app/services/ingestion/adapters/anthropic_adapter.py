@@ -14,7 +14,6 @@ Expected raw payload:
 
 Anthropic does not expose a server-side log retrieval API; ingest via webhook.
 """
-import logging
 from datetime import datetime, timezone
 from typing import Any, TYPE_CHECKING
 
@@ -24,9 +23,6 @@ from app.services.ingestion.registry import adapter_registry
 
 if TYPE_CHECKING:
     from app.models import ToolConnector
-
-logger = logging.getLogger(__name__)
-
 
 def _parse_status(stop_reason: str | None) -> str:
     if stop_reason == "end_turn":

@@ -6,7 +6,6 @@ so costs, security scoring, and alerts fire exactly as for direct telemetry.
 import csv
 import io
 import json
-import logging
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
@@ -19,7 +18,6 @@ from app.core.deps import get_db
 from app.models import TelemetryEvent, ToolConnector
 from app.services.ingestion import IngestionNormalizer
 
-logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/ingestion", tags=["ingestion"])
 
 

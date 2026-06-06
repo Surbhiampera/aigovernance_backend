@@ -12,7 +12,7 @@ from app.models import (
     TraceModelUsage, TraceToolUsage, UsageAnomaly,
 )
 from app.schemas import ProjectCreate, ProjectResponse
-from decorator.models import DecoratorRegistration, ProjectModelUsage, RequestResponseLog, ToolApiInventory
+from app.models import DecoratorRegistration, ProjectModelUsage, RequestResponseLog, ToolApiInventory
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 

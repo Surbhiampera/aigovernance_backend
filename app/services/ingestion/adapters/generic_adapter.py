@@ -10,7 +10,6 @@ Recognised token field names:
 Recognised model field names: model, model_name, modelVersion
 Recognised id field names:    id, request_id, completion_id
 """
-import logging
 from datetime import datetime, timezone
 from typing import Any, TYPE_CHECKING
 
@@ -20,8 +19,6 @@ from app.services.ingestion.registry import adapter_registry
 
 if TYPE_CHECKING:
     from app.models import ToolConnector
-
-logger = logging.getLogger(__name__)
 
 _PROMPT_KEYS = ("prompt_tokens", "input_tokens", "promptTokenCount")
 _COMPLETION_KEYS = ("completion_tokens", "output_tokens", "candidatesTokenCount")

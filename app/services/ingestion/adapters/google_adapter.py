@@ -12,7 +12,6 @@ Expected raw payload (Gemini generateContent response):
   "modelVersion": "gemini-1.5-pro-001"
 }
 """
-import logging
 from datetime import datetime, timezone
 from typing import Any, TYPE_CHECKING
 
@@ -22,9 +21,6 @@ from app.services.ingestion.registry import adapter_registry
 
 if TYPE_CHECKING:
     from app.models import ToolConnector
-
-logger = logging.getLogger(__name__)
-
 
 @adapter_registry.register
 class GoogleAdapter(VendorAdapter):

@@ -4,12 +4,9 @@ Used in _ingest_event to back-fill prompt_tokens / completion_tokens when the
 caller sends text in input_preview / output_preview but omits the counts.
 """
 
-import logging
 from functools import lru_cache
 
 import tiktoken
-
-logger = logging.getLogger(__name__)
 
 # Mapping from common provider model prefixes → tiktoken encoding name.
 # cl100k_base covers GPT-4, GPT-3.5-turbo, and is a reasonable approximation
@@ -54,8 +51,7 @@ def count_tokens(text: str, model_name: str | None = None) -> int:
     try:
         enc = _encoding_for_model(model_name)
         return len(enc.encode(text))
-    except Exception as exc:  # never crash ingestion
-        logger.warning("token_counter: failed to count tokens: %s", exc)
+    except Exception:
         return 0
 
 

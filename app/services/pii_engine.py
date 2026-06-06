@@ -6,13 +6,10 @@ returns a structured result the proxy router can act on.
 """
 
 import re
-import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
 from sqlalchemy.orm import Session
-
-logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Regex patterns per PII type

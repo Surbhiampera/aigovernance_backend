@@ -12,7 +12,6 @@ predictive alert when velocity * remaining_days >= limit.
 from __future__ import annotations
 
 import calendar
-import logging
 from datetime import date, timedelta
 from decimal import Decimal
 
@@ -28,9 +27,6 @@ from app.config import (
 )
 from app.models import Alert, Budget, DailyOrgSummary, GovernanceRule, RateLimit, UsageAnomaly
 from app.schemas import CostSummary, TelemetryEventCreate
-
-logger = logging.getLogger(__name__)
-
 
 class AlertEngine:
     def evaluate(
@@ -392,5 +388,5 @@ class AlertEngine:
                 org_id=org_id or "",
                 project_id=project_id,
             )
-        except Exception as exc:
-            logger.warning("Notification dispatch failed: %s", exc)
+        except Exception:
+            pass

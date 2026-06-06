@@ -23,7 +23,6 @@ Request lifecycle (10 steps from the governance doc):
 """
 
 import uuid
-import logging
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Optional
@@ -42,8 +41,6 @@ from app.models import (
     AiRequest, AiResponse, TokenUsage, RequestCost, RouteExecution,
     ProviderConfig,
 )
-
-logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/proxy", tags=["proxy"])
 

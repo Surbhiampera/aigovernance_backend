@@ -21,13 +21,10 @@ Optional (Microsoft Teams via Incoming Webhooks):
 """
 from __future__ import annotations
 
-import logging
 import os
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-
-logger = logging.getLogger(__name__)
 
 _EMOJI = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢"}
 _TEAMS_COLOR = {"critical": "FF0000", "high": "FF6600", "medium": "FFCC00", "low": "00AA44"}
@@ -95,9 +92,8 @@ class NotificationService:
                     server.starttls()
                     server.login(self.smtp_user, self.smtp_password)
                 server.sendmail(self.from_email, self.notification_emails, msg.as_string())
-            logger.info("Alert email sent: %s", subject)
-        except Exception as exc:
-            logger.error("Email notification failed: %s", exc)
+        except Exception:
+            pass
 
     # ─────────────────── whatsapp ───────────────────
 
@@ -110,11 +106,8 @@ class NotificationService:
             for to_num in self.twilio_to_numbers:
                 normalized = to_num if to_num.startswith("whatsapp:") else f"whatsapp:{to_num}"
                 client.messages.create(body=message, from_=self.twilio_from, to=normalized)
-            logger.info("WhatsApp alert sent to %d recipient(s)", len(self.twilio_to_numbers))
-        except ImportError:
-            logger.warning("twilio package not installed — WhatsApp notifications disabled. pip install twilio")
-        except Exception as exc:
-            logger.error("WhatsApp notification failed: %s", exc)
+        except (ImportError, Exception):
+            pass
 
     # ─────────────────── microsoft teams ───────────────────
 
@@ -148,9 +141,8 @@ class NotificationService:
                 )
                 with urllib.request.urlopen(req, timeout=10):
                     pass
-            logger.info("Teams alert sent to %d webhook(s)", len(self.teams_webhooks))
-        except Exception as exc:
-            logger.error("Teams notification failed: %s", exc)
+        except Exception:
+            pass
 
 
 notification_service = NotificationService()

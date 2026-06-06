@@ -1,14 +1,14 @@
-import logging
 from contextlib import asynccontextmanager
 
 from fastapi import APIRouter, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.config import get_cors_origins, get_log_level
+from app.config import get_cors_origins
 from app.routers import (
     alerts,
     alerts_security,
     apikeys,
+    audit_logs,
     auth,
     budgets,
     control,
@@ -27,13 +27,6 @@ from app.routers import (
     workers,
 )
 from app.routers.proxy import router as proxy_router
-from decorator.router import router as decorator_router
-
-logging.basicConfig(
-    level=get_log_level(),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
-logger = logging.getLogger(__name__)
 
 _SAFE_ALTERS = [
     "ALTER TABLE tool_connectors ADD COLUMN IF NOT EXISTS org_id VARCHAR(100)",
@@ -86,6 +79,8 @@ _SAFE_ALTERS = [
     "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE",
     "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP",
     "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMP",
+    # RBAC role on API keys (migration 008)
+    "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS role VARCHAR(50)",
 ]
 
 _ALL_ROUTERS = [
@@ -93,7 +88,7 @@ _ALL_ROUTERS = [
     alerts.router, costs.router, security.router, alerts_security.router,
     governance.router, organizations.router, projects.router, budgets.router,
     pricing.router, apikeys.router, workers.router, lookups.router,
-    ingestion.router, control.router, decorator_router,
+    ingestion.router, control.router, audit_logs.router,
 ]
 
 
@@ -103,19 +98,17 @@ async def lifespan(app: FastAPI):
     from app.database import Base, engine
     from app.scheduler import start_scheduler, stop_scheduler
 
-    logger.info("Starting AI Governance API")
     try:
         Base.metadata.create_all(bind=engine)
         with engine.connect() as conn:
             for stmt in _SAFE_ALTERS:
                 try:
                     conn.execute(text(stmt))
-                except Exception as exc:
-                    logger.warning("Auto-migration skipped: %s — %s", stmt, exc)
+                except Exception:
+                    pass
             conn.commit()
-    except Exception as exc:
-        logger.error("Database setup failed: %s", exc)
-        logger.error("Check that DATABASE_URL is set correctly in your environment.")
+    except Exception:
+        pass
 
     start_scheduler()
     try:
@@ -123,7 +116,6 @@ async def lifespan(app: FastAPI):
     finally:
         stop_scheduler()
         engine.dispose()
-        logger.info("Shutting down AI Governance API")
 
 
 app = FastAPI(

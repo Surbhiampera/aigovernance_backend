@@ -6,13 +6,10 @@ never updated — only inserted.
 """
 
 import uuid
-import logging
 from datetime import datetime
 from typing import Optional
 
 from sqlalchemy.orm import Session
-
-logger = logging.getLogger(__name__)
 
 
 def _new_audit_id() -> str:
@@ -70,8 +67,8 @@ def log_event(
         db.add(row)
         if flush:
             db.flush()
-    except Exception as exc:
-        logger.warning("audit_service: failed to write audit log: %s", exc)
+    except Exception:
+        pass
 
 
 def log_pii_detection(

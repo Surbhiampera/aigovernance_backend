@@ -10,7 +10,7 @@ from app.models import (
     TraceModelUsage, TraceToolUsage, UsageAnomaly, User,
 )
 from app.schemas import OrganizationCreate, OrganizationUpdate, OrganizationResponse
-from decorator.models import DecoratorRegistration, ProjectModelUsage, RequestResponseLog, ToolApiInventory
+from app.models import DecoratorRegistration, ProjectModelUsage, RequestResponseLog, ToolApiInventory
 
 router = APIRouter(prefix="/organizations", tags=["organizations"])
 

@@ -4,7 +4,6 @@ All DB sessions are managed by the caller.
 """
 from __future__ import annotations
 
-import logging
 import time
 import uuid
 from datetime import date, datetime, timedelta
@@ -23,8 +22,6 @@ from app.models import (
     ToolConnector,
     UsageAnomaly,
 )
-
-logger = logging.getLogger(__name__)
 
 
 # ─────────────────────── daily aggregation ───────────────────────
@@ -323,8 +320,8 @@ def _run_connector_poll(db: Session) -> dict:
                     SecurityEngine().analyze(db, row, raw.get("contains_pii", False), raw.get("pii_type"))
                     AlertEngine().evaluate(db, row)
                     events_ingested += 1
-                except Exception as exc:
-                    logger.warning("Connector %s: failed to ingest event: %s", connector.connector_name, exc)
+                except Exception:
+                    pass
 
         sync_status = "error" if error and not events_ingested else ("no_data" if not events_ingested else "success")
         db.add(ConnectorSyncLog(
@@ -344,7 +341,6 @@ def _run_connector_poll(db: Session) -> dict:
         total_pulled += events_ingested
         if error:
             total_errors += 1
-        logger.info("Connector %s: %d events, status=%s", connector.connector_name, events_ingested, sync_status)
 
     db.flush()
     return {"connectors_polled": len(connectors), "events_pulled": total_pulled, "errors": total_errors}

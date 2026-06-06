@@ -1,14 +1,10 @@
 """APScheduler — runs all periodic jobs as background threads inside the FastAPI process."""
 from __future__ import annotations
 
-import logging
-
 from apscheduler.executors.pool import ThreadPoolExecutor
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from app.config import get_scheduler_max_workers
-
-logger = logging.getLogger(__name__)
 
 _scheduler: BackgroundScheduler | None = None
 
@@ -24,9 +20,7 @@ def _job_daily_aggregation() -> None:
     try:
         rows = _rebuild_daily_summary(db, datetime.date.today())
         db.commit()
-        logger.info("Daily aggregation complete: %d rows", rows)
-    except Exception as exc:
-        logger.error("Daily aggregation error: %s", exc)
+    except Exception:
         db.rollback()
     finally:
         db.close()
@@ -40,9 +34,7 @@ def _job_monthly_aggregation() -> None:
     try:
         rows = _rebuild_monthly_summary(db)
         db.commit()
-        logger.info("Monthly aggregation complete: %d rows", rows)
-    except Exception as exc:
-        logger.error("Monthly aggregation error: %s", exc)
+    except Exception:
         db.rollback()
     finally:
         db.close()
@@ -56,9 +48,7 @@ def _job_anomaly_detection() -> None:
     try:
         created = _detect_anomalies(db)
         db.commit()
-        logger.info("Anomaly detection complete: %d anomalies created", created)
-    except Exception as exc:
-        logger.error("Anomaly detection error: %s", exc)
+    except Exception:
         db.rollback()
     finally:
         db.close()
@@ -72,9 +62,7 @@ def _job_alert_scan() -> None:
     try:
         created = AlertEngine().create_daily_anomaly_alerts(db)
         db.commit()
-        logger.info("Alert scan complete: %d alerts created", created)
-    except Exception as exc:
-        logger.error("Alert scan error: %s", exc)
+    except Exception:
         db.rollback()
     finally:
         db.close()
@@ -88,9 +76,7 @@ def _job_connector_poll() -> None:
     try:
         result = _run_connector_poll(db)
         db.commit()
-        logger.info("Connector poll complete: %s", result)
-    except Exception as exc:
-        logger.error("Connector poll error: %s", exc)
+    except Exception:
         db.rollback()
     finally:
         db.close()
@@ -120,7 +106,6 @@ def start_scheduler() -> BackgroundScheduler:
     _scheduler.add_job(_job_alert_scan, "interval", minutes=30, id="alert_scan", replace_existing=True)
     _scheduler.add_job(_job_connector_poll, "interval", minutes=15, id="connector_poll", replace_existing=True)
     _scheduler.start()
-    logger.info("APScheduler started (daily_agg / monthly_agg / anomaly_detection / alert_scan / connector_poll)")
     return _scheduler
 
 
@@ -128,4 +113,3 @@ def stop_scheduler() -> None:
     global _scheduler
     if _scheduler and _scheduler.running:
         _scheduler.shutdown(wait=False)
-        logger.info("APScheduler stopped")

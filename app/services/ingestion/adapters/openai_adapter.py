@@ -13,7 +13,6 @@ Expected raw payload (Chat Completions response):
   "system_fingerprint": "fp_xxx"
 }
 """
-import logging
 from datetime import date, datetime, timezone
 from typing import Any, TYPE_CHECKING
 
@@ -25,9 +24,6 @@ from app.services.ingestion.registry import adapter_registry
 
 if TYPE_CHECKING:
     from app.models import ToolConnector
-
-logger = logging.getLogger(__name__)
-
 
 @adapter_registry.register
 class OpenAIAdapter(VendorAdapter):
@@ -102,7 +98,6 @@ class OpenAIAdapter(VendorAdapter):
     def pull(self, connector: "ToolConnector") -> list[dict[str, Any]]:
         """Pull today's usage records from OpenAI's usage API endpoint."""
         if not connector.api_key:
-            logger.warning("OpenAI connector '%s' has no api_key — skipping pull.", connector.connector_name)
             return []
 
         endpoint = (connector.endpoint_url or "https://api.openai.com/v1").rstrip("/")
@@ -116,12 +111,7 @@ class OpenAIAdapter(VendorAdapter):
             resp.raise_for_status()
             data = resp.json()
             if not isinstance(data, dict):
-                logger.warning("OpenAI usage endpoint returned unexpected type %s for '%s'.", type(data), connector.connector_name)
                 return []
             return data.get("data") or []
-        except httpx.HTTPStatusError as exc:
-            logger.warning("OpenAI pull HTTP error for '%s': %s", connector.connector_name, exc)
-            return []
-        except Exception as exc:
-            logger.warning("OpenAI pull failed for '%s': %s", connector.connector_name, exc)
+        except (httpx.HTTPStatusError, Exception):
             return []
