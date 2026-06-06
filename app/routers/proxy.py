@@ -364,7 +364,7 @@ async def proxy_openai_universal(
         raise HTTPException(status_code=400, detail="No provider API key configured for this org")
 
     upstream_base = (provider_cfg.base_url if provider_cfg and provider_cfg.base_url
-                     else "https://api.openai.com")
+                     else "https://api.openai.com/v1")
     upstream_url = f"{upstream_base}/{path}"
 
     # Build forward headers — strip governance-specific headers
