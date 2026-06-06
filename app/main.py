@@ -11,6 +11,7 @@ from app.routers import (
     audit_logs,
     auth,
     budgets,
+    chat,
     control,
     costs,
     governance,
@@ -88,7 +89,7 @@ _ALL_ROUTERS = [
     alerts.router, costs.router, security.router, alerts_security.router,
     governance.router, organizations.router, projects.router, budgets.router,
     pricing.router, apikeys.router, workers.router, lookups.router,
-    ingestion.router, control.router, audit_logs.router,
+    ingestion.router, control.router, audit_logs.router, chat.router,
 ]
 
 

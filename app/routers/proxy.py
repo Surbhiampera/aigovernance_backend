@@ -39,7 +39,7 @@ from app.services.audit_service import log_pii_detection, log_request_blocked, l
 from app.services.token_counter import count_tokens
 from app.models import (
     AiRequest, AiResponse, TokenUsage, RequestCost, RouteExecution,
-    ProviderConfig,
+    ProviderConfig, ProjectModelUsage,
 )
 
 router = APIRouter(prefix="/proxy", tags=["proxy"])
@@ -566,6 +566,51 @@ async def proxy_openai_universal(
         cost_model_type="per_token",
         currency="USD",
     ))
+
+    # ── Upsert ProjectModelUsage (daily aggregate per project × model) ───
+    _today = received_at.date()
+    _pid_filter = (
+        ProjectModelUsage.project_id == project_id
+        if project_id is not None
+        else ProjectModelUsage.project_id.is_(None)
+    )
+    pmu = db.query(ProjectModelUsage).filter(
+        ProjectModelUsage.org_id == org_id,
+        _pid_filter,
+        ProjectModelUsage.model_name == model_name,
+        ProjectModelUsage.date == _today,
+    ).first()
+    if pmu:
+        pmu.call_count = (pmu.call_count or 0) + 1
+        pmu.total_prompt_tokens = (pmu.total_prompt_tokens or 0) + prompt_tokens_final
+        pmu.total_completion_tokens = (pmu.total_completion_tokens or 0) + completion_tokens_final
+        pmu.total_tokens = (pmu.total_tokens or 0) + total_tokens
+        pmu.input_tokens = (pmu.input_tokens or 0) + prompt_tokens_final
+        pmu.output_tokens = (pmu.output_tokens or 0) + completion_tokens_final
+        pmu.input_token_cost = float(pmu.input_token_cost or 0) + cost_data["input_token_cost"]
+        pmu.output_token_cost = float(pmu.output_token_cost or 0) + cost_data["output_token_cost"]
+        pmu.total_token_cost = float(pmu.total_token_cost or 0) + cost_data["llm_cost"]
+        pmu.total_cost = float(pmu.total_cost or 0) + cost_data["total_cost"]
+        pmu.success_count = (pmu.success_count or 0) + 1
+    else:
+        db.add(ProjectModelUsage(
+            org_id=org_id,
+            project_id=project_id,
+            model_name=model_name,
+            provider=provider,
+            date=_today,
+            call_count=1,
+            total_prompt_tokens=prompt_tokens_final,
+            total_completion_tokens=completion_tokens_final,
+            total_tokens=total_tokens,
+            input_tokens=prompt_tokens_final,
+            output_tokens=completion_tokens_final,
+            input_token_cost=cost_data["input_token_cost"],
+            output_token_cost=cost_data["output_token_cost"],
+            total_token_cost=cost_data["llm_cost"],
+            total_cost=cost_data["total_cost"],
+            success_count=1,
+        ))
 
     # ── Step 10: Finalise ────────────────────────────────────────────────
     ai_req.request_status = "completed"
@@ -1140,6 +1185,70 @@ def proxy_request_list(
             "source_system": r.source_system,
         })
     return {"total": total, "items": items}
+
+
+@router.get("/stats/by-project-model")
+def proxy_stats_by_project_model(
+    org_id: Optional[str] = None,
+    days: int = 30,
+    db: Session = Depends(get_db),
+):
+    """Usage breakdown grouped by (project, model) — reads from pre-aggregated ProjectModelUsage table."""
+    cutoff = datetime.utcnow().date() - timedelta(days=int(days))
+
+    q = db.query(
+        ProjectModelUsage.org_id,
+        ProjectModelUsage.project_id,
+        ProjectModelUsage.model_name,
+        ProjectModelUsage.provider,
+        func.sum(ProjectModelUsage.call_count).label("total_requests"),
+        func.sum(ProjectModelUsage.input_tokens).label("input_tokens"),
+        func.sum(ProjectModelUsage.output_tokens).label("output_tokens"),
+        func.sum(ProjectModelUsage.total_tokens).label("total_tokens"),
+        func.sum(ProjectModelUsage.input_token_cost).label("input_cost"),
+        func.sum(ProjectModelUsage.output_token_cost).label("output_cost"),
+        func.sum(ProjectModelUsage.total_cost).label("total_cost"),
+        func.sum(ProjectModelUsage.success_count).label("success_count"),
+    ).filter(ProjectModelUsage.date >= cutoff)
+    if org_id:
+        q = q.filter(ProjectModelUsage.org_id == org_id)
+    rows = q.group_by(
+        ProjectModelUsage.org_id,
+        ProjectModelUsage.project_id,
+        ProjectModelUsage.model_name,
+        ProjectModelUsage.provider,
+    ).order_by(
+        ProjectModelUsage.project_id,
+        func.sum(ProjectModelUsage.total_cost).desc(),
+    ).all()
+
+    # Resolve project names
+    proj_names = {}
+    try:
+        from app.models import Project
+        projs = db.query(Project).all()
+        proj_names = {p.id: (p.project_name or p.id) for p in projs}
+    except Exception:
+        pass
+
+    return [
+        {
+            "org_id":          r.org_id,
+            "project_id":      r.project_id,
+            "project_name":    proj_names.get(r.project_id, r.project_id or "Unassigned"),
+            "model_name":      r.model_name or "unknown",
+            "provider":        r.provider or "openai",
+            "total_requests":  int(r.total_requests or 0),
+            "input_tokens":    int(r.input_tokens or 0),
+            "output_tokens":   int(r.output_tokens or 0),
+            "total_tokens":    int(r.total_tokens or 0),
+            "input_cost":      round(float(r.input_cost or 0), 8),
+            "output_cost":     round(float(r.output_cost or 0), 8),
+            "total_cost":      round(float(r.total_cost or 0), 8),
+            "success_count":   int(r.success_count or 0),
+        }
+        for r in rows
+    ]
 
 
 @router.get("/stats/pii")

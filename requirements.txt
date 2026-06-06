@@ -10,4 +10,4 @@ httpx
 openpyxl
 python-multipart
 twilio
-tiktoken
+tiktokenanthropic
