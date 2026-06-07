@@ -1,28 +1,25 @@
 """Governance Proxy Server — the single entry point for all AI requests.
 
-External teams configure only:
+Client apps configure only:
     GOVERNANCE_KEY=gov-xxxx
-    GOVERNANCE_BASE_URL=https://governance.company.com
+    BASE_URL=https://governance.company.com
 
-They point any OpenAI-compatible SDK at this proxy:
-    client = OpenAI(
-        api_key="ignored",
-        base_url="https://governance.company.com/proxy/v1",
-        default_headers={"X-Governance-Key": "gov-xxxx"},
-    )
+Endpoints:
+    POST /proxy          — non-streaming chat completion
+    POST /proxy/stream   — streaming chat completion (SSE)
 
-Azure OpenAI credentials (API key, endpoint, deployment) live exclusively on
-the admin server — read from environment variables via config.py.
-External teams never see them.
+Model is specified by the client via ?model=<name> query param or "model" in the
+request body. The proxy resolves the correct Azure deployment from the DB and
+forwards the request. Clients never see provider credentials.
 
-Request lifecycle (10 steps):
+Request lifecycle:
   1  Authenticate X-Governance-Key → resolve org_id + project_id
-  2  Generate request_id, capture metadata and timestamp
-  3  Receive and validate request body
-  4  PII scan — mask or block based on pii_policies
-  5  Count input tokens, store AiRequest row
-  6  Forward sanitised request to Azure OpenAI (admin credentials only)
-  7  Azure OpenAI processes the request
+  2  Rate limit check (pre-body, cheapest gate)
+  3  Parse body, resolve model → look up Azure deployment
+  4  Budget + governance rules enforcement
+  5  PII scan — mask or block based on pii_policies
+  6  Count input tokens, store AiRequest row
+  7  Forward sanitised request to Azure OpenAI (admin credentials only)
   8  Capture output tokens and latency
   9  Calculate cost (input + output)
  10  Store AiResponse, TokenUsage, RequestCost, AuditLog — return to caller
@@ -40,7 +37,7 @@ from typing import Any, AsyncIterator, Optional
 _log = logging.getLogger(__name__)
 
 import httpx
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
@@ -643,16 +640,21 @@ async def _stream_azure(
 
 
 # ---------------------------------------------------------------------------
-# Main endpoint — OpenAI-compatible chat completions
+# Shared enforcement pipeline (steps 1-6)
 # ---------------------------------------------------------------------------
 
-@router.post("/v1/chat/completions")
-async def proxy_chat_completions(
+async def _run_pre_flight(
+    *,
     request: Request,
-    x_governance_key: str = Header(..., alias="X-Governance-Key"),
-    db: Session = Depends(get_db),
-) -> Any:
-    # Step 1: Authenticate
+    x_governance_key: str,
+    model_override: Optional[str],
+    db: Session,
+) -> dict:
+    """Auth, rate-limit, model resolution, budget/governance checks, PII scan, token count.
+
+    Returns a context dict consumed by both proxy endpoints.
+    Raises HTTPException on any enforcement failure.
+    """
     identity = _authenticate(db=db, raw_key=x_governance_key)
     org_id: str = identity["org_id"]
     project_id: Optional[str] = identity["project_id"]
@@ -660,53 +662,40 @@ async def proxy_chat_completions(
 
     source_ip: Optional[str] = request.client.host if request.client else None
     user_agent: Optional[str] = request.headers.get("user-agent")
-
-    # request_id is generated immediately after auth so every blocked-request
-    # audit row and every error response body carries a consistent identifier.
     request_id = _new_request_id()
 
-    # Step 2a: Rate limit — cheapest check, requires no body parse.
-    # Wrapped to fail open: if DB schema is missing columns the check is skipped
-    # rather than crashing the entire request with a 500.
     try:
         check_rate_limit(
             db=db, org_id=org_id, project_id=project_id, key_id=key_id,
-            model="",  # model unknown until body parsed; org/project limits still apply
-            request_id=request_id, source_ip=source_ip,
+            model="", request_id=request_id, source_ip=source_ip,
         )
     except HTTPException:
         raise
-    except Exception as _rl_err:
-        _log.warning("Rate limit check skipped due to error: %s", _rl_err)
+    except Exception as _e:
+        _log.warning("Rate limit check skipped: %s", _e)
 
-    # Step 2: Parse body
     try:
         body: dict = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON body.")
 
-    messages: list[dict] = body.get("messages", [])
-    stream: bool = bool(body.get("stream", False))
+    model_name = model_override or body.get("model")
+    if not model_name:
+        raise HTTPException(
+            status_code=400,
+            detail="Model must be specified via ?model= query param or 'model' in the request body.",
+        )
 
-    # Resolve deployment from DB (per-org/project) with env-var fallback.
-    # External teams never specify provider/model — governance platform decides.
-    depl = get_deployment_for_org(
-        db, org_id=org_id, project_id=project_id,
-        requested_model=body.get("model"),
-    )
+    depl = get_deployment_for_org(db, org_id=org_id, project_id=project_id, requested_model=model_name)
     if not depl:
         raise HTTPException(
-            status_code=503,
-            detail=(
-                "No AI deployment configured for this project. "
-                "An admin must register one via POST /deployments."
-            ),
+            status_code=404,
+            detail=f"Model '{model_name}' is not configured or not authorized for this project.",
         )
 
     model: str = depl.model_name
     deployment: str = depl.deployment_name or depl.model_name
 
-    # Step 2b: Budget — current-month spend vs configured limits.
     try:
         check_budget(
             db=db, org_id=org_id, project_id=project_id,
@@ -714,10 +703,9 @@ async def proxy_chat_completions(
         )
     except HTTPException:
         raise
-    except Exception as _budget_err:
-        _log.warning("Budget check skipped due to error: %s", _budget_err)
+    except Exception as _e:
+        _log.warning("Budget check skipped: %s", _e)
 
-    # Step 2c: Governance rules — model allow/block, pricing, max_output_tokens.
     try:
         check_governance_rules(
             db=db, org_id=org_id, project_id=project_id,
@@ -727,38 +715,33 @@ async def proxy_chat_completions(
         )
     except HTTPException:
         raise
-    except Exception as _gov_err:
-        _log.warning("Governance rules check skipped due to error: %s", _gov_err)
+    except Exception as _e:
+        _log.warning("Governance rules check skipped: %s", _e)
 
-    # Step 4: PII scan — fail-open: DB errors skip scanning, raw messages forwarded.
+    messages: list[dict] = body.get("messages", [])
     try:
         clean_messages = _scan_messages(
-            messages=messages,
-            org_id=org_id,
-            project_id=project_id,
-            db=db,
+            messages=messages, org_id=org_id, project_id=project_id, db=db,
         )
     except HTTPException:
         raise
-    except Exception as _pii_err:
-        _log.warning("PII scan skipped due to error: %s", _pii_err)
+    except Exception as _e:
+        _log.warning("PII scan skipped: %s", _e)
         clean_messages = messages
 
     forward_body = {k: v for k, v in body.items() if k != "stream"}
     forward_body["messages"] = clean_messages
+    forward_body["model"] = model
 
-    # Step 5: Count input tokens using chat-completions format overhead.
-    # Each message carries ~4 tokens of structural overhead (role, separators).
-    # A further 2 tokens prime the reply. This matches Azure's billing model.
-    input_tokens = 2  # reply priming
+    # Each message: ~4 tokens structural overhead (role + separators). 2 tokens prime the reply.
+    input_tokens = 2
     for msg in clean_messages:
         content = msg.get("content", "")
         if isinstance(content, str):
             input_tokens += 4 + count_tokens(text=content, model_name=model)
         else:
-            input_tokens += 4  # non-text content (images etc.) — best effort
+            input_tokens += 4
 
-    # Step 4a: Max input tokens governance check (requires token count).
     try:
         check_max_input_tokens(
             db=db, org_id=org_id, project_id=project_id,
@@ -767,8 +750,8 @@ async def proxy_chat_completions(
         )
     except HTTPException:
         raise
-    except Exception as _mit_err:
-        _log.warning("Max input tokens check skipped due to error: %s", _mit_err)
+    except Exception as _e:
+        _log.warning("Max input tokens check skipped: %s", _e)
 
     _store_request(
         db=db,
@@ -787,97 +770,94 @@ async def proxy_chat_completions(
     db.commit()
 
     url, azure_hdrs = build_provider_request(depl)
+
+    return dict(
+        request_id=request_id,
+        org_id=org_id,
+        project_id=project_id,
+        key_id=key_id,
+        model=model,
+        deployment=deployment,
+        forward_body=forward_body,
+        input_tokens=input_tokens,
+        source_ip=source_ip,
+        user_agent=user_agent,
+        url=url,
+        azure_hdrs=azure_hdrs,
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /proxy — non-streaming
+# ---------------------------------------------------------------------------
+
+@router.post("")
+async def proxy_chat(
+    request: Request,
+    model: Optional[str] = Query(None, description="AI model name (overrides body 'model' field)"),
+    x_governance_key: str = Header(..., alias="X-Governance-Key"),
+    db: Session = Depends(get_db),
+) -> Any:
+    ctx = await _run_pre_flight(
+        request=request, x_governance_key=x_governance_key, model_override=model, db=db,
+    )
     t_start = time.time()
 
-    # Step 6-10: Streaming path
-    if stream:
-        return StreamingResponse(
-            _stream_azure(
-                url=url,
-                headers=azure_hdrs,
-                body={**forward_body, "stream": True},
-                request_id=request_id,
-                org_id=org_id,
-                project_id=project_id,
-                key_id=key_id,
-                model=model,
-                deployment=deployment,
-                input_tokens=input_tokens,
-                source_ip=source_ip,
-                user_agent=user_agent,
-                db=db,
-                t_start=t_start,
-            ),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Request-Id": request_id},
-        )
-
-    # Step 6-10: Non-streaming path
     try:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=5.0)
         ) as client:
-            azure_resp = await client.post(url=url, headers=azure_hdrs, json=forward_body)
+            azure_resp = await client.post(
+                url=ctx["url"], headers=ctx["azure_hdrs"], json=ctx["forward_body"],
+            )
             azure_resp.raise_for_status()
     except httpx.HTTPStatusError as exc:
         status_code = exc.response.status_code
         if status_code == 429:
-            # Rate limit — Azure rejected before processing; no tokens consumed.
             _mark_request_failed(
-                db=db, request_id=request_id, org_id=org_id, project_id=project_id,
-                key_id=key_id, source_ip=source_ip, user_agent=user_agent,
+                db=db, request_id=ctx["request_id"], org_id=ctx["org_id"],
+                project_id=ctx["project_id"], key_id=ctx["key_id"],
+                source_ip=ctx["source_ip"], user_agent=ctx["user_agent"],
                 detail=f"Azure 429 rate limit: {exc}",
             )
         else:
-            # Content filter (400), context length (400), server error (5xx), etc.
-            # Azure received and processed the input — input tokens were consumed.
-            # Prefer Azure's own usage count from the error body; fall back to
-            # our tiktoken estimate when Azure doesn't include usage.
             azure_input, azure_output = _azure_usage_from_error(exc)
-            billed_input = azure_input if azure_input > 0 else input_tokens
-            billed_output = azure_output
+            billed_input = azure_input if azure_input > 0 else ctx["input_tokens"]
             in_src = "azure" if azure_input > 0 else "tiktoken_estimate"
             out_src = "azure" if azure_output > 0 else "tiktoken_estimate"
             _mark_request_failed_with_cost(
-                db=db, request_id=request_id, org_id=org_id, project_id=project_id,
-                key_id=key_id, model=model, deployment=deployment,
-                input_tokens=billed_input, output_tokens=billed_output,
+                db=db, request_id=ctx["request_id"], org_id=ctx["org_id"],
+                project_id=ctx["project_id"], key_id=ctx["key_id"],
+                model=ctx["model"], deployment=ctx["deployment"],
+                input_tokens=billed_input, output_tokens=azure_output,
                 latency_ms=int((time.time() - t_start) * 1000),
-                source_ip=source_ip, user_agent=user_agent,
+                source_ip=ctx["source_ip"], user_agent=ctx["user_agent"],
                 detail=f"Azure error {status_code}: {exc}",
-                input_token_source=in_src,
-                output_token_source=out_src,
+                input_token_source=in_src, output_token_source=out_src,
             )
         raise HTTPException(status_code=status_code, detail=str(exc))
     except httpx.RequestError as exc:
-        # Timeout or connection failure — Azure received the request body and
-        # started processing before the connection dropped; input tokens consumed.
         _mark_request_failed_with_cost(
-            db=db, request_id=request_id, org_id=org_id, project_id=project_id,
-            key_id=key_id, model=model, deployment=deployment,
-            input_tokens=input_tokens, output_tokens=0,
+            db=db, request_id=ctx["request_id"], org_id=ctx["org_id"],
+            project_id=ctx["project_id"], key_id=ctx["key_id"],
+            model=ctx["model"], deployment=ctx["deployment"],
+            input_tokens=ctx["input_tokens"], output_tokens=0,
             latency_ms=int((time.time() - t_start) * 1000),
-            source_ip=source_ip, user_agent=user_agent,
-            detail=f"Azure unreachable (timeout/connection): {exc}",
-            input_token_source="tiktoken_estimate",
-            output_token_source="tiktoken_estimate",
+            source_ip=ctx["source_ip"], user_agent=ctx["user_agent"],
+            detail=f"Azure unreachable: {exc}",
+            input_token_source="tiktoken_estimate", output_token_source="tiktoken_estimate",
         )
         raise HTTPException(status_code=502, detail=f"Azure OpenAI unreachable: {exc}")
 
     latency_ms = int((time.time() - t_start) * 1000)
     response_data: dict = azure_resp.json()
 
-    # Step 8: Extract tokens — prefer Azure's usage field (exact, from provider).
-    # prompt_tokens overwrites our pre-send tiktoken estimate when Azure returns it.
     usage = response_data.get("usage", {})
     azure_prompt = int(usage.get("prompt_tokens", 0))
     azure_completion = int(usage.get("completion_tokens", 0))
 
-    if azure_prompt > 0:
-        input_tokens = azure_prompt
-        in_src = "azure"
-    else:
-        in_src = "tiktoken_estimate"  # keep the estimate we counted before sending
+    input_tokens = azure_prompt if azure_prompt > 0 else ctx["input_tokens"]
+    in_src = "azure" if azure_prompt > 0 else "tiktoken_estimate"
 
     if azure_completion > 0:
         output_tokens = azure_completion
@@ -887,7 +867,7 @@ async def proxy_chat_completions(
             (c.get("message", {}).get("content") or "")
             for c in response_data.get("choices", [])
         )
-        output_tokens = count_tokens(text=output_text, model_name=model)
+        output_tokens = count_tokens(text=output_text, model_name=ctx["model"])
         out_src = "tiktoken_estimate"
 
     finish_reason: Optional[str] = None
@@ -895,16 +875,13 @@ async def proxy_chat_completions(
     if choices:
         finish_reason = choices[0].get("finish_reason")
 
-    # Steps 9-10: Store cost + audit
-    # Both token sources reflect whether Azure returned a usage field.
-    # in_src = "azure" when prompt_tokens was present, "tiktoken_estimate" otherwise.
     _store_response_and_cost(
         db=db,
-        request_id=request_id,
-        org_id=org_id,
-        project_id=project_id,
-        model=model,
-        deployment=deployment,
+        request_id=ctx["request_id"],
+        org_id=ctx["org_id"],
+        project_id=ctx["project_id"],
+        model=ctx["model"],
+        deployment=ctx["deployment"],
         response_payload=response_data,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
@@ -916,20 +893,57 @@ async def proxy_chat_completions(
     )
     _store_audit(
         db=db,
-        request_id=request_id,
-        org_id=org_id,
-        project_id=project_id,
-        key_id=key_id,
+        request_id=ctx["request_id"],
+        org_id=ctx["org_id"],
+        project_id=ctx["project_id"],
+        key_id=ctx["key_id"],
         action="proxy_request_complete",
         status="success",
-        source_ip=source_ip,
-        user_agent=user_agent,
+        source_ip=ctx["source_ip"],
+        user_agent=ctx["user_agent"],
     )
     db.commit()
 
     return JSONResponse(
         content=response_data,
-        headers={"X-Request-Id": request_id},
+        headers={"X-Request-Id": ctx["request_id"]},
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /proxy/stream — SSE streaming
+# ---------------------------------------------------------------------------
+
+@router.post("/stream")
+async def proxy_chat_stream(
+    request: Request,
+    model: Optional[str] = Query(None, description="AI model name (overrides body 'model' field)"),
+    x_governance_key: str = Header(..., alias="X-Governance-Key"),
+    db: Session = Depends(get_db),
+) -> Any:
+    ctx = await _run_pre_flight(
+        request=request, x_governance_key=x_governance_key, model_override=model, db=db,
+    )
+    t_start = time.time()
+    return StreamingResponse(
+        _stream_azure(
+            url=ctx["url"],
+            headers=ctx["azure_hdrs"],
+            body={**ctx["forward_body"], "stream": True},
+            request_id=ctx["request_id"],
+            org_id=ctx["org_id"],
+            project_id=ctx["project_id"],
+            key_id=ctx["key_id"],
+            model=ctx["model"],
+            deployment=ctx["deployment"],
+            input_tokens=ctx["input_tokens"],
+            source_ip=ctx["source_ip"],
+            user_agent=ctx["user_agent"],
+            db=db,
+            t_start=t_start,
+        ),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Request-Id": ctx["request_id"]},
     )
 
 

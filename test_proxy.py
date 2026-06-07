@@ -1,12 +1,13 @@
 """
-Governance Proxy — external-team test script.
+Governance Proxy — integration test script.
 
-Only two credentials required (set in .env):
-    GOVERNANCE_BASE_URL=https://<server>/proxy/v1
+Required in .env:
+    GOVERNANCE_BASE_URL=http://localhost:8000    ← server root, no trailing slash
     GOVERNANCE_KEY=gov-<your-key>
+    GOVERNANCE_MODEL=gpt-4o                      ← model name registered in deployments
 
 Run:
-    source venv/bin/activate
+    conda activate govenv   (or whichever env has requests + python-dotenv)
     python test_proxy.py
 """
 
@@ -14,25 +15,22 @@ import json
 import os
 import sys
 import time
-from urllib.parse import urlparse as _urlparse
 
 import requests
 from dotenv import load_dotenv
 
-load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+load_dotenv()
 
 # ── Config ────────────────────────────────────────────────────────────────────
-# External teams only need these two values — no Azure details, no model names.
-GOVERNANCE_BASE_URL = os.getenv("GOVERNANCE_BASE_URL", "").rstrip("/")
-GOVERNANCE_KEY      = os.getenv("GOVERNANCE_KEY", "")
+SERVER_ROOT = os.getenv("GOVERNANCE_BASE_URL", "").rstrip("/")  # e.g. http://localhost:8000
+GOVERNANCE_KEY = os.getenv("GOVERNANCE_KEY", "")
+MODEL = os.getenv("GOVERNANCE_MODEL", "")
 
-if not GOVERNANCE_BASE_URL or not GOVERNANCE_KEY:
-    sys.exit("ERROR: GOVERNANCE_BASE_URL and GOVERNANCE_KEY must be set in .env")
+missing = [k for k, v in [("GOVERNANCE_BASE_URL", SERVER_ROOT), ("GOVERNANCE_KEY", GOVERNANCE_KEY), ("GOVERNANCE_MODEL", MODEL)] if not v]
+if missing:
+    sys.exit(f"ERROR: missing .env variable(s): {', '.join(missing)}")
 
-# Derive roots from GOVERNANCE_BASE_URL (e.g. https://server/proxy/v1)
-_parsed     = _urlparse(GOVERNANCE_BASE_URL)
-SERVER_ROOT = f"{_parsed.scheme}://{_parsed.netloc}"   # https://server
-PROXY_BASE  = GOVERNANCE_BASE_URL                       # https://server/proxy/v1
+PROXY_BASE = f"{SERVER_ROOT}/proxy"  # POST /proxy, POST /proxy/stream
 
 HEADERS = {
     "X-Governance-Key": GOVERNANCE_KEY,
@@ -72,11 +70,12 @@ def separator(title: str):
 print(f"\n[{INFO} ] SERVER   : {SERVER_ROOT}")
 print(f"[{INFO} ] PROXY    : {PROXY_BASE}")
 print(f"[{INFO} ] KEY      : {GOVERNANCE_KEY[:12]}...")
+print(f"[{INFO} ] MODEL    : {MODEL}")
 
 
-# ── 0. Warm-up — wait for Render cold start ───────────────────────────────────
-separator("0. Server warm-up (handles Render cold start)")
-print(f"[{INFO} ] Pinging server — may take up to 60 s on cold start ...")
+# ── 0. Warm-up ────────────────────────────────────────────────────────────────
+separator("0. Server warm-up (handles cold start)")
+print(f"[{INFO} ] Pinging server ...")
 _warmed_up = False
 for _attempt in range(4):
     try:
@@ -104,10 +103,10 @@ except Exception as e:
 separator("2. Auth — invalid governance key")
 try:
     r = requests.post(
-        f"{PROXY_BASE}/chat/completions",
+        PROXY_BASE,
         headers={**HEADERS, "X-Governance-Key": "gov-BADKEY0000000000"},
-        json={"messages": [{"role": "user", "content": "hi"}]},
-        timeout=60,
+        json={"model": MODEL, "messages": [{"role": "user", "content": "hi"}]},
+        timeout=15,
     )
     check("Invalid key → 401", r.status_code == 401, r.text[:120])
 except Exception as e:
@@ -118,9 +117,9 @@ except Exception as e:
 separator("3. Auth — missing X-Governance-Key header")
 try:
     r = requests.post(
-        f"{PROXY_BASE}/chat/completions",
+        PROXY_BASE,
         headers={"Content-Type": "application/json"},
-        json={"messages": [{"role": "user", "content": "hi"}]},
+        json={"model": MODEL, "messages": [{"role": "user", "content": "hi"}]},
         timeout=15,
     )
     check("Missing key → 422", r.status_code == 422, r.text[:120])
@@ -128,23 +127,51 @@ except Exception as e:
     check("Missing key → 422", False, str(e))
 
 
-# ── 4. Non-streaming chat completion ─────────────────────────────────────────
-separator("4. Non-streaming chat completion (success path)")
+# ── 4. No model specified → 400 ───────────────────────────────────────────────
+separator("4. Missing model — proxy must reject with 400")
+try:
+    r = requests.post(
+        PROXY_BASE,
+        headers=HEADERS,
+        json={"messages": [{"role": "user", "content": "hi"}]},
+        timeout=15,
+    )
+    check("No model in body or ?model= → 400", r.status_code == 400, r.text[:120])
+except Exception as e:
+    check("No model in body or ?model= → 400", False, str(e))
+
+
+# ── 5. Unknown model → 404 ────────────────────────────────────────────────────
+separator("5. Unknown model — proxy must reject with 404")
+try:
+    r = requests.post(
+        PROXY_BASE,
+        headers=HEADERS,
+        json={"model": "this-model-does-not-exist", "messages": [{"role": "user", "content": "hi"}]},
+        timeout=15,
+    )
+    check("Unknown model → 404", r.status_code == 404, r.text[:120])
+except Exception as e:
+    check("Unknown model → 404", False, str(e))
+
+
+# ── 6. Non-streaming chat completion ─────────────────────────────────────────
+separator("6. Non-streaming chat completion (success path)")
 try:
     t0 = time.time()
     r = requests.post(
-        f"{PROXY_BASE}/chat/completions",
+        PROXY_BASE,
         headers=HEADERS,
         json={
+            "model": MODEL,
             "messages": [{"role": "user", "content": "Reply with exactly: OK"}],
             "max_tokens": 10,
-            "stream": False,
         },
         timeout=60,
     )
     latency = round((time.time() - t0) * 1000)
     ok = r.status_code == 200
-    check(f"POST /proxy/v1/chat/completions → 200  ({latency} ms)", ok, r.text[:200] if not ok else "")
+    check(f"POST /proxy → 200  ({latency} ms)", ok, r.text[:200] if not ok else "")
 
     if ok:
         body = r.json()
@@ -156,26 +183,46 @@ try:
         print(f"[{INFO} ] X-Request-Id : {request_id}")
         print(f"[{INFO} ] usage        : {usage}")
 except Exception as e:
-    check("POST /proxy/v1/chat/completions → 200", False, str(e))
+    check("POST /proxy → 200", False, str(e))
 
 
-# ── 5. Streaming chat completion ──────────────────────────────────────────────
-separator("5. Streaming chat completion (success path)")
+# ── 7. Model via query param ──────────────────────────────────────────────────
+separator("7. Model specified via ?model= query param (not body)")
+try:
+    t0 = time.time()
+    r = requests.post(
+        f"{PROXY_BASE}?model={MODEL}",
+        headers=HEADERS,
+        json={
+            "messages": [{"role": "user", "content": "Reply with exactly: QUERY_PARAM_OK"}],
+            "max_tokens": 10,
+        },
+        timeout=60,
+    )
+    latency = round((time.time() - t0) * 1000)
+    ok = r.status_code == 200
+    check(f"POST /proxy?model={MODEL} → 200  ({latency} ms)", ok, r.text[:200] if not ok else "")
+except Exception as e:
+    check(f"POST /proxy?model={MODEL} → 200", False, str(e))
+
+
+# ── 8. Streaming chat completion ──────────────────────────────────────────────
+separator("8. Streaming chat completion — POST /proxy/stream")
 try:
     t0 = time.time()
     with requests.post(
-        f"{PROXY_BASE}/chat/completions",
+        f"{PROXY_BASE}/stream",
         headers=HEADERS,
         json={
+            "model": MODEL,
             "messages": [{"role": "user", "content": "Count to 3, one number per word."}],
             "max_tokens": 20,
-            "stream": True,
         },
         stream=True,
         timeout=60,
     ) as r:
         ok = r.status_code == 200
-        check("POST /proxy/v1/chat/completions stream → 200", ok, r.headers.get("content-type", "") if not ok else "")
+        check("POST /proxy/stream → 200", ok, r.headers.get("content-type", "") if not ok else "")
 
         if ok:
             chunks = 0
@@ -202,14 +249,14 @@ try:
             check(f"Stream received data chunks ({chunks} chunks, {latency} ms)", chunks > 0, f"text: {text!r}")
             check("Stream terminated with [DONE]", done)
 except Exception as e:
-    check("POST /proxy/v1/chat/completions stream → 200", False, str(e))
+    check("POST /proxy/stream → 200", False, str(e))
 
 
-# ── 6. Bad JSON body → 400 ────────────────────────────────────────────────────
-separator("6. Malformed JSON body")
+# ── 9. Bad JSON body → 400 ────────────────────────────────────────────────────
+separator("9. Malformed JSON body")
 try:
     r = requests.post(
-        f"{PROXY_BASE}/chat/completions",
+        PROXY_BASE,
         headers=HEADERS,
         data=b"not-json{{{{",
         timeout=15,
@@ -219,11 +266,11 @@ except Exception as e:
     check("Malformed JSON → 400", False, str(e))
 
 
-# ── 7. List proxy requests ────────────────────────────────────────────────────
-separator("7. List proxy requests (admin endpoint)")
+# ── 10. List proxy requests ───────────────────────────────────────────────────
+separator("10. List proxy requests (admin endpoint)")
 try:
     r = requests.get(
-        f"{PROXY_BASE}/requests",
+        f"{PROXY_BASE}/v1/requests",
         headers=HEADERS,
         params={"limit": 5},
         timeout=15,
@@ -243,8 +290,8 @@ except Exception as e:
     check("GET /proxy/v1/requests → 200", False, str(e))
 
 
-# ── 8. Costs summary ─────────────────────────────────────────────────────────
-separator("8. Cost summary endpoint")
+# ── 11. Cost summary ──────────────────────────────────────────────────────────
+separator("11. Cost summary endpoint")
 try:
     r = requests.get(f"{SERVER_ROOT}/costs/summary", headers=HEADERS, timeout=15)
     ok = r.status_code == 200
@@ -259,17 +306,17 @@ except Exception as e:
     check("GET /costs/summary → 200", False, str(e))
 
 
-# ── 9. Token tracking — verify DB records tokens after a real request ─────────
-separator("9. Token tracking — verify tokens stored in DB")
+# ── 12. Token tracking ────────────────────────────────────────────────────────
+separator("12. Token tracking — verify tokens stored in DB")
 _tracked_request_id = None
 try:
     r = requests.post(
-        f"{PROXY_BASE}/chat/completions",
+        PROXY_BASE,
         headers=HEADERS,
         json={
+            "model": MODEL,
             "messages": [{"role": "user", "content": "Say the word: hello"}],
             "max_tokens": 5,
-            "stream": False,
         },
         timeout=60,
     )
@@ -288,8 +335,8 @@ except Exception as e:
     check("Token tracking request → 200", False, str(e))
 
 
-# ── 10. Cost per request — verify cost stored for the request above ───────────
-separator("10. Cost per request — verify cost recorded in DB")
+# ── 13. Cost per request ──────────────────────────────────────────────────────
+separator("13. Cost per request — verify cost recorded in DB")
 if _tracked_request_id:
     try:
         r = requests.get(
@@ -310,11 +357,11 @@ if _tracked_request_id:
     except Exception as e:
         check("GET /costs/request/{id} → 200", False, str(e))
 else:
-    skip("Cost per request", "Skipped — no request_id captured in test 9")
+    skip("Cost per request", "Skipped — no request_id captured in test 12")
 
 
-# ── 11. Cost by model — model-wise breakdown ──────────────────────────────────
-separator("11. Cost by model — model-wise breakdown")
+# ── 14. Cost by model ─────────────────────────────────────────────────────────
+separator("14. Cost by model — model-wise breakdown")
 try:
     r = requests.get(f"{SERVER_ROOT}/costs/by-model", headers=HEADERS, timeout=15)
     ok = r.status_code == 200
@@ -334,8 +381,8 @@ except Exception as e:
     check("GET /costs/by-model → 200", False, str(e))
 
 
-# ── 12. Cost by project — project-wise breakdown ──────────────────────────────
-separator("12. Cost by project — project-wise breakdown")
+# ── 15. Cost by project ───────────────────────────────────────────────────────
+separator("15. Cost by project — project-wise breakdown")
 try:
     r = requests.get(f"{SERVER_ROOT}/costs/by-project", headers=HEADERS, timeout=15)
     ok = r.status_code == 200
@@ -350,52 +397,49 @@ except Exception as e:
     check("GET /costs/by-project → 200", False, str(e))
 
 
-# ── 13. Audit log ─────────────────────────────────────────────────────────────
-separator("13. Audit log — internal admin endpoint")
+# ── 16. Audit log (admin only) ────────────────────────────────────────────────
+separator("16. Audit log — internal admin endpoint")
 skip("GET /audit-logs", "Requires X-API-Key (admin only) — not available to external teams")
 
-
-# ── 14. Audit log summary ─────────────────────────────────────────────────────
-separator("14. Audit log summary — internal admin endpoint")
+separator("17. Audit log summary — internal admin endpoint")
 skip("GET /audit-logs/summary", "Requires X-API-Key (admin only) — not available to external teams")
 
 
-# ── 15. PII detection — email in message ─────────────────────────────────────
-separator("15. PII detection — email address in message")
+# ── 18. PII detection — email ─────────────────────────────────────────────────
+separator("18. PII detection — email address in message")
 try:
     r = requests.post(
-        f"{PROXY_BASE}/chat/completions",
+        PROXY_BASE,
         headers=HEADERS,
         json={
+            "model": MODEL,
             "messages": [{"role": "user", "content": "My email is test.user@example.com, help me write a greeting."}],
             "max_tokens": 20,
-            "stream": False,
         },
         timeout=60,
     )
     pii_email_request_id = r.headers.get("X-Request-Id", "")
-    # 200 = masked and forwarded; 4xx = blocked by policy — both are valid outcomes
     check(
         "PII email request handled (200=masked, 4xx=blocked by policy)",
         r.status_code in (200, 400, 403, 422),
         f"status={r.status_code}",
     )
-    print(f"[{INFO} ] action  : {'masked/forwarded' if r.status_code == 200 else 'blocked by PII policy'}")
+    print(f"[{INFO} ] action       : {'masked/forwarded' if r.status_code == 200 else 'blocked by PII policy'}")
     print(f"[{INFO} ] X-Request-Id : {pii_email_request_id}")
 except Exception as e:
     check("PII email request handled", False, str(e))
 
 
-# ── 16. PII detection — phone number in message ───────────────────────────────
-separator("16. PII detection — phone number in message")
+# ── 19. PII detection — phone number ─────────────────────────────────────────
+separator("19. PII detection — phone number in message")
 try:
     r = requests.post(
-        f"{PROXY_BASE}/chat/completions",
+        PROXY_BASE,
         headers=HEADERS,
         json={
+            "model": MODEL,
             "messages": [{"role": "user", "content": "Call me at +91 98765 43210 to discuss the project."}],
             "max_tokens": 20,
-            "stream": False,
         },
         timeout=60,
     )
@@ -408,22 +452,19 @@ try:
 except Exception as e:
     check("PII phone request handled", False, str(e))
 
-
-# ── 17. PII audit log ─────────────────────────────────────────────────────────
-separator("17. PII audit log — internal admin endpoint")
+separator("20. PII audit log — internal admin endpoint")
 skip("GET /audit-logs/pii", "Requires X-API-Key (admin only) — not available to external teams")
 
 
-# ── 18. Empty messages array — governance proxy rejects gracefully ────────────
-separator("18. Empty messages — proxy rejects or handles gracefully (not crash)")
+# ── 21. Empty messages — graceful rejection ───────────────────────────────────
+separator("21. Empty messages — proxy rejects or handles gracefully")
 try:
     r = requests.post(
-        f"{PROXY_BASE}/chat/completions",
+        PROXY_BASE,
         headers=HEADERS,
-        json={"messages": [], "max_tokens": 5},
+        json={"model": MODEL, "messages": [], "max_tokens": 5},
         timeout=30,
     )
-    # Proxy should return an error (4xx/5xx), not a 200 with an empty response
     check(
         "Empty messages → error response (not crash)",
         r.status_code != 200 or bool(r.text),
@@ -433,20 +474,20 @@ except Exception as e:
     check("Empty messages → error response (not crash)", False, str(e))
 
 
-# ── 19. Governance rule — oversized input ─────────────────────────────────────
-separator("19. Governance rule — oversized input (max_input_tokens)")
+# ── 22. Governance rule — oversized input ─────────────────────────────────────
+separator("22. Governance rule — oversized input (max_input_tokens)")
 try:
     big_message = "word " * 4000   # ~4 000 tokens
     r = requests.post(
-        f"{PROXY_BASE}/chat/completions",
+        PROXY_BASE,
         headers=HEADERS,
         json={
+            "model": MODEL,
             "messages": [{"role": "user", "content": big_message}],
             "max_tokens": 5,
         },
         timeout=60,
     )
-    # 200 = no max-token rule configured; 4xx = governance rule blocked — both valid
     check(
         "Oversized input handled (200=no rule set, 4xx=rule blocked)",
         r.status_code in (200, 400, 403, 422, 429),
@@ -457,8 +498,8 @@ except Exception as e:
     check("Oversized input handled", False, str(e))
 
 
-# ── 20. Cost daily trend ───────────────────────────────────────────────────────
-separator("20. Cost daily trend")
+# ── 23. Cost daily trend ──────────────────────────────────────────────────────
+separator("23. Cost daily trend")
 try:
     r = requests.get(f"{SERVER_ROOT}/costs/trend/daily", headers=HEADERS, timeout=15)
     ok = r.status_code == 200
@@ -485,44 +526,42 @@ print(f"{color}  {passed}/{total} checks passed\033[0m\n")
 # HOW TO RUN
 # ─────────────────────────────────────────────────────────────────────────────
 #
-#  Prerequisites — nothing to install, already in the project venv:
-#       requests, python-dotenv
-#
-#  Share only these two values with the external team (.env):
-#       GOVERNANCE_BASE_URL=https://<server>/proxy/v1
+#  .env (three values required):
+#       GOVERNANCE_BASE_URL=https://<server>     ← server root, NOT the /proxy path
 #       GOVERNANCE_KEY=gov-<your-key>
-#
-#  No Azure details. No model names. No SDK setup.
+#       GOVERNANCE_MODEL=gpt-4o                  ← must be registered in model_deployments
 #
 #  Steps:
-#       source venv/bin/activate
+#       conda activate govenv   (or: source venv/bin/activate)
 #       python test_proxy.py
+#
+#  Proxy endpoints:
+#       POST /proxy              non-streaming — model in body or ?model=
+#       POST /proxy/stream       streaming SSE — model in body or ?model=
+#       GET  /proxy/v1/requests  request history (admin)
 #
 #  What each test verifies:
 #   1   Health check              server is up
 #   2   Invalid key               401 for a bad governance key
 #   3   Missing key header        422 when header is absent
-#   4   Non-streaming completion  chat works, usage block returned
-#   5   Streaming completion      SSE chunks arrive + [DONE] terminator
-#   6   Malformed JSON            400 returned, server does not crash
-#   7   List proxy requests       request history endpoint works
-#   8   Cost summary              aggregated totals endpoint works
-#   9   Token tracking            prompt/completion/total tokens > 0
-#  10   Cost per request          cost stored in DB for each request
-#  11   Cost by model             model-wise breakdown responds
-#  12   Cost by project           project-wise breakdown responds
-#  13   Audit log                 SKIPPED — admin only
-#  14   Audit log summary         SKIPPED — admin only
-#  15   PII email                 email masked or blocked — either is correct
-#  16   PII phone                 phone masked or blocked — either is correct
-#  17   PII audit log             SKIPPED — admin only
-#  18   Empty messages            proxy rejects gracefully, does not crash
-#  19   Oversized input           governance rule blocks or passes cleanly
-#  20   Cost daily trend          daily trend rows returned
-#
-#  Notes:
-#  - Tests 13, 14, 17 are skipped — they need an admin key the external
-#    team does not have. They do not count toward pass/fail totals.
-#  - Tests 15, 16, 19 accept 200 OR 4xx as PASS because the outcome
-#    depends on PII policies and governance rules configured in the DB.
+#   4   No model specified        400 when model is omitted entirely
+#   5   Unknown model             404 when model has no registered deployment
+#   6   Non-streaming completion  chat works, usage block returned
+#   7   Model via query param     ?model= overrides body model field
+#   8   Streaming completion      SSE chunks arrive + [DONE] terminator
+#   9   Malformed JSON            400 returned, server does not crash
+#  10   List proxy requests       request history endpoint works
+#  11   Cost summary              aggregated totals endpoint works
+#  12   Token tracking            prompt/completion/total tokens > 0
+#  13   Cost per request          cost stored in DB for each request
+#  14   Cost by model             model-wise breakdown responds
+#  15   Cost by project           project-wise breakdown responds
+#  16   Audit log                 SKIPPED — admin only
+#  17   Audit log summary         SKIPPED — admin only
+#  18   PII email                 email masked or blocked — either is correct
+#  19   PII phone                 phone masked or blocked — either is correct
+#  20   PII audit log             SKIPPED — admin only
+#  21   Empty messages            proxy rejects gracefully, does not crash
+#  22   Oversized input           governance rule blocks or passes cleanly
+#  23   Cost daily trend          daily trend rows returned
 # ─────────────────────────────────────────────────────────────────────────────
