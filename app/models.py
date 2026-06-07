@@ -12,6 +12,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 
 from app.database import Base
@@ -629,6 +630,11 @@ class AiRequest(Base):
     pii_masked = Column(Boolean, default=False)
     pii_action_taken = Column(String(20), nullable=True)
     content_policy_flags = Column(JSON, nullable=True)
+    # Proxy-layer provenance columns (added via _SAFE_ALTERS)
+    deployment_name = Column(String(255), nullable=True)
+    governance_key_id = Column(String(120), nullable=True)
+    source_ip = Column(String(60), nullable=True)
+    completed_at = Column(DateTime, nullable=True)
     received_at = Column(DateTime, server_default=func.now())
     processing_started_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
@@ -678,7 +684,8 @@ class TokenUsage(Base):
     __table_args__ = {"extend_existing": True}
 
     id = Column(BigInteger, primary_key=True)
-    token_usage_id = Column(String(120), unique=True, nullable=False)
+    token_usage_id = Column(String(120), unique=True, nullable=False,
+                           server_default=text("concat('tu-', replace(gen_random_uuid()::text, '-', ''))"))
     request_id = Column(String(120), ForeignKey("ai_requests.request_id", ondelete="CASCADE"), nullable=False)
     response_id = Column(String(120), ForeignKey("ai_responses.response_id", ondelete="SET NULL"), nullable=True)
     org_id = Column(String(100), nullable=False)
@@ -700,6 +707,10 @@ class TokenUsage(Base):
     context_window_limit = Column(Integer, nullable=True)
     context_utilization_pct = Column(Numeric(6, 3), nullable=True)
     raw_usage = Column(JSON, nullable=True)
+    # Token provenance — values: "azure" (exact from provider) or "tiktoken_estimate"
+    input_token_source = Column(String(30), nullable=True)
+    output_token_source = Column(String(30), nullable=True)
+    is_estimated = Column(Boolean, default=False)
     created_at = Column(DateTime, server_default=func.now())
 
 
@@ -708,7 +719,8 @@ class RequestCost(Base):
     __table_args__ = {"extend_existing": True}
 
     id = Column(BigInteger, primary_key=True)
-    cost_id = Column(String(120), unique=True, nullable=False)
+    cost_id = Column(String(120), unique=True, nullable=False,
+                    server_default=text("concat('cu-', replace(gen_random_uuid()::text, '-', ''))"))
     request_id = Column(String(120), ForeignKey("ai_requests.request_id", ondelete="CASCADE"), nullable=False)
     response_id = Column(String(120), ForeignKey("ai_responses.response_id", ondelete="SET NULL"), nullable=True)
     org_id = Column(String(100), nullable=False)
@@ -716,6 +728,9 @@ class RequestCost(Base):
     project_ref_id = Column(String(100), nullable=True)
     provider = Column(String(100), nullable=True)
     model_name = Column(String(120), nullable=True)
+    input_tokens = Column(Integer, default=0)
+    output_tokens = Column(Integer, default=0)
+    total_tokens = Column(Integer, default=0)
     input_token_cost = Column(Numeric(14, 8), default=0)
     cached_token_cost = Column(Numeric(14, 8), default=0)
     output_token_cost = Column(Numeric(14, 8), default=0)

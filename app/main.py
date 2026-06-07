@@ -1,7 +1,8 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app.config import get_cors_origins
 from app.routers import (
@@ -39,6 +40,29 @@ _SAFE_ALTERS = [
     # Audit log
     "ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS request_id VARCHAR(120)",
     "ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS trace_id VARCHAR(120)",
+    # Token usage provenance
+    "ALTER TABLE token_usage ADD COLUMN IF NOT EXISTS input_token_source VARCHAR(30)",
+    "ALTER TABLE token_usage ADD COLUMN IF NOT EXISTS output_token_source VARCHAR(30)",
+    "ALTER TABLE token_usage ADD COLUMN IF NOT EXISTS is_estimated BOOLEAN DEFAULT FALSE",
+    # Rate limit — per-key and per-project granularity
+    "ALTER TABLE rate_limits ADD COLUMN IF NOT EXISTS project_id VARCHAR(100)",
+    "ALTER TABLE rate_limits ADD COLUMN IF NOT EXISTS key_id VARCHAR(120)",
+    # Provenance: deployment tracked per request
+    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS deployment_name VARCHAR(255)",
+    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP",
+    # Provenance: token counts co-located with cost for single-table reporting
+    "ALTER TABLE request_cost ADD COLUMN IF NOT EXISTS input_tokens INTEGER DEFAULT 0",
+    "ALTER TABLE request_cost ADD COLUMN IF NOT EXISTS output_tokens INTEGER DEFAULT 0",
+    "ALTER TABLE request_cost ADD COLUMN IF NOT EXISTS total_tokens INTEGER DEFAULT 0",
+    # DB-generated IDs so proxy omitting them never causes NOT NULL violations
+    "ALTER TABLE token_usage ALTER COLUMN token_usage_id SET DEFAULT concat('tu-', replace(gen_random_uuid()::text, '-', ''))",
+    "ALTER TABLE request_cost ALTER COLUMN cost_id SET DEFAULT concat('cu-', replace(gen_random_uuid()::text, '-', ''))",
+    # Audit index for policy-violation dashboard queries
+    (
+        "CREATE INDEX IF NOT EXISTS ix_audit_logs_policy "
+        "ON audit_logs (org_id, audit_action, occurred_at) "
+        "WHERE policy_triggered = TRUE"
+    ),
 ]
 
 _ALL_ROUTERS = [
@@ -98,6 +122,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    """Propagate X-Request-Id from enforcement-gate exceptions to response headers.
+
+    When our budget/governance/rate-limit services raise HTTPException with a
+    dict detail containing 'request_id', that ID is surfaced as a response header
+    so callers can correlate blocked requests with audit_logs without parsing the body.
+    """
+    detail = exc.detail
+    headers: dict = dict(exc.headers or {})
+    if isinstance(detail, dict) and "request_id" in detail:
+        headers["X-Request-Id"] = detail["request_id"]
+    content = detail if isinstance(detail, dict) else {"detail": detail}
+    return JSONResponse(status_code=exc.status_code, content=content, headers=headers)
 
 for _router in _ALL_ROUTERS:
     app.include_router(_router)

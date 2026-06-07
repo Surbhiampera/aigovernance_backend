@@ -1,4 +1,5 @@
 """Application configuration loaded from environment variables."""
+import logging
 import os
 from decimal import Decimal
 
@@ -6,14 +7,22 @@ from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
 
+_log = logging.getLogger(__name__)
+
 
 def get_log_level() -> str:
     return os.getenv("LOG_LEVEL", "INFO").upper()
 
 
 def get_cors_origins() -> list[str]:
-    raw = os.getenv("CORS_ORIGINS", "*")
+    raw = os.getenv("CORS_ORIGINS", "")
+    if not raw.strip():
+        return []  # default: no cross-origin browser access; server-to-server unaffected
     if raw.strip() == "*":
+        _log.warning(
+            "CORS_ORIGINS=* permits all browser origins. "
+            "Set explicit origins (e.g. https://governance.company.com) for production."
+        )
         return ["*"]
     return [origin.strip() for origin in raw.split(",") if origin.strip()]
 

@@ -3,8 +3,12 @@
 DailyOrgSummary is populated hourly by the APScheduler job in workers/tasks.py
 which aggregates AiRequest + RequestCost rows into daily rollups.
 
-All endpoints that serve totals read from DailyOrgSummary (fast, pre-aggregated).
-The /overview endpoint also pulls live counts (alerts, active rules) directly.
+MonthlyOrgSummary is populated daily by the same scheduler and covers the
+current calendar month. Monthly endpoints read from this pre-aggregated table
+rather than re-grouping daily rows at query time.
+
+Note: monthly data is up to 24 hours stale (scheduler cadence). Today's and
+daily endpoints remain live.
 """
 from datetime import date, timedelta
 from decimal import Decimal
@@ -15,7 +19,15 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_db
-from app.models import Alert, AiRequest, Budget, DailyOrgSummary, GovernanceRule, RequestCost
+from app.models import (
+    Alert,
+    AiRequest,
+    Budget,
+    DailyOrgSummary,
+    GovernanceRule,
+    MonthlyOrgSummary,
+    RequestCost,
+)
 
 router = APIRouter(prefix="/summary", tags=["summary"])
 
@@ -108,52 +120,89 @@ def get_daily_summary(
 
 
 # ---------------------------------------------------------------------------
-# Monthly rollup — from DailyOrgSummary grouped by month
+# Monthly rollup — from MonthlyOrgSummary (pre-aggregated by scheduler, daily)
+# Data is up to 24 hours stale. Current month appears after first scheduler run.
 # ---------------------------------------------------------------------------
+
+def _month_cutoff(months_back: int) -> date:
+    today = date.today()
+    total_months = today.year * 12 + today.month - months_back
+    y, m = divmod(total_months, 12)
+    if m == 0:
+        m = 12
+        y -= 1
+    return date(y, m, 1)
+
 
 @router.get("/monthly")
 def get_monthly_summary(
     *,
     org_id: Optional[str] = Query(None),
     project_id: Optional[str] = Query(None),
+    months: int = Query(12, ge=1, le=36),
     db: Session = Depends(get_db),
 ) -> list[dict]:
-    q = db.query(
-        func.date_trunc("month", DailyOrgSummary.date).label("month"),
-        DailyOrgSummary.org_id,
-        DailyOrgSummary.project_id,
-        func.sum(DailyOrgSummary.total_events).label("total_requests"),
-        func.sum(DailyOrgSummary.total_prompt_tokens).label("input_tokens"),
-        func.sum(DailyOrgSummary.total_completion_tokens).label("output_tokens"),
-        func.sum(DailyOrgSummary.total_tokens).label("total_tokens"),
-        func.sum(DailyOrgSummary.total_cost).label("total_cost"),
-        func.sum(DailyOrgSummary.success_count).label("success_count"),
-        func.sum(DailyOrgSummary.failure_count).label("failure_count"),
-    )
-    q = _org_filter(q, DailyOrgSummary, org_id=org_id)
-    q = _project_filter(q, DailyOrgSummary, project_id=project_id)
-    rows = (
-        q.group_by(
-            func.date_trunc("month", DailyOrgSummary.date),
-            DailyOrgSummary.org_id,
-            DailyOrgSummary.project_id,
-        )
-        .order_by(func.date_trunc("month", DailyOrgSummary.date).desc())
-        .all()
-    )
+    cutoff = _month_cutoff(months - 1)
+    q = db.query(MonthlyOrgSummary).filter(MonthlyOrgSummary.month >= cutoff)
+    if org_id:
+        q = q.filter(MonthlyOrgSummary.org_id == org_id)
+    if project_id:
+        q = q.filter(MonthlyOrgSummary.project_id == project_id)
+    rows = q.order_by(MonthlyOrgSummary.month.desc()).all()
 
     return [
         {
-            "month": str(r.month)[:7] if r.month else None,
+            "month": str(r.month)[:7],
             "org_id": r.org_id,
             "project_id": r.project_id,
-            "total_requests": r.total_requests or 0,
-            "input_tokens": r.input_tokens or 0,
-            "output_tokens": r.output_tokens or 0,
+            "total_requests": r.total_events or 0,
+            "input_tokens": r.total_prompt_tokens or 0,
+            "output_tokens": r.total_completion_tokens or 0,
             "total_tokens": r.total_tokens or 0,
             "total_cost": float(r.total_cost or 0),
             "success_count": r.success_count or 0,
             "failure_count": r.failure_count or 0,
+            "avg_latency_ms": r.avg_latency_ms or 0,
+        }
+        for r in rows
+    ]
+
+
+@router.get("/monthly-by-model")
+def get_monthly_summary_by_model(
+    *,
+    org_id: Optional[str] = Query(None),
+    project_id: Optional[str] = Query(None),
+    months: int = Query(12, ge=1, le=36),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    """Monthly cost and token breakdown per model.
+
+    Reads from MonthlyOrgSummary.tool_name (which stores model name).
+    Useful for charting cost-per-model trends over time.
+    """
+    cutoff = _month_cutoff(months - 1)
+    q = db.query(MonthlyOrgSummary).filter(MonthlyOrgSummary.month >= cutoff)
+    if org_id:
+        q = q.filter(MonthlyOrgSummary.org_id == org_id)
+    if project_id:
+        q = q.filter(MonthlyOrgSummary.project_id == project_id)
+    rows = q.order_by(MonthlyOrgSummary.month.desc(), MonthlyOrgSummary.total_cost.desc()).all()
+
+    return [
+        {
+            "month": str(r.month)[:7],
+            "org_id": r.org_id,
+            "project_id": r.project_id,
+            "model_name": r.tool_name,
+            "total_requests": r.total_events or 0,
+            "input_tokens": r.total_prompt_tokens or 0,
+            "output_tokens": r.total_completion_tokens or 0,
+            "total_tokens": r.total_tokens or 0,
+            "total_cost": float(r.total_cost or 0),
+            "success_count": r.success_count or 0,
+            "failure_count": r.failure_count or 0,
+            "avg_latency_ms": r.avg_latency_ms or 0,
         }
         for r in rows
     ]

@@ -12,7 +12,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_db
-from app.models import AiRequest, RequestCost, TokenUsage
+from app.models import AiRequest, MonthlyOrgSummary, RequestCost, TokenUsage
 
 router = APIRouter(prefix="/costs", tags=["costs"])
 
@@ -56,8 +56,8 @@ def cost_by_model(
         func.sum(RequestCost.input_tokens).label("input_tokens"),
         func.sum(RequestCost.output_tokens).label("output_tokens"),
         func.sum(RequestCost.total_tokens).label("total_tokens"),
-        func.sum(RequestCost.input_cost).label("input_cost"),
-        func.sum(RequestCost.output_cost).label("output_cost"),
+        func.sum(RequestCost.input_token_cost).label("input_token_cost"),
+        func.sum(RequestCost.output_token_cost).label("output_token_cost"),
         func.sum(RequestCost.total_cost).label("total_cost"),
     )
     q = _org_filter(q, RequestCost, org_id=org_id)
@@ -72,8 +72,8 @@ def cost_by_model(
             "input_tokens": r.input_tokens or 0,
             "output_tokens": r.output_tokens or 0,
             "total_tokens": r.total_tokens or 0,
-            "input_cost": float(r.input_cost or 0),
-            "output_cost": float(r.output_cost or 0),
+            "input_cost": float(r.input_token_cost or 0),
+            "output_cost": float(r.output_token_cost or 0),
             "total_cost": float(r.total_cost or 0),
         }
         for r in rows
@@ -182,8 +182,8 @@ def cost_trend_daily(
         func.sum(RequestCost.input_tokens).label("input_tokens"),
         func.sum(RequestCost.output_tokens).label("output_tokens"),
         func.sum(RequestCost.total_tokens).label("total_tokens"),
-        func.sum(RequestCost.input_cost).label("input_cost"),
-        func.sum(RequestCost.output_cost).label("output_cost"),
+        func.sum(RequestCost.input_token_cost).label("input_token_cost"),
+        func.sum(RequestCost.output_token_cost).label("output_token_cost"),
         func.sum(RequestCost.total_cost).label("total_cost"),
     ).filter(func.date(RequestCost.created_at) >= cutoff)
 
@@ -202,9 +202,85 @@ def cost_trend_daily(
             "input_tokens": r.input_tokens or 0,
             "output_tokens": r.output_tokens or 0,
             "total_tokens": r.total_tokens or 0,
-            "input_cost": float(r.input_cost or 0),
-            "output_cost": float(r.output_cost or 0),
+            "input_cost": float(r.input_token_cost or 0),
+            "output_cost": float(r.output_token_cost or 0),
             "total_cost": float(r.total_cost or 0),
+        }
+        for r in rows
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Monthly cost trend — from MonthlyOrgSummary (pre-aggregated, up to 24h stale)
+# ---------------------------------------------------------------------------
+
+def _month_cutoff(months_back: int) -> date:
+    today = date.today()
+    total_months = today.year * 12 + today.month - months_back
+    y, m = divmod(total_months, 12)
+    if m == 0:
+        m = 12
+        y -= 1
+    return date(y, m, 1)
+
+
+@router.get("/trend/monthly")
+def cost_trend_monthly(
+    *,
+    org_id: Optional[str] = Query(None),
+    project_id: Optional[str] = Query(None),
+    months: int = Query(12, ge=1, le=36),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    """Monthly cost trend aggregated across all models per org/project.
+
+    Reads from MonthlyOrgSummary — pre-aggregated by the daily scheduler.
+    Data is up to 24 hours stale. Use /trend/daily for same-day accuracy.
+    """
+    cutoff = _month_cutoff(months - 1)
+
+    q = db.query(
+        MonthlyOrgSummary.month,
+        MonthlyOrgSummary.org_id,
+        MonthlyOrgSummary.project_id,
+        func.sum(MonthlyOrgSummary.total_events).label("total_requests"),
+        func.sum(MonthlyOrgSummary.total_prompt_tokens).label("input_tokens"),
+        func.sum(MonthlyOrgSummary.total_completion_tokens).label("output_tokens"),
+        func.sum(MonthlyOrgSummary.total_tokens).label("total_tokens"),
+        func.sum(MonthlyOrgSummary.total_cost).label("total_cost"),
+        func.sum(MonthlyOrgSummary.success_count).label("success_count"),
+        func.sum(MonthlyOrgSummary.failure_count).label("failure_count"),
+        func.avg(MonthlyOrgSummary.avg_latency_ms).label("avg_latency_ms"),
+    ).filter(MonthlyOrgSummary.month >= cutoff)
+
+    if org_id:
+        q = q.filter(MonthlyOrgSummary.org_id == org_id)
+    if project_id:
+        q = q.filter(MonthlyOrgSummary.project_id == project_id)
+
+    rows = (
+        q.group_by(
+            MonthlyOrgSummary.month,
+            MonthlyOrgSummary.org_id,
+            MonthlyOrgSummary.project_id,
+        )
+        .order_by(MonthlyOrgSummary.month.asc())
+        .all()
+    )
+
+    return [
+        {
+            "month": str(r.month)[:7],
+            "org_id": r.org_id,
+            "project_id": r.project_id,
+            "total_requests": r.total_requests or 0,
+            "input_tokens": r.input_tokens or 0,
+            "output_tokens": r.output_tokens or 0,
+            "total_tokens": r.total_tokens or 0,
+            "total_cost": float(r.total_cost or 0),
+            "success_count": r.success_count or 0,
+            "failure_count": r.failure_count or 0,
+            "avg_latency_ms": round(float(r.avg_latency_ms or 0), 2),
         }
         for r in rows
     ]
@@ -234,12 +310,12 @@ def cost_for_request(
         "input_tokens": cost.input_tokens,
         "output_tokens": cost.output_tokens,
         "total_tokens": cost.total_tokens,
-        "input_cost": float(cost.input_cost or 0),
-        "output_cost": float(cost.output_cost or 0),
+        "input_cost": float(cost.input_token_cost or 0),
+        "output_cost": float(cost.output_token_cost or 0),
         "total_cost": float(cost.total_cost or 0),
         "currency": cost.currency,
         "request_type": req.request_type if req else None,
-        "status": req.status if req else None,
+        "status": req.request_status if req else None,
         "created_at": cost.created_at.isoformat() if cost.created_at else None,
     }
 
@@ -262,8 +338,8 @@ def cost_summary(
         func.sum(RequestCost.input_tokens).label("input_tokens"),
         func.sum(RequestCost.output_tokens).label("output_tokens"),
         func.sum(RequestCost.total_tokens).label("total_tokens"),
-        func.sum(RequestCost.input_cost).label("input_cost"),
-        func.sum(RequestCost.output_cost).label("output_cost"),
+        func.sum(RequestCost.input_token_cost).label("input_token_cost"),
+        func.sum(RequestCost.output_token_cost).label("output_token_cost"),
         func.sum(RequestCost.total_cost).label("total_cost"),
     )
     q = _org_filter(q, RequestCost, org_id=org_id)
@@ -276,8 +352,8 @@ def cost_summary(
         "input_tokens": r.input_tokens or 0,
         "output_tokens": r.output_tokens or 0,
         "total_tokens": r.total_tokens or 0,
-        "input_cost": float(r.input_cost or 0),
-        "output_cost": float(r.output_cost or 0),
+        "input_cost": float(r.input_token_cost or 0),
+        "output_cost": float(r.output_token_cost or 0),
         "total_cost": float(r.total_cost or 0),
         "currency": "USD",
     }
