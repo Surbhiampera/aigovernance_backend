@@ -687,11 +687,18 @@ async def proxy_chat_completions(
     request_id = _new_request_id()
 
     # Step 2a: Rate limit — cheapest check, requires no body parse.
-    check_rate_limit(
-        db=db, org_id=org_id, project_id=project_id, key_id=key_id,
-        model="",  # model unknown until body parsed; org/project limits still apply
-        request_id=request_id, source_ip=source_ip,
-    )
+    # Wrapped to fail open: if DB schema is missing columns the check is skipped
+    # rather than crashing the entire request with a 500.
+    try:
+        check_rate_limit(
+            db=db, org_id=org_id, project_id=project_id, key_id=key_id,
+            model="",  # model unknown until body parsed; org/project limits still apply
+            request_id=request_id, source_ip=source_ip,
+        )
+    except HTTPException:
+        raise
+    except Exception as _rl_err:
+        _log.warning("Rate limit check skipped due to error: %s", _rl_err)
 
     # Step 2: Parse body
     try:
@@ -714,18 +721,28 @@ async def proxy_chat_completions(
         raise HTTPException(status_code=503, detail="Azure deployment not configured on this server.")
 
     # Step 2b: Budget — current-month spend vs configured limits.
-    check_budget(
-        db=db, org_id=org_id, project_id=project_id,
-        request_id=request_id, source_ip=source_ip, key_id=key_id,
-    )
+    try:
+        check_budget(
+            db=db, org_id=org_id, project_id=project_id,
+            request_id=request_id, source_ip=source_ip, key_id=key_id,
+        )
+    except HTTPException:
+        raise
+    except Exception as _budget_err:
+        _log.warning("Budget check skipped due to error: %s", _budget_err)
 
     # Step 2c: Governance rules — model allow/block, pricing, max_output_tokens.
-    check_governance_rules(
-        db=db, org_id=org_id, project_id=project_id,
-        model=model,
-        max_output_tokens_requested=body.get("max_tokens"),
-        request_id=request_id, source_ip=source_ip,
-    )
+    try:
+        check_governance_rules(
+            db=db, org_id=org_id, project_id=project_id,
+            model=model,
+            max_output_tokens_requested=body.get("max_tokens"),
+            request_id=request_id, source_ip=source_ip,
+        )
+    except HTTPException:
+        raise
+    except Exception as _gov_err:
+        _log.warning("Governance rules check skipped due to error: %s", _gov_err)
 
     # Step 4: PII scan
     clean_messages = _scan_messages(
@@ -934,36 +951,40 @@ def list_proxy_requests(
     offset: int = 0,
     db: Session = Depends(get_db),
 ) -> dict:
-    q = db.query(AiRequest)
-    if request_id:
-        q = q.filter(AiRequest.request_id == request_id)
-    if org_id:
-        q = q.filter(AiRequest.org_id == org_id)
-    if project_id:
-        q = q.filter(AiRequest.project_id == project_id)
-    if request_type:
-        q = q.filter(AiRequest.request_type == request_type)
+    try:
+        q = db.query(AiRequest)
+        if request_id:
+            q = q.filter(AiRequest.request_id == request_id)
+        if org_id:
+            q = q.filter(AiRequest.org_id == org_id)
+        if project_id:
+            q = q.filter(AiRequest.project_id == project_id)
+        if request_type:
+            q = q.filter(AiRequest.request_type == request_type)
 
-    total = q.count()
-    rows = q.order_by(AiRequest.created_at.desc()).offset(offset).limit(limit).all()
+        total = q.count()
+        rows = q.order_by(AiRequest.created_at.desc()).offset(offset).limit(limit).all()
 
-    return {
-        "total": total,
-        "offset": offset,
-        "items": [
-            {
-                "request_id": r.request_id,
-                "org_id": r.org_id,
-                "project_id": r.project_id,
-                "request_type": r.request_type,
-                "model_name": r.model_name,
-                "deployment_name": r.deployment_name,
-                "input_tokens": r.input_token_estimate,
-                "status": r.request_status,
-                "source_ip": r.source_ip,
-                "created_at": r.created_at.isoformat() if r.created_at else None,
-                "completed_at": r.completed_at.isoformat() if r.completed_at else None,
-            }
-            for r in rows
-        ],
-    }
+        return {
+            "total": total,
+            "offset": offset,
+            "items": [
+                {
+                    "request_id":    r.request_id,
+                    "org_id":        r.org_id,
+                    "project_id":    r.project_id,
+                    "request_type":  r.request_type,
+                    "model_name":    r.model_name,
+                    "deployment_name": getattr(r, "deployment_name", None),
+                    "input_tokens":  r.input_token_estimate,
+                    "status":        r.request_status,
+                    "source_ip":     getattr(r, "source_ip", None),
+                    "created_at":    r.created_at.isoformat() if r.created_at else None,
+                    "completed_at":  getattr(r, "completed_at", None) and r.completed_at.isoformat(),
+                }
+                for r in rows
+            ],
+        }
+    except Exception as exc:
+        _log.error("list_proxy_requests DB error: %s", exc)
+        raise HTTPException(status_code=503, detail="Request history temporarily unavailable.")
