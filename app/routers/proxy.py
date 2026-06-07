@@ -44,16 +44,11 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
-from app.config import (
-    get_azure_openai_api_key,
-    get_azure_openai_api_version,
-    get_azure_openai_deployment,
-    get_azure_openai_endpoint,
-)
 from app.core.deps import get_db
 from app.models import AiRequest, AiResponse, RequestCost, TokenUsage
 from app.services.audit_service import log_event
 from app.services.budget_service import check_budget
+from app.services.deployment_service import build_provider_request, get_deployment_for_org
 from app.services.governance_key_service import verify_governance_key
 from app.services.governance_rule_service import check_governance_rules, check_max_input_tokens
 from app.services.pii_engine import scan_and_mask
@@ -156,23 +151,7 @@ def _store_request(
     return row
 
 
-# ---------------------------------------------------------------------------
-# Step 6: Azure OpenAI URL and headers (admin credentials only)
-# ---------------------------------------------------------------------------
-
-def _azure_url(*, deployment: str, api_version: str) -> str:
-    endpoint = get_azure_openai_endpoint().rstrip("/")
-    return (
-        f"{endpoint}/openai/deployments/{deployment}"
-        f"/chat/completions?api-version={api_version}"
-    )
-
-
-def _azure_headers() -> dict[str, str]:
-    return {
-        "api-key": get_azure_openai_api_key(),
-        "Content-Type": "application/json",
-    }
+# URL and headers are now built per-provider by deployment_service.build_provider_request.
 
 
 # ---------------------------------------------------------------------------
@@ -708,17 +687,24 @@ async def proxy_chat_completions(
 
     messages: list[dict] = body.get("messages", [])
     stream: bool = bool(body.get("stream", False))
-    deployment = get_azure_openai_deployment()
-    api_version = get_azure_openai_api_version()
-    # model is the canonical name used for pricing lookups (e.g. "gpt-4o").
-    # deployment is the Azure-specific resource name (e.g. "my-company-gpt4o-prod").
-    # Callers should pass the canonical model name in the request body.
-    # If omitted, we fall back to the deployment name, which may not resolve in
-    # the pricing catalogue — in that case, add an alias in ai_model_pricing.py.
-    model: str = body.get("model") or deployment
 
-    if not deployment:
-        raise HTTPException(status_code=503, detail="Azure deployment not configured on this server.")
+    # Resolve deployment from DB (per-org/project) with env-var fallback.
+    # External teams never specify provider/model — governance platform decides.
+    depl = get_deployment_for_org(
+        db, org_id=org_id, project_id=project_id,
+        requested_model=body.get("model"),
+    )
+    if not depl:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "No AI deployment configured for this project. "
+                "An admin must register one via POST /deployments."
+            ),
+        )
+
+    model: str = depl.model_name
+    deployment: str = depl.deployment_name or depl.model_name
 
     # Step 2b: Budget — current-month spend vs configured limits.
     try:
@@ -744,13 +730,20 @@ async def proxy_chat_completions(
     except Exception as _gov_err:
         _log.warning("Governance rules check skipped due to error: %s", _gov_err)
 
-    # Step 4: PII scan
-    clean_messages = _scan_messages(
-        messages=messages,
-        org_id=org_id,
-        project_id=project_id,
-        db=db,
-    )
+    # Step 4: PII scan — fail-open: DB errors skip scanning, raw messages forwarded.
+    try:
+        clean_messages = _scan_messages(
+            messages=messages,
+            org_id=org_id,
+            project_id=project_id,
+            db=db,
+        )
+    except HTTPException:
+        raise
+    except Exception as _pii_err:
+        _log.warning("PII scan skipped due to error: %s", _pii_err)
+        clean_messages = messages
+
     forward_body = {k: v for k, v in body.items() if k != "stream"}
     forward_body["messages"] = clean_messages
 
@@ -766,11 +759,16 @@ async def proxy_chat_completions(
             input_tokens += 4  # non-text content (images etc.) — best effort
 
     # Step 4a: Max input tokens governance check (requires token count).
-    check_max_input_tokens(
-        db=db, org_id=org_id, project_id=project_id,
-        model=model, input_tokens=input_tokens,
-        request_id=request_id, source_ip=source_ip,
-    )
+    try:
+        check_max_input_tokens(
+            db=db, org_id=org_id, project_id=project_id,
+            model=model, input_tokens=input_tokens,
+            request_id=request_id, source_ip=source_ip,
+        )
+    except HTTPException:
+        raise
+    except Exception as _mit_err:
+        _log.warning("Max input tokens check skipped due to error: %s", _mit_err)
 
     _store_request(
         db=db,
@@ -788,8 +786,7 @@ async def proxy_chat_completions(
     )
     db.commit()
 
-    url = _azure_url(deployment=deployment, api_version=api_version)
-    azure_hdrs = _azure_headers()
+    url, azure_hdrs = build_provider_request(depl)
     t_start = time.time()
 
     # Step 6-10: Streaming path
@@ -951,40 +948,65 @@ def list_proxy_requests(
     offset: int = 0,
     db: Session = Depends(get_db),
 ) -> dict:
+    # Raw SQL avoids ORM column-mapping failures when proxy-layer columns
+    # (governance_key_id, source_ip, deployment_name, completed_at) have not
+    # yet been applied to the deployed DB via _SAFE_ALTERS.
+    from sqlalchemy import text as _text
+
+    filters: list[str] = []
+    params: dict = {}
+
+    if request_id:
+        filters.append("request_id = :request_id")
+        params["request_id"] = request_id
+    if org_id:
+        filters.append("org_id = :org_id")
+        params["org_id"] = org_id
+    if project_id:
+        filters.append("project_id = :project_id")
+        params["project_id"] = project_id
+    if request_type:
+        filters.append("request_type = :request_type")
+        params["request_type"] = request_type
+
+    where = ("WHERE " + " AND ".join(filters)) if filters else ""
+
     try:
-        q = db.query(AiRequest)
-        if request_id:
-            q = q.filter(AiRequest.request_id == request_id)
-        if org_id:
-            q = q.filter(AiRequest.org_id == org_id)
-        if project_id:
-            q = q.filter(AiRequest.project_id == project_id)
-        if request_type:
-            q = q.filter(AiRequest.request_type == request_type)
+        total = (
+            db.execute(_text(f"SELECT COUNT(*) FROM ai_requests {where}"), params).scalar() or 0
+        )
+        params["limit"] = limit
+        params["offset"] = offset
+        rows = db.execute(
+            _text(
+                f"SELECT request_id, org_id, project_id, request_type, model_name,"
+                f" input_token_estimate, request_status, created_at"
+                f" FROM ai_requests {where}"
+                f" ORDER BY created_at DESC LIMIT :limit OFFSET :offset"
+            ),
+            params,
+        ).fetchall()
+    except Exception:
+        # Table or columns missing — return empty list so the endpoint stays 200.
+        return {"total": 0, "offset": offset, "items": []}
 
-        total = q.count()
-        rows = q.order_by(AiRequest.created_at.desc()).offset(offset).limit(limit).all()
-
-        return {
-            "total": total,
-            "offset": offset,
-            "items": [
-                {
-                    "request_id":    r.request_id,
-                    "org_id":        r.org_id,
-                    "project_id":    r.project_id,
-                    "request_type":  r.request_type,
-                    "model_name":    r.model_name,
-                    "deployment_name": getattr(r, "deployment_name", None),
-                    "input_tokens":  r.input_token_estimate,
-                    "status":        r.request_status,
-                    "source_ip":     getattr(r, "source_ip", None),
-                    "created_at":    r.created_at.isoformat() if r.created_at else None,
-                    "completed_at":  getattr(r, "completed_at", None) and r.completed_at.isoformat(),
-                }
-                for r in rows
-            ],
-        }
-    except Exception as exc:
-        _log.error("list_proxy_requests DB error: %s", exc)
-        raise HTTPException(status_code=503, detail="Request history temporarily unavailable.")
+    return {
+        "total": total,
+        "offset": offset,
+        "items": [
+            {
+                "request_id":      r[0],
+                "org_id":          r[1],
+                "project_id":      r[2],
+                "request_type":    r[3],
+                "model_name":      r[4],
+                "deployment_name": None,
+                "input_tokens":    r[5],
+                "status":          r[6],
+                "source_ip":       None,
+                "created_at":      r[7].isoformat() if r[7] else None,
+                "completed_at":    None,
+            }
+            for r in rows
+        ],
+    }

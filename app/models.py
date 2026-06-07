@@ -888,13 +888,16 @@ class ModelDeployment(Base):
     deployment_id = Column(String(120), unique=True, nullable=False)
     org_id = Column(String(100), ForeignKey("organizations.id"), nullable=False)
     project_id = Column(String(100), ForeignKey("projects.id"), nullable=True)
-    provider = Column(String(100), nullable=False)
-    model_name = Column(String(120), nullable=False)
-    deployment_name = Column(String(255), nullable=True)
-    endpoint_url = Column(String(500), nullable=True)
+    provider = Column(String(100), nullable=False)       # azure_openai | openai | anthropic | …
+    model_name = Column(String(120), nullable=False)     # canonical name used for pricing
+    deployment_name = Column(String(255), nullable=True) # provider-specific resource name (Azure deployment)
+    endpoint_url = Column(String(500), nullable=True)    # provider base URL
+    api_key = Column(Text, nullable=True)                # server-side credential — never returned to clients
+    api_version = Column(String(50), nullable=True)      # e.g. 2025-01-01-preview for Azure
+    is_default = Column(Boolean, default=False)          # auto-selected when request has no model hint
     deployment_type = Column(String(50), default="api")
     auth_type = Column(String(50), nullable=True)
-    api_key_ref = Column(String(500), nullable=True)
+    api_key_ref = Column(String(500), nullable=True)     # legacy field — kept for compat
     default_parameters = Column(JSON, nullable=True)
     rate_limit_rpm = Column(Integer, nullable=True)
     rate_limit_tpm = Column(Integer, nullable=True)

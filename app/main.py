@@ -21,6 +21,7 @@ from app.routers import (
     projects,
     summary,
 )
+from app.routers.deployments import router as deployments_router
 from app.routers.proxy import router as proxy_router
 
 # Safe schema additions — all use IF NOT EXISTS, safe to re-run on every startup.
@@ -64,6 +65,10 @@ _SAFE_ALTERS = [
         "ON audit_logs (org_id, audit_action, occurred_at) "
         "WHERE policy_triggered = TRUE"
     ),
+    # Multi-deployment routing columns (added to existing model_deployments table)
+    "ALTER TABLE model_deployments ADD COLUMN IF NOT EXISTS api_key TEXT",
+    "ALTER TABLE model_deployments ADD COLUMN IF NOT EXISTS api_version VARCHAR(50)",
+    "ALTER TABLE model_deployments ADD COLUMN IF NOT EXISTS is_default BOOLEAN DEFAULT FALSE",
 ]
 
 _ALL_ROUTERS = [
@@ -146,6 +151,7 @@ for _router in _ALL_ROUTERS:
 
 # Proxy registered at root — stable URL for external teams' SDK base_url.
 app.include_router(proxy_router)
+app.include_router(deployments_router)
 
 
 @app.get("/health")
