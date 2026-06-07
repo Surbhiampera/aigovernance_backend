@@ -90,7 +90,7 @@ def check_rate_limit(
                     limit_type="max_requests_per_min",
                     scope=scope, limit=limit_row.max_requests_per_min, count=count,
                 )
-                db.flush()
+                db.commit()
                 raise HTTPException(
                     status_code=429,
                     headers={"Retry-After": str(retry_after)},
@@ -119,7 +119,7 @@ def check_rate_limit(
                     limit_type="max_tokens_per_day",
                     scope=scope, limit=limit_row.max_tokens_per_day, count=tokens_used,
                 )
-                db.flush()
+                db.commit()
                 raise HTTPException(
                     status_code=429,
                     headers={"Retry-After": str(_seconds_until_midnight())},

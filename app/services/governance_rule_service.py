@@ -147,7 +147,7 @@ def _enforce_pricing_known(
         summary=f"Model '{model}' has no pricing entry — request blocked.",
         metadata={"model": model},
     )
-    db.flush()
+    db.commit()
     raise HTTPException(
         status_code=403,
         detail={
@@ -179,7 +179,7 @@ def _enforce_block_list(
                 metadata={"rule_id": rule.id, "rule_name": rule.rule_name, "model": model},
             )
             _create_governance_alert(db=db, rule=rule, org_id=org_id, project_id=project_id)
-            db.flush()
+            db.commit()
             raise HTTPException(
                 status_code=403,
                 detail={
@@ -214,7 +214,7 @@ def _enforce_allow_list(
         summary=f"Model '{model}' not in allowed model list for org '{org_id}'.",
         metadata={"model": model, "allowed_models": sorted(allowed)},
     )
-    db.flush()
+    db.commit()
     raise HTTPException(
         status_code=403,
         detail={
@@ -255,7 +255,7 @@ def _enforce_max_output_tokens(
                 },
             )
             _create_governance_alert(db=db, rule=rule, org_id=org_id, project_id=project_id)
-            db.flush()
+            db.commit()
             raise HTTPException(
                 status_code=403,
                 detail={
@@ -298,7 +298,7 @@ def _enforce_max_input_tokens(
                 },
             )
             _create_governance_alert(db=db, rule=rule, org_id=org_id, project_id=project_id)
-            db.flush()
+            db.commit()
             raise HTTPException(
                 status_code=403,
                 detail={

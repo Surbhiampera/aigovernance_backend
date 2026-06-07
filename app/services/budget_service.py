@@ -142,7 +142,7 @@ def _evaluate_budget(
             alert_type="budget_exceeded",
             severity="critical",
         )
-        db.flush()
+        db.commit()
         raise HTTPException(
             status_code=429,
             detail={
