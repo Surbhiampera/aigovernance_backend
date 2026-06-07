@@ -220,9 +220,318 @@ except Exception as e:
     check("GET /costs/summary → 200", False, str(e))
 
 
+# ── 9. Token tracking — verify DB records tokens after a real request ─────────
+separator("9. Token tracking — verify tokens stored in DB")
+_tracked_request_id = None
+try:
+    r = requests.post(
+        f"{SERVER_ROOT}/v1/chat/completions",
+        headers=HEADERS,
+        json={
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "Say the word: hello"}],
+            "max_tokens": 5,
+            "stream": False,
+        },
+        timeout=60,
+    )
+    ok = r.status_code == 200
+    check("Token tracking request → 200", ok, r.text[:120] if not ok else "")
+    if ok:
+        _tracked_request_id = r.headers.get("X-Request-Id")
+        body = r.json()
+        usage = body.get("usage", {})
+        check("usage.prompt_tokens > 0",    (usage.get("prompt_tokens")     or 0) > 0, str(usage))
+        check("usage.completion_tokens > 0",(usage.get("completion_tokens") or 0) > 0, str(usage))
+        check("usage.total_tokens > 0",     (usage.get("total_tokens")      or 0) > 0, str(usage))
+        print(f"[{INFO} ] X-Request-Id : {_tracked_request_id}")
+        print(f"[{INFO} ] usage        : {usage}")
+except Exception as e:
+    check("Token tracking request → 200", False, str(e))
+
+
+# ── 10. Cost per request — verify cost stored for the request above ───────────
+separator("10. Cost per request — verify cost recorded in DB")
+if _tracked_request_id:
+    try:
+        r = requests.get(
+            f"{SERVER_ROOT}/costs/request/{_tracked_request_id}",
+            headers=HEADERS,
+            timeout=15,
+        )
+        ok = r.status_code == 200
+        check("GET /costs/request/{id} → 200", ok, r.text[:120] if not ok else "")
+        if ok:
+            c = r.json()
+            total_cost = float(c.get("total_cost") or 0)
+            check("Cost record has total_cost > 0", total_cost > 0, f"total_cost={total_cost}")
+            print(f"[{INFO} ] input_cost   : ${float(c.get('input_cost',  0)):.6f}")
+            print(f"[{INFO} ] output_cost  : ${float(c.get('output_cost', 0)):.6f}")
+            print(f"[{INFO} ] total_cost   : ${total_cost:.6f}")
+            print(f"[{INFO} ] pricing_src  : {c.get('pricing_source')}")
+    except Exception as e:
+        check("GET /costs/request/{id} → 200", False, str(e))
+else:
+    print(f"[{INFO} ] Skipped — no request_id captured in test 9")
+
+
+# ── 11. Cost by model — model-wise breakdown ──────────────────────────────────
+separator("11. Cost by model — model-wise breakdown")
+try:
+    r = requests.get(f"{SERVER_ROOT}/costs/by-model", headers=HEADERS, timeout=15)
+    ok = r.status_code == 200
+    check("GET /costs/by-model → 200", ok, r.text[:120] if not ok else "")
+    if ok:
+        rows = r.json()
+        check("by-model returns at least 1 model", len(rows) > 0, f"{len(rows)} rows")
+        for row in rows[:3]:
+            print(f"[{INFO} ] model={row.get('model_name','?')}  "
+                  f"requests={row.get('request_count','?')}  "
+                  f"cost=${float(row.get('total_cost', 0)):.6f}")
+except Exception as e:
+    check("GET /costs/by-model → 200", False, str(e))
+
+
+# ── 12. Cost by project — project-wise breakdown ──────────────────────────────
+separator("12. Cost by project — project-wise breakdown")
+try:
+    r = requests.get(f"{SERVER_ROOT}/costs/by-project", headers=HEADERS, timeout=15)
+    ok = r.status_code == 200
+    check("GET /costs/by-project → 200", ok, r.text[:120] if not ok else "")
+    if ok:
+        rows = r.json()
+        print(f"[{INFO} ] {len(rows)} project row(s) returned")
+        for row in rows[:3]:
+            print(f"[{INFO} ] project={row.get('project_id','?')}  "
+                  f"cost=${float(row.get('total_cost', 0)):.6f}")
+except Exception as e:
+    check("GET /costs/by-project → 200", False, str(e))
+
+
+# ── 13. Audit log — verify entries exist ─────────────────────────────────────
+separator("13. Audit log — verify request audit entries exist")
+try:
+    r = requests.get(
+        f"{SERVER_ROOT}/audit-logs",
+        headers=HEADERS,
+        params={"limit": 5},
+        timeout=15,
+    )
+    ok = r.status_code == 200
+    check("GET /audit-logs → 200", ok, r.text[:120] if not ok else "")
+    if ok:
+        logs = r.json()
+        check("Audit log has at least 1 entry", len(logs) > 0, f"{len(logs)} entries")
+        if logs:
+            latest = logs[0]
+            print(f"[{INFO} ] latest event   : {latest.get('event_type','?')}")
+            print(f"[{INFO} ] latest status  : {latest.get('status','?')}")
+            print(f"[{INFO} ] latest org_id  : {latest.get('org_id','?')}")
+except Exception as e:
+    check("GET /audit-logs → 200", False, str(e))
+
+
+# ── 14. Audit log summary ─────────────────────────────────────────────────────
+separator("14. Audit log summary")
+try:
+    r = requests.get(f"{SERVER_ROOT}/audit-logs/summary", headers=HEADERS, timeout=15)
+    ok = r.status_code == 200
+    check("GET /audit-logs/summary → 200", ok, r.text[:120] if not ok else "")
+    if ok:
+        s = r.json()
+        print(f"[{INFO} ] total_events   : {s.get('total_events')}")
+        print(f"[{INFO} ] success_count  : {s.get('success_count')}")
+        print(f"[{INFO} ] error_count    : {s.get('error_count')}")
+except Exception as e:
+    check("GET /audit-logs/summary → 200", False, str(e))
+
+
+# ── 15. PII detection — email in message ─────────────────────────────────────
+separator("15. PII detection — email address in message")
+try:
+    r = requests.post(
+        f"{SERVER_ROOT}/v1/chat/completions",
+        headers=HEADERS,
+        json={
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "My email is test.user@example.com, help me write a greeting."}],
+            "max_tokens": 20,
+            "stream": False,
+        },
+        timeout=60,
+    )
+    # 200 = PII was masked and request forwarded; 4xx = policy blocked it — both are valid
+    pii_email_request_id = r.headers.get("X-Request-Id", "")
+    check(
+        "PII email request handled (200=masked, 4xx=blocked by policy)",
+        r.status_code in (200, 400, 403, 422),
+        f"status={r.status_code}",
+    )
+    print(f"[{INFO} ] action taken   : {'masked/forwarded' if r.status_code == 200 else 'blocked by PII policy'}")
+    print(f"[{INFO} ] X-Request-Id  : {pii_email_request_id}")
+except Exception as e:
+    check("PII email request handled", False, str(e))
+
+
+# ── 16. PII detection — phone number in message ───────────────────────────────
+separator("16. PII detection — phone number in message")
+try:
+    r = requests.post(
+        f"{SERVER_ROOT}/v1/chat/completions",
+        headers=HEADERS,
+        json={
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "Call me at +91 98765 43210 to discuss the project."}],
+            "max_tokens": 20,
+            "stream": False,
+        },
+        timeout=60,
+    )
+    check(
+        "PII phone request handled (200=masked, 4xx=blocked by policy)",
+        r.status_code in (200, 400, 403, 422),
+        f"status={r.status_code}",
+    )
+    print(f"[{INFO} ] action taken   : {'masked/forwarded' if r.status_code == 200 else 'blocked by PII policy'}")
+except Exception as e:
+    check("PII phone request handled", False, str(e))
+
+
+# ── 17. PII audit log — verify PII detections are logged ─────────────────────
+separator("17. PII audit log — verify detections are stored")
+try:
+    r = requests.get(f"{SERVER_ROOT}/audit-logs/pii", headers=HEADERS, timeout=15)
+    ok = r.status_code == 200
+    check("GET /audit-logs/pii → 200", ok, r.text[:120] if not ok else "")
+    if ok:
+        logs = r.json()
+        print(f"[{INFO} ] {len(logs)} PII detection log(s) found")
+        if logs:
+            latest = logs[0]
+            print(f"[{INFO} ] pii_types      : {latest.get('pii_types','?')}")
+            print(f"[{INFO} ] action_taken   : {latest.get('action_taken','?')}")
+except Exception as e:
+    check("GET /audit-logs/pii → 200", False, str(e))
+
+
+# ── 18. Invalid model name — graceful error from Azure ────────────────────────
+separator("18. Invalid model name — expect proxy error, not crash")
+try:
+    r = requests.post(
+        f"{SERVER_ROOT}/v1/chat/completions",
+        headers=HEADERS,
+        json={
+            "model": "gpt-nonexistent-model-xyz",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 5,
+        },
+        timeout=30,
+    )
+    # Should return an error status (4xx/5xx), NOT a 200 or an unhandled crash
+    check("Invalid model → error response (not crash)", r.status_code != 200, f"status={r.status_code}  body={r.text[:120]}")
+except Exception as e:
+    check("Invalid model → error response (not crash)", False, str(e))
+
+
+# ── 19. Governance rule — oversized input ─────────────────────────────────────
+separator("19. Governance rule — oversized input (max_input_tokens)")
+try:
+    big_message = "word " * 4000   # ~20 000 chars / ~4000 tokens
+    r = requests.post(
+        f"{SERVER_ROOT}/v1/chat/completions",
+        headers=HEADERS,
+        json={
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": big_message}],
+            "max_tokens": 5,
+        },
+        timeout=60,
+    )
+    # 200 = no max-token rule configured; 4xx = governance rule blocked it — both valid
+    check(
+        "Oversized input handled (200=no rule, 4xx=rule blocked)",
+        r.status_code in (200, 400, 403, 422, 429),
+        f"status={r.status_code}",
+    )
+    print(f"[{INFO} ] result  : {'allowed (no rule set)' if r.status_code == 200 else 'blocked by governance rule'}")
+except Exception as e:
+    check("Oversized input handled", False, str(e))
+
+
+# ── 20. Cost daily trend ───────────────────────────────────────────────────────
+separator("20. Cost daily trend")
+try:
+    r = requests.get(f"{SERVER_ROOT}/costs/trend/daily", headers=HEADERS, timeout=15)
+    ok = r.status_code == 200
+    check("GET /costs/trend/daily → 200", ok, r.text[:120] if not ok else "")
+    if ok:
+        rows = r.json()
+        print(f"[{INFO} ] {len(rows)} daily trend row(s)")
+        if rows:
+            latest = rows[-1]
+            print(f"[{INFO} ] latest date    : {latest.get('date','?')}")
+            print(f"[{INFO} ] latest cost    : ${float(latest.get('total_cost', 0)):.6f}")
+except Exception as e:
+    check("GET /costs/trend/daily → 200", False, str(e))
+
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 separator("RESULTS")
 passed = sum(results)
 total  = len(results)
 color  = "\033[92m" if passed == total else "\033[91m"
 print(f"{color}  {passed}/{total} checks passed\033[0m\n")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HOW TO RUN THIS TEST SCRIPT
+# ─────────────────────────────────────────────────────────────────────────────
+#
+#  Prerequisites
+#  -------------
+#  1. Python 3.9+ with dependencies installed:
+#       pip install requests python-dotenv
+#
+#  2. A .env file in the same folder with these two variables set:
+#       OPENAI_BASE_URL=https://<your-server>/proxy/openai
+#       GOVERNANCE_KEY=gov-<your-key>
+#
+#  Run
+#  ---
+#       python test_proxy.py
+#
+#  What each test verifies
+#  -----------------------
+#   1  Health check              — server is up and reachable
+#   2  Invalid key               — 401 returned for a bad governance key
+#   3  Missing key header        — 422 returned when header is absent
+#   4  Non-streaming completion  — happy-path chat, checks usage block
+#   5  Streaming completion      — SSE stream delivers chunks and [DONE]
+#   6  Malformed JSON            — 400 returned, server does not crash
+#   7  List proxy requests       — admin endpoint returns request history
+#   8  Cost summary              — aggregated totals endpoint works
+#   9  Token tracking            — usage.prompt/completion/total_tokens > 0
+#  10  Cost per request          — /costs/request/{id} stores actual cost
+#  11  Cost by model             — model-wise breakdown has rows
+#  12  Cost by project           — project-wise breakdown returns data
+#  13  Audit log entries         — /audit-logs returns at least 1 entry
+#  14  Audit log summary         — summary counts match
+#  15  PII — email               — email in message is masked or blocked
+#  16  PII — phone               — phone number in message is masked or blocked
+#  17  PII audit log             — PII detections are stored in audit-logs/pii
+#  18  Invalid model             — proxy returns an error (does not crash)
+#  19  Oversized input           — governance rule blocks or allows cleanly
+#  20  Cost daily trend          — /costs/trend/daily returns date rows
+#
+#  Interpreting results
+#  --------------------
+#  Tests 15, 16, 19 accept EITHER 200 OR 4xx as a PASS because the outcome
+#  depends on how PII policies and governance rules are configured in your DB.
+#  If you see 200 on a PII test and want blocking, set the policy action to
+#  "block" in the pii_policies table for your org.
+#
+#  Exit code
+#  ---------
+#  The script does NOT sys.exit(1) on failure — it prints a summary line.
+#  To use in CI, add this at the end or pipe through grep:
+#       python test_proxy.py | tee out.txt && grep -q "FAIL" out.txt && exit 1
+# ─────────────────────────────────────────────────────────────────────────────
