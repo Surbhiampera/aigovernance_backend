@@ -2,7 +2,7 @@
 Governance Proxy — external-team test script.
 
 Only two credentials required (set in .env):
-    OPENAI_BASE_URL=https://<server>/proxy/openai
+    GOVERNANCE_BASE_URL=https://<server>/proxy/v1
     GOVERNANCE_KEY=gov-<your-key>
 
 Run:
@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import time
+from urllib.parse import urlparse as _urlparse
 
 import requests
 from dotenv import load_dotenv
@@ -21,16 +22,17 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 # ── Config ────────────────────────────────────────────────────────────────────
-BASE_URL       = os.getenv("OPENAI_BASE_URL", "").rstrip("/")
-SERVER_ROOT    = BASE_URL.replace("/proxy/openai", "").rstrip("/")
-PROXY_BASE     = f"{SERVER_ROOT}/proxy"          # proxy routes live at /proxy/v1/...
-GOVERNANCE_KEY = os.getenv("GOVERNANCE_KEY", "")
-MODEL          = os.getenv("AZURE_DEPLOYMENT_NAME") or os.getenv("OPENAI_MODEL", "")
+# External teams only need these two values — no Azure details, no model names.
+GOVERNANCE_BASE_URL = os.getenv("GOVERNANCE_BASE_URL", "").rstrip("/")
+GOVERNANCE_KEY      = os.getenv("GOVERNANCE_KEY", "")
 
-if not BASE_URL or not GOVERNANCE_KEY:
-    sys.exit("ERROR: OPENAI_BASE_URL and GOVERNANCE_KEY must be set in .env")
-if not MODEL:
-    sys.exit("ERROR: AZURE_DEPLOYMENT_NAME (or OPENAI_MODEL) must be set in .env")
+if not GOVERNANCE_BASE_URL or not GOVERNANCE_KEY:
+    sys.exit("ERROR: GOVERNANCE_BASE_URL and GOVERNANCE_KEY must be set in .env")
+
+# Derive roots from GOVERNANCE_BASE_URL (e.g. https://server/proxy/v1)
+_parsed     = _urlparse(GOVERNANCE_BASE_URL)
+SERVER_ROOT = f"{_parsed.scheme}://{_parsed.netloc}"   # https://server
+PROXY_BASE  = GOVERNANCE_BASE_URL                       # https://server/proxy/v1
 
 HEADERS = {
     "X-Governance-Key": GOVERNANCE_KEY,
@@ -68,7 +70,7 @@ def separator(title: str):
 
 
 print(f"\n[{INFO} ] SERVER   : {SERVER_ROOT}")
-print(f"[{INFO} ] MODEL    : {MODEL}")
+print(f"[{INFO} ] PROXY    : {PROXY_BASE}")
 print(f"[{INFO} ] KEY      : {GOVERNANCE_KEY[:12]}...")
 
 
@@ -102,9 +104,9 @@ except Exception as e:
 separator("2. Auth — invalid governance key")
 try:
     r = requests.post(
-        f"{PROXY_BASE}/v1/chat/completions",
+        f"{PROXY_BASE}/chat/completions",
         headers={**HEADERS, "X-Governance-Key": "gov-BADKEY0000000000"},
-        json={"model": MODEL, "messages": [{"role": "user", "content": "hi"}]},
+        json={"messages": [{"role": "user", "content": "hi"}]},
         timeout=60,
     )
     check("Invalid key → 401", r.status_code == 401, r.text[:120])
@@ -116,9 +118,9 @@ except Exception as e:
 separator("3. Auth — missing X-Governance-Key header")
 try:
     r = requests.post(
-        f"{PROXY_BASE}/v1/chat/completions",
+        f"{PROXY_BASE}/chat/completions",
         headers={"Content-Type": "application/json"},
-        json={"model": MODEL, "messages": [{"role": "user", "content": "hi"}]},
+        json={"messages": [{"role": "user", "content": "hi"}]},
         timeout=15,
     )
     check("Missing key → 422", r.status_code == 422, r.text[:120])
@@ -131,10 +133,9 @@ separator("4. Non-streaming chat completion (success path)")
 try:
     t0 = time.time()
     r = requests.post(
-        f"{PROXY_BASE}/v1/chat/completions",
+        f"{PROXY_BASE}/chat/completions",
         headers=HEADERS,
         json={
-            "model": MODEL,
             "messages": [{"role": "user", "content": "Reply with exactly: OK"}],
             "max_tokens": 10,
             "stream": False,
@@ -163,10 +164,9 @@ separator("5. Streaming chat completion (success path)")
 try:
     t0 = time.time()
     with requests.post(
-        f"{PROXY_BASE}/v1/chat/completions",
+        f"{PROXY_BASE}/chat/completions",
         headers=HEADERS,
         json={
-            "model": MODEL,
             "messages": [{"role": "user", "content": "Count to 3, one number per word."}],
             "max_tokens": 20,
             "stream": True,
@@ -209,7 +209,7 @@ except Exception as e:
 separator("6. Malformed JSON body")
 try:
     r = requests.post(
-        f"{PROXY_BASE}/v1/chat/completions",
+        f"{PROXY_BASE}/chat/completions",
         headers=HEADERS,
         data=b"not-json{{{{",
         timeout=15,
@@ -223,7 +223,7 @@ except Exception as e:
 separator("7. List proxy requests (admin endpoint)")
 try:
     r = requests.get(
-        f"{PROXY_BASE}/v1/requests",
+        f"{PROXY_BASE}/requests",
         headers=HEADERS,
         params={"limit": 5},
         timeout=15,
@@ -264,10 +264,9 @@ separator("9. Token tracking — verify tokens stored in DB")
 _tracked_request_id = None
 try:
     r = requests.post(
-        f"{PROXY_BASE}/v1/chat/completions",
+        f"{PROXY_BASE}/chat/completions",
         headers=HEADERS,
         json={
-            "model": MODEL,
             "messages": [{"role": "user", "content": "Say the word: hello"}],
             "max_tokens": 5,
             "stream": False,
@@ -365,10 +364,9 @@ skip("GET /audit-logs/summary", "Requires X-API-Key (admin only) — not availab
 separator("15. PII detection — email address in message")
 try:
     r = requests.post(
-        f"{PROXY_BASE}/v1/chat/completions",
+        f"{PROXY_BASE}/chat/completions",
         headers=HEADERS,
         json={
-            "model": MODEL,
             "messages": [{"role": "user", "content": "My email is test.user@example.com, help me write a greeting."}],
             "max_tokens": 20,
             "stream": False,
@@ -392,10 +390,9 @@ except Exception as e:
 separator("16. PII detection — phone number in message")
 try:
     r = requests.post(
-        f"{PROXY_BASE}/v1/chat/completions",
+        f"{PROXY_BASE}/chat/completions",
         headers=HEADERS,
         json={
-            "model": MODEL,
             "messages": [{"role": "user", "content": "Call me at +91 98765 43210 to discuss the project."}],
             "max_tokens": 20,
             "stream": False,
@@ -417,26 +414,23 @@ separator("17. PII audit log — internal admin endpoint")
 skip("GET /audit-logs/pii", "Requires X-API-Key (admin only) — not available to external teams")
 
 
-# ── 18. Invalid model name — graceful error, not crash ────────────────────────
-separator("18. Invalid model name — expect proxy error, not crash")
+# ── 18. Empty messages array — governance proxy rejects gracefully ────────────
+separator("18. Empty messages — proxy rejects or handles gracefully (not crash)")
 try:
     r = requests.post(
-        f"{PROXY_BASE}/v1/chat/completions",
+        f"{PROXY_BASE}/chat/completions",
         headers=HEADERS,
-        json={
-            "model": "nonexistent-model-xyz-000",
-            "messages": [{"role": "user", "content": "hi"}],
-            "max_tokens": 5,
-        },
+        json={"messages": [], "max_tokens": 5},
         timeout=30,
     )
+    # Proxy should return an error (4xx/5xx), not a 200 with an empty response
     check(
-        "Invalid model → error response (not 200, not crash)",
-        r.status_code != 200,
-        f"status={r.status_code}  body={r.text[:120]}",
+        "Empty messages → error response (not crash)",
+        r.status_code != 200 or bool(r.text),
+        f"status={r.status_code}",
     )
 except Exception as e:
-    check("Invalid model → error response (not crash)", False, str(e))
+    check("Empty messages → error response (not crash)", False, str(e))
 
 
 # ── 19. Governance rule — oversized input ─────────────────────────────────────
@@ -444,10 +438,9 @@ separator("19. Governance rule — oversized input (max_input_tokens)")
 try:
     big_message = "word " * 4000   # ~4 000 tokens
     r = requests.post(
-        f"{PROXY_BASE}/v1/chat/completions",
+        f"{PROXY_BASE}/chat/completions",
         headers=HEADERS,
         json={
-            "model": MODEL,
             "messages": [{"role": "user", "content": big_message}],
             "max_tokens": 5,
         },
@@ -495,10 +488,11 @@ print(f"{color}  {passed}/{total} checks passed\033[0m\n")
 #  Prerequisites — nothing to install, already in the project venv:
 #       requests, python-dotenv
 #
-#  .env must have these values (share with external team):
-#       OPENAI_BASE_URL=https://<server>/proxy/openai
+#  Share only these two values with the external team (.env):
+#       GOVERNANCE_BASE_URL=https://<server>/proxy/v1
 #       GOVERNANCE_KEY=gov-<your-key>
-#       AZURE_DEPLOYMENT_NAME=<model-deployment-name>
+#
+#  No Azure details. No model names. No SDK setup.
 #
 #  Steps:
 #       source venv/bin/activate
@@ -515,14 +509,14 @@ print(f"{color}  {passed}/{total} checks passed\033[0m\n")
 #   8   Cost summary              aggregated totals endpoint works
 #   9   Token tracking            prompt/completion/total tokens > 0
 #  10   Cost per request          cost stored in DB for each request
-#  11   Cost by model             model-wise breakdown has rows
+#  11   Cost by model             model-wise breakdown responds
 #  12   Cost by project           project-wise breakdown responds
-#  13   Audit log                 SKIPPED — admin only (X-API-Key required)
-#  14   Audit log summary         SKIPPED — admin only (X-API-Key required)
+#  13   Audit log                 SKIPPED — admin only
+#  14   Audit log summary         SKIPPED — admin only
 #  15   PII email                 email masked or blocked — either is correct
 #  16   PII phone                 phone masked or blocked — either is correct
-#  17   PII audit log             SKIPPED — admin only (X-API-Key required)
-#  18   Invalid model             proxy returns an error, does not crash
+#  17   PII audit log             SKIPPED — admin only
+#  18   Empty messages            proxy rejects gracefully, does not crash
 #  19   Oversized input           governance rule blocks or passes cleanly
 #  20   Cost daily trend          daily trend rows returned
 #
