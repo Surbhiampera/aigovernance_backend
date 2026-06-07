@@ -64,6 +64,23 @@ def get_scheduler_max_workers() -> int:
     return _int("SCHEDULER_MAX_WORKERS", "2")
 
 
+# ── Azure OpenAI credentials (admin-only — never exposed to external teams) ─
+def get_azure_openai_api_key() -> str:
+    return os.getenv("AZURE_OPENAI_API_KEY", "")
+
+
+def get_azure_openai_endpoint() -> str:
+    return os.getenv("AZURE_OPENAI_ENDPOINT", "")
+
+
+def get_azure_openai_deployment() -> str:
+    return os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "")
+
+
+def get_azure_openai_api_version() -> str:
+    return os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01")
+
+
 # ── Cost engine rates ──────────────────────────────────────────────────────
 def get_cost_default_rate_per_1k() -> Decimal:
     return _dec("COST_DEFAULT_RATE_PER_1K", "0.0025")
