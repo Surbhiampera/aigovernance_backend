@@ -30,7 +30,7 @@ import json
 import logging
 import time
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, AsyncIterator, Optional
 
@@ -39,6 +39,7 @@ _log = logging.getLogger(__name__)
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_db
@@ -945,6 +946,61 @@ async def proxy_chat_stream(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Request-Id": ctx["request_id"]},
     )
+
+
+# ---------------------------------------------------------------------------
+# Stats breakdown by project + model
+# ---------------------------------------------------------------------------
+
+@router.get("/stats/by-project-model")
+def stats_by_project_model(
+    *,
+    org_id: Optional[str] = Query(None),
+    project_id: Optional[str] = Query(None),
+    start: Optional[date] = Query(None),
+    end: Optional[date] = Query(None),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    q = db.query(
+        RequestCost.project_id,
+        RequestCost.model_name,
+        func.count(RequestCost.request_id).label("total_requests"),
+        func.sum(RequestCost.input_tokens).label("input_tokens"),
+        func.sum(RequestCost.output_tokens).label("output_tokens"),
+        func.sum(RequestCost.total_tokens).label("total_tokens"),
+        func.sum(RequestCost.input_token_cost).label("input_cost"),
+        func.sum(RequestCost.output_token_cost).label("output_cost"),
+        func.sum(RequestCost.total_cost).label("total_cost"),
+    )
+    if org_id:
+        q = q.filter(RequestCost.org_id == org_id)
+    if project_id:
+        q = q.filter(RequestCost.project_id == project_id)
+    if start:
+        q = q.filter(func.date(RequestCost.created_at) >= start)
+    if end:
+        q = q.filter(func.date(RequestCost.created_at) <= end)
+
+    rows = (
+        q.group_by(RequestCost.project_id, RequestCost.model_name)
+        .order_by(func.sum(RequestCost.total_cost).desc())
+        .all()
+    )
+
+    return [
+        {
+            "project_id": r.project_id,
+            "model_name": r.model_name,
+            "total_requests": r.total_requests or 0,
+            "input_tokens": r.input_tokens or 0,
+            "output_tokens": r.output_tokens or 0,
+            "total_tokens": r.total_tokens or 0,
+            "input_cost": float(r.input_cost or 0),
+            "output_cost": float(r.output_cost or 0),
+            "total_cost": float(r.total_cost or 0),
+        }
+        for r in rows
+    ]
 
 
 # ---------------------------------------------------------------------------

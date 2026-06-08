@@ -99,6 +99,8 @@ def cost_by_project(
         func.sum(RequestCost.input_tokens).label("input_tokens"),
         func.sum(RequestCost.output_tokens).label("output_tokens"),
         func.sum(RequestCost.total_tokens).label("total_tokens"),
+        func.sum(RequestCost.input_token_cost).label("input_cost"),
+        func.sum(RequestCost.output_token_cost).label("output_cost"),
         func.sum(RequestCost.total_cost).label("total_cost"),
     )
     q = _org_filter(q, RequestCost, org_id=org_id)
@@ -117,6 +119,8 @@ def cost_by_project(
             "input_tokens": r.input_tokens or 0,
             "output_tokens": r.output_tokens or 0,
             "total_tokens": r.total_tokens or 0,
+            "input_cost": float(r.input_cost or 0),
+            "output_cost": float(r.output_cost or 0),
             "total_cost": float(r.total_cost or 0),
         }
         for r in rows
