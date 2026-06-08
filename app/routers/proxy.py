@@ -836,7 +836,11 @@ async def proxy_chat(
                 detail=f"Azure error {status_code}: {exc}",
                 input_token_source=in_src, output_token_source=out_src,
             )
-        raise HTTPException(status_code=status_code, detail=str(exc))
+        try:
+            azure_detail = exc.response.json()
+        except Exception:
+            azure_detail = exc.response.text or str(exc)
+        raise HTTPException(status_code=status_code, detail=azure_detail)
     except httpx.RequestError as exc:
         _mark_request_failed_with_cost(
             db=db, request_id=ctx["request_id"], org_id=ctx["org_id"],

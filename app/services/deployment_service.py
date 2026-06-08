@@ -76,7 +76,7 @@ def _env_fallback(*, org_id: str, project_id: Optional[str]):
     _key    = os.getenv("AZURE_OPENAI_API_KEY", "")
     _ep     = os.getenv("AZURE_OPENAI_ENDPOINT", "")
     _dep    = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "")
-    _ver    = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01")
+    _ver    = os.getenv("AZURE_OPENAI_API_VERSION") or os.getenv("OPENAI_API_VERSION") or "2024-02-01"
 
     if not (_key and _ep and _dep):
         return None
@@ -104,7 +104,12 @@ def build_provider_request(depl) -> tuple[str, dict]:
     provider  = (depl.provider or "").lower().replace("-", "_").replace(" ", "_")
     api_key   = depl.api_key or ""
     endpoint  = (depl.endpoint_url or "").rstrip("/")
-    api_ver   = getattr(depl, "api_version", None) or "2024-02-01"
+    api_ver   = (
+        getattr(depl, "api_version", None)
+        or os.getenv("AZURE_OPENAI_API_VERSION")
+        or os.getenv("OPENAI_API_VERSION")
+        or "2024-02-01"
+    )
     dep_name  = depl.deployment_name or depl.model_name
 
     if provider in ("azure_openai", "azure"):

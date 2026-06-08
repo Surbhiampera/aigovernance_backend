@@ -165,7 +165,7 @@ try:
         json={
             "model": MODEL,
             "messages": [{"role": "user", "content": "Reply with exactly: OK"}],
-            "max_tokens": 10,
+            "max_completion_tokens": 100,
         },
         timeout=60,
     )
@@ -195,7 +195,7 @@ try:
         headers=HEADERS,
         json={
             "messages": [{"role": "user", "content": "Reply with exactly: QUERY_PARAM_OK"}],
-            "max_tokens": 10,
+            "max_completion_tokens": 100,
         },
         timeout=60,
     )
@@ -216,7 +216,7 @@ try:
         json={
             "model": MODEL,
             "messages": [{"role": "user", "content": "Count to 3, one number per word."}],
-            "max_tokens": 20,
+            "max_completion_tokens": 100,
         },
         stream=True,
         timeout=60,
@@ -316,7 +316,7 @@ try:
         json={
             "model": MODEL,
             "messages": [{"role": "user", "content": "Say the word: hello"}],
-            "max_tokens": 5,
+            "max_completion_tokens": 100,
         },
         timeout=60,
     )
@@ -414,7 +414,7 @@ try:
         json={
             "model": MODEL,
             "messages": [{"role": "user", "content": "My email is test.user@example.com, help me write a greeting."}],
-            "max_tokens": 20,
+            "max_completion_tokens": 20,
         },
         timeout=60,
     )
@@ -439,7 +439,7 @@ try:
         json={
             "model": MODEL,
             "messages": [{"role": "user", "content": "Call me at +91 98765 43210 to discuss the project."}],
-            "max_tokens": 20,
+            "max_completion_tokens": 20,
         },
         timeout=60,
     )
@@ -462,7 +462,7 @@ try:
     r = requests.post(
         PROXY_BASE,
         headers=HEADERS,
-        json={"model": MODEL, "messages": [], "max_tokens": 5},
+        json={"model": MODEL, "messages": [], "max_completion_tokens": 100},
         timeout=30,
     )
     check(
@@ -484,7 +484,7 @@ try:
         json={
             "model": MODEL,
             "messages": [{"role": "user", "content": big_message}],
-            "max_tokens": 5,
+            "max_completion_tokens": 5,
         },
         timeout=60,
     )

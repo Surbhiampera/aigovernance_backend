@@ -87,7 +87,11 @@ def get_azure_openai_deployment() -> str:
 
 
 def get_azure_openai_api_version() -> str:
-    return os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01")
+    return (
+        os.getenv("AZURE_OPENAI_API_VERSION")
+        or os.getenv("OPENAI_API_VERSION")
+        or "2024-02-01"
+    )
 
 
 # ── Cost engine rates ──────────────────────────────────────────────────────
