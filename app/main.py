@@ -42,6 +42,9 @@ _SAFE_ALTERS = [
     # Audit log
     "ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS request_id VARCHAR(120)",
     "ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS trace_id VARCHAR(120)",
+    "ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS old_value JSONB",
+    "ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS new_value JSONB",
+    "ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS audit_metadata JSONB",
     # Token usage provenance
     "ALTER TABLE token_usage ADD COLUMN IF NOT EXISTS input_token_source VARCHAR(30)",
     "ALTER TABLE token_usage ADD COLUMN IF NOT EXISTS output_token_source VARCHAR(30)",
@@ -50,12 +53,16 @@ _SAFE_ALTERS = [
     "ALTER TABLE rate_limits ADD COLUMN IF NOT EXISTS project_id VARCHAR(100)",
     "ALTER TABLE rate_limits ADD COLUMN IF NOT EXISTS key_id VARCHAR(120)",
     # Provenance: deployment tracked per request
+    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS source_system VARCHAR(255)",
     "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS deployment_name VARCHAR(255)",
     "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP",
     # Provenance: token counts co-located with cost for single-table reporting
     "ALTER TABLE request_cost ADD COLUMN IF NOT EXISTS input_tokens INTEGER DEFAULT 0",
     "ALTER TABLE request_cost ADD COLUMN IF NOT EXISTS output_tokens INTEGER DEFAULT 0",
     "ALTER TABLE request_cost ADD COLUMN IF NOT EXISTS total_tokens INTEGER DEFAULT 0",
+    "ALTER TABLE request_cost ADD COLUMN IF NOT EXISTS cost_model_type VARCHAR(50)",
+    "ALTER TABLE request_cost ADD COLUMN IF NOT EXISTS pricing_snapshot JSONB",
+    "ALTER TABLE request_cost ADD COLUMN IF NOT EXISTS pricing_version VARCHAR(50)",
     # DB-generated IDs so proxy omitting them never causes NOT NULL violations
     "ALTER TABLE token_usage ALTER COLUMN token_usage_id SET DEFAULT concat('tu-', replace(gen_random_uuid()::text, '-', ''))",
     "ALTER TABLE request_cost ALTER COLUMN cost_id SET DEFAULT concat('cu-', replace(gen_random_uuid()::text, '-', ''))",
@@ -69,6 +76,14 @@ _SAFE_ALTERS = [
     "ALTER TABLE model_deployments ADD COLUMN IF NOT EXISTS api_key TEXT",
     "ALTER TABLE model_deployments ADD COLUMN IF NOT EXISTS api_version VARCHAR(50)",
     "ALTER TABLE model_deployments ADD COLUMN IF NOT EXISTS is_default BOOLEAN DEFAULT FALSE",
+    # PII-masked version of the prompt stored alongside the original
+    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS sanitized_prompt_text TEXT",
+    # PII detection outcome columns
+    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS pii_action_taken VARCHAR(20)",
+    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS pii_types JSONB",
+    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS content_policy_flags JSONB",
+    # Request lifecycle timestamp
+    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS processing_started_at TIMESTAMP",
 ]
 
 _ALL_ROUTERS = [

@@ -112,6 +112,7 @@ def scan_and_mask(
     org_id: str,
     db: Optional[Session] = None,
     policies: Optional[dict[str, dict]] = None,
+    project_id: Optional[str] = None,
 ) -> PiiScanResult:
     """Detect PII in *text*, apply policy actions, return PiiScanResult."""
     if not text:

@@ -377,6 +377,8 @@ class RateLimit(Base):
 
     id = Column(BigInteger, primary_key=True)
     org_id = Column(String(100), nullable=True)
+    project_id = Column(String(100), nullable=True)
+    key_id = Column(String(120), nullable=True)
     tool_name = Column(String(150), nullable=True)
     max_requests_per_min = Column(Integer, nullable=True)
     max_tokens_per_day = Column(Integer, nullable=True)
