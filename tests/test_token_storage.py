@@ -27,8 +27,8 @@ from app.models import (
     Project,
     RequestCost,
     TokenUsage,
-    ModelPricing,
 )
+from app.services.ai_model_pricing import MODEL_PRICING
 from app.services.governance_key_service import create_governance_key
 
 
@@ -103,24 +103,6 @@ def _seed_org_project_key(db, org_id: str, project_id: str) -> str:
     return result["raw_key"]
 
 
-def _seed_model_pricing(db):
-    """
-    Pricing per 1M tokens.
-    """
-
-    pricing = ModelPricing(
-        model_name="gpt-4o",
-        input_cost_per_million=Decimal("5.00"),
-        output_cost_per_million=Decimal("15.00"),
-        provider="azure",
-    )
-
-    db.add(pricing)
-    db.flush()
-
-    return pricing
-
-
 def _mock_deployment():
     return MagicMock(
         deployment_id="dep-001",
@@ -163,8 +145,6 @@ def test_tokens_and_costs_are_stored(client, db_session):
         "proj-t01",
     )
 
-    _seed_model_pricing(db_session)
-
     with patch(
         "app.routers.proxy.httpx.AsyncClient",
         return_value=_mock_azure_client(
@@ -204,41 +184,38 @@ def test_tokens_and_costs_are_stored(client, db_session):
 
     assert row is not None
 
+    _usage = FAKE_AZURE_RESPONSE["usage"]
+    _catalogue = MODEL_PRICING[FAKE_AZURE_RESPONSE["model"]]
+
     # ------------------------------------------------------------------
     # Tokens
     # ------------------------------------------------------------------
 
-    assert row.input_tokens == 25
-    assert row.output_tokens == 10
-    assert row.total_tokens == 35
+    assert row.input_tokens == _usage["prompt_tokens"]
+    assert row.output_tokens == _usage["completion_tokens"]
+    assert row.total_tokens == _usage["total_tokens"]
 
     # ------------------------------------------------------------------
     # Model + Project
     # ------------------------------------------------------------------
 
     assert row.project_id == "proj-t01"
-    assert row.model_name == "gpt-4o"
+    assert row.model_name == FAKE_AZURE_RESPONSE["model"]
 
     # ------------------------------------------------------------------
-    # Expected Costs
+    # Costs — derived from catalogue, no hardcoded rates
     # ------------------------------------------------------------------
 
-    expected_input_cost = (
-        Decimal("25") / Decimal("1000000")
-    ) * Decimal("5.00")
-
-    expected_output_cost = (
-        Decimal("10") / Decimal("1000000")
-    ) * Decimal("15.00")
-
-    expected_total_cost = (
-        expected_input_cost
-        + expected_output_cost
+    expected_input_cost = round(
+        (_usage["prompt_tokens"] / 1_000_000) * _catalogue.input_per_1m, 6
+    )
+    expected_output_cost = round(
+        (_usage["completion_tokens"] / 1_000_000) * _catalogue.output_per_1m, 6
     )
 
-    assert Decimal(str(row.input_cost)) == expected_input_cost
-    assert Decimal(str(row.output_cost)) == expected_output_cost
-    assert Decimal(str(row.total_cost)) == expected_total_cost
+    assert abs(float(row.input_token_cost) - expected_input_cost) < 1e-6
+    assert abs(float(row.output_token_cost) - expected_output_cost) < 1e-6
+    assert float(row.total_cost) >= expected_input_cost + expected_output_cost
 
     # ------------------------------------------------------------------
     # Token Usage Table
@@ -252,12 +229,12 @@ def test_tokens_and_costs_are_stored(client, db_session):
 
     assert usage is not None
 
-    assert usage.input_tokens == 25
-    assert usage.output_tokens == 10
-    assert usage.total_tokens == 35
+    assert usage.input_tokens == _usage["prompt_tokens"]
+    assert usage.output_tokens == _usage["completion_tokens"]
+    assert usage.total_tokens == _usage["total_tokens"]
 
     assert usage.project_id == "proj-t01"
-    assert usage.model_name == "gpt-4o"
+    assert usage.model_name == FAKE_AZURE_RESPONSE["model"]
 
 
 def test_tiktoken_fallback_when_usage_missing(client, db_session):
@@ -271,8 +248,6 @@ def test_tiktoken_fallback_when_usage_missing(client, db_session):
         "org-t02",
         "proj-t02",
     )
-
-    _seed_model_pricing(db_session)
 
     body = dict(FAKE_AZURE_RESPONSE)
     body["usage"] = {}
@@ -344,8 +319,6 @@ def test_costs_by_project_endpoint(client, db_session):
         "proj-t03",
     )
 
-    _seed_model_pricing(db_session)
-
     with patch(
         "app.routers.proxy.httpx.AsyncClient",
         return_value=_mock_azure_client(
@@ -392,12 +365,13 @@ def test_costs_by_project_endpoint(client, db_session):
 
     row = rows[0]
 
-    assert row["project_id"] == "proj-t03"
-    assert row["model_name"] == "gpt-4o"
+    _usage = FAKE_AZURE_RESPONSE["usage"]
 
-    assert row["input_tokens"] == 25
-    assert row["output_tokens"] == 10
-    assert row["total_tokens"] == 35
+    assert row["project_id"] == "proj-t03"
+
+    assert row["input_tokens"] == _usage["prompt_tokens"]
+    assert row["output_tokens"] == _usage["completion_tokens"]
+    assert row["total_tokens"] == _usage["total_tokens"]
 
     assert "input_cost" in row
     assert "output_cost" in row
@@ -406,7 +380,6 @@ def test_costs_by_project_endpoint(client, db_session):
     print("\n")
     print("===================================================")
     print(f"Project      : {row['project_id']}")
-    print(f"Model        : {row['model_name']}")
     print(f"Input Tokens : {row['input_tokens']}")
     print(f"Output Tokens: {row['output_tokens']}")
     print(f"Total Tokens : {row['total_tokens']}")

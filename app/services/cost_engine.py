@@ -8,7 +8,7 @@ from app.config import (
     get_cost_infra_rate_per_ms,
     get_cost_infra_rate_per_mb,
 )
-from app.models import ModelPricing, ToolRegistry
+from app.models import ModelPricing
 from app.schemas import CostSummary, TelemetryEventCreate
 from app.services.ai_model_pricing import MODEL_PRICING
 
@@ -84,39 +84,8 @@ class CostEngine:
                     ).quantize(Decimal("0.000001"))
                     llm_cost = input_token_cost + output_token_cost
                 else:
-                    # 3. Last resort: tool registry cost model (non-LLM tools)
-                    tool = (
-                        db.query(ToolRegistry)
-                        .filter(
-                            (ToolRegistry.tool_name == (event_data.model_name or event_data.tool_name))
-                            | (ToolRegistry.tool_name == event_data.component_name)
-                        )
-                        .first()
-                    )
-                    cost_model = (tool.cost_model if tool and tool.cost_model else None) or "per_token"
-                    base_cost = Decimal(str(tool.base_cost)) if tool and tool.base_cost is not None else Decimal("0")
-                    latency_s = (Decimal(str(max(int(event_data.latency_ms or 0), 0))) / Decimal("1000")).quantize(Decimal("0.000001"))
-
-                    if cost_model == "per_token":
-                        rate_per_1k = base_cost if base_cost > 0 else get_cost_default_rate_per_1k()
-                        llm_cost = (Decimal(str(total_tokens)) / Decimal("1000")) * rate_per_1k
-                    elif cost_model == "per_request":
-                        llm_cost = base_cost
-                    elif cost_model == "per_second":
-                        rate_per_s = base_cost if base_cost > 0 else get_cost_default_per_second_rate()
-                        llm_cost = latency_s * rate_per_s
-                    elif cost_model == "fixed":
-                        llm_cost = base_cost
-                    elif cost_model == "custom":
-                        meta = event_data.metadata_json or {}
-                        multiplier = Decimal(str(meta.get("custom_multiplier", 1) or 1))
-                        per_mb_in = Decimal(str(meta.get("per_mb_in", 0) or 0))
-                        per_mb_out = Decimal(str(meta.get("per_mb_out", 0) or 0))
-                        mb_in = Decimal(str(event_data.input_data_size_mb or 0))
-                        mb_out = Decimal(str(event_data.output_data_size_mb or 0))
-                        llm_cost = (base_cost * multiplier) + (per_mb_in * mb_in) + (per_mb_out * mb_out)
-                    else:
-                        llm_cost = (Decimal(str(total_tokens)) / Decimal("1000")) * get_cost_default_rate_per_1k()
+                    # 3. Last resort: default rate from config
+                    llm_cost = (Decimal(str(total_tokens)) / Decimal("1000")) * get_cost_default_rate_per_1k()
 
         for ext in event_data.external_tools:
             external_cost += Decimal(str(ext.cost))
