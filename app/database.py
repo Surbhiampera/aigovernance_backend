@@ -7,7 +7,18 @@ from sqlalchemy.pool import QueuePool
 
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://localhost:5432/ai_governance")
+def _build_database_url() -> str:
+    url = os.getenv("DATABASE_URL")
+    if url:
+        return url
+    host = os.getenv("DB_HOST", "localhost")
+    port = os.getenv("DB_PORT", "5432")
+    name = os.getenv("DB_NAME", "ai_governance")
+    user = os.getenv("DB_USER", "postgres")
+    password = os.getenv("DB_PASSWORD", "")
+    return f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{name}"
+
+DATABASE_URL = _build_database_url()
 
 from app.config import (
     get_db_max_overflow,

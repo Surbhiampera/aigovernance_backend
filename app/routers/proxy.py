@@ -30,7 +30,7 @@ import json
 import logging
 import time
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, AsyncIterator, Optional
 
@@ -93,8 +93,11 @@ def _scan_messages(
     org_id: str,
     project_id: Optional[str],
     db: Session,
-) -> list[dict]:
+):
+    """Return (sanitised_messages, pii_detected, pii_types, pii_masked, pii_action_taken)."""
+    from app.services.pii_engine import PiiScanResult
     sanitised: list[dict] = []
+    combined = PiiScanResult(sanitized_text="")
     for msg in messages:
         content = msg.get("content", "")
         if not isinstance(content, str):
@@ -106,8 +109,25 @@ def _scan_messages(
             project_id=project_id,
             db=db,
         )
-        sanitised.append({**msg, "content": result.get("masked_text", content)})
-    return sanitised
+        if result.pii_detected:
+            combined.pii_detected = True
+            combined.pii_types = list(set(combined.pii_types + result.pii_types))
+        if result.pii_masked:
+            combined.pii_masked = True
+        if result.should_block:
+            combined.action_taken = "block"
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error": "pii_block",
+                    "message": "Request blocked: sensitive PII detected.",
+                    "pii_types": result.pii_types,
+                },
+            )
+        if result.action_taken == "mask":
+            combined.action_taken = "mask"
+        sanitised.append({**msg, "content": result.sanitized_text})
+    return sanitised, combined
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +148,10 @@ def _store_request(
     input_tokens: int,
     source_ip: Optional[str],
     user_agent: Optional[str],
+    pii_detected: bool = False,
+    pii_types: list = None,
+    pii_masked: bool = False,
+    pii_action_taken: Optional[str] = None,
 ) -> AiRequest:
     row = AiRequest(
         request_id=request_id,
@@ -142,6 +166,10 @@ def _store_request(
         source_ip=source_ip,
         user_agent=user_agent,
         request_status="pending",
+        pii_detected=pii_detected,
+        pii_types=pii_types or [],
+        pii_masked=pii_masked,
+        pii_action_taken=pii_action_taken,
         created_at=datetime.utcnow(),
     )
     db.add(row)
@@ -291,6 +319,7 @@ def _store_response_and_cost(
         total_tokens=input_tokens + output_tokens,
         input_token_cost=input_cost,
         output_token_cost=output_cost,
+        llm_cost=input_cost + output_cost,
         total_cost=total_cost,
         currency="USD",
         cost_model_type=pricing_source,
@@ -458,6 +487,7 @@ def _mark_request_failed_with_cost(
         total_tokens=input_tokens + output_tokens,
         input_token_cost=input_cost,
         output_token_cost=output_cost,
+        llm_cost=input_cost + output_cost,
         total_cost=total_cost,
         currency="USD",
         cost_model_type=pricing_source,
@@ -720,10 +750,18 @@ async def _run_pre_flight(
         _log.warning("Governance rules check skipped: %s", _e)
 
     messages: list[dict] = body.get("messages", [])
+    pii_detected = False
+    pii_types: list = []
+    pii_masked = False
+    pii_action_taken: Optional[str] = None
     try:
-        clean_messages = _scan_messages(
+        clean_messages, pii_result = _scan_messages(
             messages=messages, org_id=org_id, project_id=project_id, db=db,
         )
+        pii_detected = pii_result.pii_detected
+        pii_types = pii_result.pii_types
+        pii_masked = pii_result.pii_masked
+        pii_action_taken = pii_result.action_taken if pii_result.pii_detected else None
     except HTTPException:
         raise
     except Exception as _e:
@@ -766,6 +804,10 @@ async def _run_pre_flight(
         payload=forward_body,
         input_tokens=input_tokens,
         source_ip=source_ip,
+        pii_detected=pii_detected,
+        pii_types=pii_types,
+        pii_masked=pii_masked,
+        pii_action_taken=pii_action_taken,
         user_agent=user_agent,
     )
     db.commit()
@@ -974,6 +1016,7 @@ def stats_by_project_model(
         func.sum(RequestCost.total_tokens).label("total_tokens"),
         func.sum(RequestCost.input_token_cost).label("input_cost"),
         func.sum(RequestCost.output_token_cost).label("output_cost"),
+        func.sum(RequestCost.llm_cost).label("llm_cost"),
         func.sum(RequestCost.total_cost).label("total_cost"),
     )
     if org_id:
@@ -1001,10 +1044,146 @@ def stats_by_project_model(
             "total_tokens": r.total_tokens or 0,
             "input_cost": float(r.input_cost or 0),
             "output_cost": float(r.output_cost or 0),
+            "llm_cost": float(r.llm_cost or 0),
             "total_cost": float(r.total_cost or 0),
         }
         for r in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# Proxy stats — overview, trends, PII summary
+# ---------------------------------------------------------------------------
+
+@router.get("/stats/overview")
+def proxy_stats_overview(
+    *,
+    org_id: Optional[str] = Query(None),
+    days: int = Query(30, ge=1, le=365),
+    db: Session = Depends(get_db),
+) -> dict:
+    cutoff = datetime.utcnow().date() - timedelta(days=days - 1)
+
+    cost_q = db.query(
+        func.count(RequestCost.request_id).label("total_requests"),
+        func.sum(RequestCost.input_tokens).label("prompt_tokens"),
+        func.sum(RequestCost.output_tokens).label("completion_tokens"),
+        func.sum(RequestCost.total_tokens).label("total_tokens"),
+        func.sum(RequestCost.llm_cost).label("llm_cost"),
+        func.sum(RequestCost.total_cost).label("total_cost"),
+    ).filter(func.date(RequestCost.created_at) >= cutoff)
+    if org_id:
+        cost_q = cost_q.filter(RequestCost.org_id == org_id)
+    cost = cost_q.first()
+
+    completed_q = db.query(func.count(AiRequest.id)).filter(
+        AiRequest.request_status == "success",
+        func.date(AiRequest.created_at) >= cutoff,
+    )
+    if org_id:
+        completed_q = completed_q.filter(AiRequest.org_id == org_id)
+    completed = completed_q.scalar() or 0
+
+    latency_q = db.query(func.avg(AiResponse.latency_ms)).filter(
+        func.date(AiResponse.created_at) >= cutoff,
+    )
+    if org_id:
+        latency_q = latency_q.filter(AiResponse.org_id == org_id)
+    avg_latency = latency_q.scalar() or 0
+
+    return {
+        "total_requests": cost.total_requests or 0,
+        "completed": completed,
+        "prompt_tokens": cost.prompt_tokens or 0,
+        "completion_tokens": cost.completion_tokens or 0,
+        "total_tokens": cost.total_tokens or 0,
+        "llm_cost": float(cost.llm_cost or 0),
+        "total_cost": float(cost.total_cost or 0),
+        "avg_latency_ms": round(float(avg_latency), 2),
+    }
+
+
+@router.get("/stats/trends")
+def proxy_stats_trends(
+    *,
+    org_id: Optional[str] = Query(None),
+    days: int = Query(30, ge=1, le=365),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    cutoff = datetime.utcnow().date() - timedelta(days=days - 1)
+
+    q = db.query(
+        func.date(RequestCost.created_at).label("date"),
+        func.count(RequestCost.request_id).label("total_requests"),
+        func.sum(RequestCost.total_tokens).label("total_tokens"),
+        func.sum(RequestCost.llm_cost).label("llm_cost"),
+        func.sum(RequestCost.total_cost).label("total_cost"),
+    ).filter(func.date(RequestCost.created_at) >= cutoff)
+    if org_id:
+        q = q.filter(RequestCost.org_id == org_id)
+
+    rows = (
+        q.group_by(func.date(RequestCost.created_at))
+        .order_by(func.date(RequestCost.created_at).asc())
+        .all()
+    )
+
+    return [
+        {
+            "date": str(r.date),
+            "total_requests": r.total_requests or 0,
+            "total_tokens": r.total_tokens or 0,
+            "llm_cost": float(r.llm_cost or 0),
+            "total_cost": float(r.total_cost or 0),
+        }
+        for r in rows
+    ]
+
+
+@router.get("/stats/pii")
+def proxy_stats_pii(
+    *,
+    org_id: Optional[str] = Query(None),
+    days: int = Query(30, ge=1, le=365),
+    db: Session = Depends(get_db),
+) -> dict:
+    from sqlalchemy import text as _text
+
+    cutoff = (datetime.utcnow().date() - timedelta(days=days - 1)).isoformat()
+
+    org_filter = "AND org_id = :org_id" if org_id else ""
+
+    type_rows = db.execute(_text(f"""
+        SELECT unnested_type AS pii_type, COUNT(*) AS count
+        FROM ai_requests,
+             jsonb_array_elements_text(
+                 CASE
+                     WHEN jsonb_typeof(pii_types::jsonb) = 'array' THEN pii_types::jsonb
+                     ELSE '[]'::jsonb
+                 END
+             ) AS unnested_type
+        WHERE pii_detected = TRUE
+          AND DATE(created_at) >= :cutoff
+          {org_filter}
+        GROUP BY unnested_type
+        ORDER BY count DESC
+    """), {"cutoff": cutoff, "org_id": org_id} if org_id else {"cutoff": cutoff}).fetchall()
+
+    action_rows = db.execute(_text(f"""
+        SELECT pii_action_taken AS action, COUNT(*) AS count
+        FROM ai_requests
+        WHERE pii_detected = TRUE
+          AND pii_action_taken IS NOT NULL
+          AND DATE(created_at) >= :cutoff
+          {org_filter}
+        GROUP BY pii_action_taken
+        ORDER BY count DESC
+    """), {"cutoff": cutoff, "org_id": org_id} if org_id else {"cutoff": cutoff}).fetchall()
+
+    return {
+        "pii_type_breakdown": [{"pii_type": r.pii_type, "count": r.count} for r in type_rows],
+        "action_breakdown": [{"action": r.action, "count": r.count} for r in action_rows],
+    }
 
 
 # ---------------------------------------------------------------------------

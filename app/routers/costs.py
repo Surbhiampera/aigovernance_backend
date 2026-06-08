@@ -58,6 +58,7 @@ def cost_by_model(
         func.sum(RequestCost.total_tokens).label("total_tokens"),
         func.sum(RequestCost.input_token_cost).label("input_token_cost"),
         func.sum(RequestCost.output_token_cost).label("output_token_cost"),
+        func.sum(RequestCost.llm_cost).label("llm_cost"),
         func.sum(RequestCost.total_cost).label("total_cost"),
     )
     q = _org_filter(q, RequestCost, org_id=org_id)
@@ -74,6 +75,7 @@ def cost_by_model(
             "total_tokens": r.total_tokens or 0,
             "input_cost": float(r.input_token_cost or 0),
             "output_cost": float(r.output_token_cost or 0),
+            "llm_cost": float(r.llm_cost or 0),
             "total_cost": float(r.total_cost or 0),
         }
         for r in rows
@@ -101,6 +103,7 @@ def cost_by_project(
         func.sum(RequestCost.total_tokens).label("total_tokens"),
         func.sum(RequestCost.input_token_cost).label("input_cost"),
         func.sum(RequestCost.output_token_cost).label("output_cost"),
+        func.sum(RequestCost.llm_cost).label("llm_cost"),
         func.sum(RequestCost.total_cost).label("total_cost"),
     )
     q = _org_filter(q, RequestCost, org_id=org_id)
@@ -121,6 +124,7 @@ def cost_by_project(
             "total_tokens": r.total_tokens or 0,
             "input_cost": float(r.input_cost or 0),
             "output_cost": float(r.output_cost or 0),
+            "llm_cost": float(r.llm_cost or 0),
             "total_cost": float(r.total_cost or 0),
         }
         for r in rows
