@@ -1,43 +1,40 @@
 """Shared test fixtures.
 
-Uses an in-memory SQLite database for fast, isolated tests.
-Each test gets a fresh database session.
+Uses a real PostgreSQL database (DATABASE_URL from .env). Each test runs
+inside a transaction that is rolled back on teardown — no rows ever persist,
+no tables are created or dropped.
 """
+import os
+
 import pytest
+from dotenv import load_dotenv
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
 
-from app.database import Base
+load_dotenv()
+
 from app.core.deps import get_db
 from app.main import app
 
+DATABASE_URL = os.environ["DATABASE_URL"]
 
-SQLALCHEMY_TEST_DATABASE_URL = "sqlite://"
-
-engine = create_engine(
-    SQLALCHEMY_TEST_DATABASE_URL,
-    connect_args={"check_same_thread": False},
-    poolclass=StaticPool,
-)
+engine = create_engine(DATABASE_URL)
 TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
-@pytest.fixture(autouse=True)
-def setup_database():
-    Base.metadata.create_all(bind=engine)
-    yield
-    Base.metadata.drop_all(bind=engine)
-
-
 @pytest.fixture
-def db_session(setup_database):
-    session = TestingSessionLocal()
+def db_session():
+    """Each test gets a DB session whose transaction is rolled back on teardown."""
+    connection = engine.connect()
+    transaction = connection.begin()
+    session = TestingSessionLocal(bind=connection)
     try:
         yield session
     finally:
         session.close()
+        transaction.rollback()
+        connection.close()
 
 
 @pytest.fixture
