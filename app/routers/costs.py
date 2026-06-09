@@ -52,6 +52,7 @@ def cost_by_model(
 ) -> list[dict]:
     q = db.query(
         RequestCost.model_name,
+        RequestCost.provider,
         func.count(RequestCost.request_id).label("total_requests"),
         func.sum(RequestCost.input_tokens).label("input_tokens"),
         func.sum(RequestCost.output_tokens).label("output_tokens"),
@@ -64,11 +65,12 @@ def cost_by_model(
     q = _org_filter(q, RequestCost, org_id=org_id)
     q = _project_filter(q, RequestCost, project_id=project_id)
     q = _date_filter(q, RequestCost, start=start, end=end)
-    rows = q.group_by(RequestCost.model_name).order_by(func.sum(RequestCost.total_cost).desc()).all()
+    rows = q.group_by(RequestCost.model_name, RequestCost.provider).order_by(func.sum(RequestCost.total_cost).desc()).all()
 
     return [
         {
             "model_name": r.model_name,
+            "provider": r.provider or "",
             "total_requests": r.total_requests or 0,
             "input_tokens": r.input_tokens or 0,
             "output_tokens": r.output_tokens or 0,

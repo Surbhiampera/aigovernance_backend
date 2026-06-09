@@ -84,6 +84,10 @@ _SAFE_ALTERS = [
     "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS content_policy_flags JSONB",
     # Request lifecycle timestamp
     "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS processing_started_at TIMESTAMP",
+    # Request Cost Log query columns (added after initial schema)
+    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS client_ip VARCHAR(50)",
+    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS provider VARCHAR(100)",
+    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS received_at TIMESTAMP DEFAULT NOW()",
 ]
 
 _ALL_ROUTERS = [

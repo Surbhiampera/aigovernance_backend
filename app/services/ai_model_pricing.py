@@ -146,6 +146,40 @@ MODEL_ALIASES: dict[str, str] = {
 }
 
 
+# ── Provider-specific pricing overrides ──────────────────────────────────────
+# Same model may be priced differently per provider (e.g. Azure vs OpenAI).
+# Key: (provider_lowercase, canonical_model_name)
+# Lookup order: PROVIDER_PRICING → MODEL_PRICING → DB → default rate
+PROVIDER_PRICING: dict[tuple[str, str], ModelPricing] = {
+    # Azure OpenAI — input is half of OpenAI direct for GPT-5-nano
+    ("azure_openai", "gpt-5-nano"):   ModelPricing(0.05,   0.40, 128_000, 32_000, "Azure OpenAI", "chat"),
+    ("azure_openai", "gpt-5-mini"):   ModelPricing(0.55,   2.20, 200_000, 64_000, "Azure OpenAI", "chat"),
+    ("azure_openai", "gpt-5"):        ModelPricing(4.50,  13.50, 400_000,128_000, "Azure OpenAI", "chat"),
+    ("azure_openai", "gpt-4o"):       ModelPricing(2.50,  10.00, 128_000, 16_384, "Azure OpenAI", "chat"),
+    ("azure_openai", "gpt-4o-mini"):  ModelPricing(0.15,   0.60, 128_000, 16_384, "Azure OpenAI", "chat"),
+    ("azure_openai", "gpt-4-turbo"):  ModelPricing(10.00, 30.00, 128_000,  4_096, "Azure OpenAI", "chat"),
+    ("azure_openai", "gpt-4"):        ModelPricing(30.00, 60.00,   8_192,  4_096, "Azure OpenAI", "chat"),
+    ("azure_openai", "gpt-3.5-turbo"):  ModelPricing(0.50,   1.50,  16_385,  4_096, "Azure OpenAI", "chat"),
+    # Azure OpenAI embedding models
+    ("azure_openai", "text-embedding-3-small"): ModelPricing(0.02, 0.00, 8_191, 0, "Azure OpenAI", "embedding"),
+    ("azure_openai", "text-embedding-3-large"): ModelPricing(0.13, 0.00, 8_191, 0, "Azure OpenAI", "embedding"),
+    ("azure_openai", "text-embedding-ada-002"): ModelPricing(0.10, 0.00, 8_191, 0, "Azure OpenAI", "embedding"),
+    # Add more provider-specific overrides here as needed
+}
+
+
+def normalize_provider(provider: str) -> str:
+    """Normalise provider string to a consistent lowercase key."""
+    return (provider or "").lower().replace("-", "_").replace(" ", "_")
+
+
+def get_model_pricing_for_provider(model_name: str, provider: str) -> Optional[ModelPricing]:
+    """Return provider-specific pricing if available, otherwise fall back to generic catalog."""
+    canonical = normalize_model_name(model_name or "")
+    prov = normalize_provider(provider)
+    return PROVIDER_PRICING.get((prov, canonical)) or MODEL_PRICING.get(canonical)
+
+
 def normalize_model_name(model_name: str) -> str:
     """Resolve aliases and casing variations to a canonical MODEL_PRICING key."""
     if not model_name:

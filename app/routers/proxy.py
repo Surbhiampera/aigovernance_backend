@@ -188,30 +188,53 @@ def _calculate_cost(
     *,
     db: Session,
     model: str,
+    provider: str = "",
     input_tokens: int,
     output_tokens: int,
 ) -> tuple[Decimal, Decimal, Decimal, str, dict, str]:
     """Return (input_cost, output_cost, total_cost, pricing_source, pricing_snapshot, pricing_version).
 
-    Lookup order: DB model_pricing (most recent effective_from ≤ now) → static catalogue.
-    DB row wins unconditionally so admins can update pricing without a code deploy.
-    pricing_snapshot records the exact rates used so historical audits remain accurate
-    even after future price changes.
+    Lookup order:
+      1. DB model_pricing filtered by provider+model (admin overrides, most recent wins)
+      2. DB model_pricing filtered by model only (provider-agnostic DB entry)
+      3. PROVIDER_PRICING catalogue (provider-specific static rates)
+      4. MODEL_PRICING catalogue (generic static rates)
+      5. Default rate from config
     """
     from app.models import ModelPricing as ModelPricingRow
-    from app.services.ai_model_pricing import get_model_pricing, normalize_model_name
+    from app.services.ai_model_pricing import (
+        get_model_pricing_for_provider,
+        normalize_model_name,
+        normalize_provider,
+    )
 
     canonical = normalize_model_name(model)
+    prov = normalize_provider(provider)
 
-    db_price = (
-        db.query(ModelPricingRow)
-        .filter(
-            ModelPricingRow.model_name == canonical,
-            ModelPricingRow.effective_from <= datetime.utcnow(),
+    # 1. DB lookup: provider+model specific (highest priority — admin can override any rate)
+    db_price = None
+    if prov:
+        db_price = (
+            db.query(ModelPricingRow)
+            .filter(
+                ModelPricingRow.model_name == canonical,
+                ModelPricingRow.provider == prov,
+                ModelPricingRow.effective_from <= datetime.utcnow(),
+            )
+            .order_by(ModelPricingRow.effective_from.desc())
+            .first()
         )
-        .order_by(ModelPricingRow.effective_from.desc())
-        .first()
-    )
+    # 2. DB lookup: model only (provider-agnostic fallback)
+    if not db_price:
+        db_price = (
+            db.query(ModelPricingRow)
+            .filter(
+                ModelPricingRow.model_name == canonical,
+                ModelPricingRow.effective_from <= datetime.utcnow(),
+            )
+            .order_by(ModelPricingRow.effective_from.desc())
+            .first()
+        )
 
     if db_price:
         in_rate = Decimal(str(db_price.input_cost_per_1k))
@@ -223,13 +246,15 @@ def _calculate_cost(
         pricing_snapshot = {
             "input_cost_per_1k": float(in_rate),
             "output_cost_per_1k": float(out_rate),
+            "provider": db_price.provider or prov,
             "currency": db_price.currency or "USD",
             "effective_from": eff_date,
             "source": "database",
         }
         pricing_version = f"{canonical}@{eff_date}"
     else:
-        catalogue_entry = get_model_pricing(canonical)
+        # 3+4. Provider-specific catalogue, then generic catalogue
+        catalogue_entry = get_model_pricing_for_provider(canonical, prov)
         if catalogue_entry:
             input_cost = Decimal(str(round((input_tokens / 1_000_000) * catalogue_entry.input_per_1m, 6)))
             output_cost = Decimal(str(round((output_tokens / 1_000_000) * catalogue_entry.output_per_1m, 6)))
@@ -237,11 +262,12 @@ def _calculate_cost(
             pricing_snapshot = {
                 "input_cost_per_1k": catalogue_entry.input_per_1m / 1000,
                 "output_cost_per_1k": catalogue_entry.output_per_1m / 1000,
+                "provider": catalogue_entry.provider,
                 "currency": "USD",
                 "effective_from": None,
                 "source": "catalogue",
             }
-            pricing_version = "catalogue"
+            pricing_version = f"catalogue:{catalogue_entry.provider}"
         else:
             input_cost = Decimal("0")
             output_cost = Decimal("0")
@@ -266,6 +292,7 @@ def _store_response_and_cost(
     project_id: Optional[str],
     model: str,
     deployment: str,
+    provider: str = "",
     response_payload: dict,
     input_tokens: int,
     output_tokens: int,
@@ -278,6 +305,7 @@ def _store_response_and_cost(
     input_cost, output_cost, total_cost, pricing_source, pricing_snapshot, pricing_version = _calculate_cost(
         db=db,
         model=model,
+        provider=provider,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
     )
@@ -314,6 +342,7 @@ def _store_response_and_cost(
         org_id=org_id,
         project_id=project_id,
         model_name=model,
+        provider=provider or None,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         total_tokens=input_tokens + output_tokens,
@@ -434,6 +463,7 @@ def _mark_request_failed_with_cost(
     key_id: str,
     model: str,
     deployment: str,
+    provider: str = "",
     input_tokens: int,
     output_tokens: int,
     latency_ms: int,
@@ -459,6 +489,7 @@ def _mark_request_failed_with_cost(
     input_cost, output_cost, total_cost, pricing_source, pricing_snapshot, pricing_version = _calculate_cost(
         db=db,
         model=model,
+        provider=provider,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
     )
@@ -538,6 +569,7 @@ async def _stream_azure(
     key_id: str,
     model: str,
     deployment: str,
+    provider: str = "",
     input_tokens: int,
     source_ip: Optional[str],
     user_agent: Optional[str],
@@ -647,6 +679,7 @@ async def _stream_azure(
         project_id=project_id,
         model=model,
         deployment=deployment,
+        provider=provider,
         response_payload={"streamed": True, "chunks": len(chunks_raw)},
         input_tokens=input_tokens,
         output_tokens=output_tokens,
@@ -821,6 +854,7 @@ async def _run_pre_flight(
         key_id=key_id,
         model=model,
         deployment=deployment,
+        provider=getattr(depl, "provider", None) or "",
         forward_body=forward_body,
         input_tokens=input_tokens,
         source_ip=source_ip,
@@ -929,6 +963,7 @@ async def proxy_chat(
         project_id=ctx["project_id"],
         model=ctx["model"],
         deployment=ctx["deployment"],
+        provider=ctx.get("provider", ""),
         response_payload=response_data,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
@@ -958,6 +993,24 @@ async def proxy_chat(
 
 
 # ---------------------------------------------------------------------------
+# OpenAI-compatible aliases — /proxy/chat/completions and /proxy/v1/chat/completions
+# The OpenAI SDK appends /chat/completions to whatever base_url is set.
+# These routes let callers set base_url="https://host/proxy" and use the SDK
+# without any patching.
+# ---------------------------------------------------------------------------
+
+@router.post("/chat/completions")
+@router.post("/v1/chat/completions")
+async def proxy_chat_openai_compat(
+    request: Request,
+    model: Optional[str] = Query(None, description="AI model name (overrides body 'model' field)"),
+    x_governance_key: str = Header(..., alias="X-Governance-Key"),
+    db: Session = Depends(get_db),
+) -> Any:
+    return await proxy_chat(request=request, model=model, x_governance_key=x_governance_key, db=db)
+
+
+# ---------------------------------------------------------------------------
 # POST /proxy/stream — SSE streaming
 # ---------------------------------------------------------------------------
 
@@ -983,6 +1036,7 @@ async def proxy_chat_stream(
             key_id=ctx["key_id"],
             model=ctx["model"],
             deployment=ctx["deployment"],
+            provider=ctx.get("provider", ""),
             input_tokens=ctx["input_tokens"],
             source_ip=ctx["source_ip"],
             user_agent=ctx["user_agent"],
@@ -1197,6 +1251,8 @@ def list_proxy_requests(
     org_id: Optional[str] = None,
     project_id: Optional[str] = None,
     request_type: Optional[str] = None,
+    status: Optional[str] = None,
+    pii_only: Optional[bool] = None,
     limit: int = 50,
     offset: int = 0,
     db: Session = Depends(get_db),
@@ -1207,40 +1263,63 @@ def list_proxy_requests(
     from sqlalchemy import text as _text
 
     filters: list[str] = []
+    count_filters: list[str] = []
     params: dict = {}
 
     if request_id:
-        filters.append("request_id = :request_id")
+        filters.append("r.request_id = :request_id")
+        count_filters.append("request_id = :request_id")
         params["request_id"] = request_id
     if org_id:
-        filters.append("org_id = :org_id")
+        filters.append("r.org_id = :org_id")
+        count_filters.append("org_id = :org_id")
         params["org_id"] = org_id
     if project_id:
-        filters.append("project_id = :project_id")
+        filters.append("r.project_id = :project_id")
+        count_filters.append("project_id = :project_id")
         params["project_id"] = project_id
     if request_type:
-        filters.append("request_type = :request_type")
+        filters.append("r.request_type = :request_type")
+        count_filters.append("request_type = :request_type")
         params["request_type"] = request_type
+    if status:
+        filters.append("r.request_status = :status")
+        count_filters.append("request_status = :status")
+        params["status"] = status
+    if pii_only:
+        filters.append("r.pii_detected = TRUE")
+        count_filters.append("pii_detected = TRUE")
 
     where = ("WHERE " + " AND ".join(filters)) if filters else ""
+    count_where = ("WHERE " + " AND ".join(count_filters)) if count_filters else ""
 
     try:
         total = (
-            db.execute(_text(f"SELECT COUNT(*) FROM ai_requests {where}"), params).scalar() or 0
+            db.execute(_text(f"SELECT COUNT(*) FROM ai_requests {count_where}"), params).scalar() or 0
         )
         params["limit"] = limit
         params["offset"] = offset
         rows = db.execute(
             _text(
-                f"SELECT request_id, org_id, project_id, request_type, model_name,"
-                f" input_token_estimate, request_status, created_at"
-                f" FROM ai_requests {where}"
-                f" ORDER BY created_at DESC LIMIT :limit OFFSET :offset"
+                f"SELECT r.request_id, r.org_id, r.project_id, r.request_type, r.model_name,"
+                f" r.input_token_estimate, r.request_status, r.created_at,"
+                f" r.pii_detected, r.pii_types, r.pii_action_taken,"
+                f" r.client_ip, r.source_ip, r.received_at, r.provider, r.source_system,"
+                f" tu.total_tokens, rc.total_cost,"
+                f" COALESCE(tu.input_tokens, r.input_token_estimate) AS prompt_tokens,"
+                f" tu.output_tokens AS completion_tokens,"
+                f" rc.llm_cost,"
+                f" rc.input_token_cost, rc.output_token_cost"
+                f" FROM ai_requests r"
+                f" LEFT JOIN token_usage tu ON tu.request_id = r.request_id"
+                f" LEFT JOIN request_cost rc ON rc.request_id = r.request_id"
+                f" {where}"
+                f" ORDER BY r.created_at DESC LIMIT :limit OFFSET :offset"
             ),
             params,
         ).fetchall()
-    except Exception:
-        # Table or columns missing — return empty list so the endpoint stays 200.
+    except Exception as exc:
+        _log.warning("list_proxy_requests query failed: %s", exc)
         return {"total": 0, "offset": offset, "items": []}
 
     return {
@@ -1248,17 +1327,31 @@ def list_proxy_requests(
         "offset": offset,
         "items": [
             {
-                "request_id":      r[0],
-                "org_id":          r[1],
-                "project_id":      r[2],
-                "request_type":    r[3],
-                "model_name":      r[4],
-                "deployment_name": None,
-                "input_tokens":    r[5],
-                "status":          r[6],
-                "source_ip":       None,
-                "created_at":      r[7].isoformat() if r[7] else None,
-                "completed_at":    None,
+                "request_id":       r[0],
+                "org_id":           r[1],
+                "project_id":       r[2],
+                "request_type":     r[3],
+                "model_name":       r[4],
+                "deployment_name":  None,
+                "input_tokens":     r[5],
+                "request_status":   r[6],
+                "status":           r[6],  # backward-compat alias
+                "created_at":       r[7].isoformat() if r[7] else None,
+                "completed_at":     None,
+                "pii_detected":     r[8],
+                "pii_types":        r[9] or [],
+                "pii_action_taken": r[10],
+                "client_ip":        r[11] or r[12],  # client_ip fallback to source_ip
+                "received_at":      r[13].isoformat() if r[13] else (r[7].isoformat() if r[7] else None),
+                "provider":         r[14],
+                "source_system":    r[15],
+                "total_tokens":     r[16],
+                "total_cost":       float(r[17]) if r[17] is not None else None,
+                "prompt_tokens":    r[18],
+                "completion_tokens": r[19],
+                "llm_cost":         float(r[20]) if r[20] is not None else None,
+                "input_cost":       float(r[21]) if r[21] is not None else None,
+                "output_cost":      float(r[22]) if r[22] is not None else None,
             }
             for r in rows
         ],
