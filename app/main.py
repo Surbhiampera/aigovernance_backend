@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse
 from app.config import get_cors_origins
 from app.routers import (
     alerts,
+    alerts_security,
     apikeys,
     audit_logs,
     auth,
@@ -88,6 +89,7 @@ _SAFE_ALTERS = [
     "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS client_ip VARCHAR(50)",
     "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS provider VARCHAR(100)",
     "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS received_at TIMESTAMP DEFAULT NOW()",
+    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS entry_point VARCHAR(100)",
 ]
 
 _ALL_ROUTERS = [
@@ -95,6 +97,7 @@ _ALL_ROUTERS = [
     summary.router,
     models.router,
     alerts.router,
+    alerts_security.router,
     costs.router,
     governance.router,
     governance_keys.router,

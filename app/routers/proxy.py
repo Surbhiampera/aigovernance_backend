@@ -152,6 +152,7 @@ def _store_request(
     pii_types: list = None,
     pii_masked: bool = False,
     pii_action_taken: Optional[str] = None,
+    entry_point: Optional[str] = None,
 ) -> AiRequest:
     row = AiRequest(
         request_id=request_id,
@@ -170,6 +171,7 @@ def _store_request(
         pii_types=pii_types or [],
         pii_masked=pii_masked,
         pii_action_taken=pii_action_taken,
+        entry_point=entry_point,
         created_at=datetime.utcnow(),
     )
     db.add(row)
@@ -825,6 +827,8 @@ async def _run_pre_flight(
     except Exception as _e:
         _log.warning("Max input tokens check skipped: %s", _e)
 
+    entry_point = request.url.path
+
     _store_request(
         db=db,
         request_id=request_id,
@@ -842,6 +846,7 @@ async def _run_pre_flight(
         pii_masked=pii_masked,
         pii_action_taken=pii_action_taken,
         user_agent=user_agent,
+        entry_point=entry_point,
     )
     db.commit()
 
@@ -861,6 +866,7 @@ async def _run_pre_flight(
         user_agent=user_agent,
         url=url,
         azure_hdrs=azure_hdrs,
+        entry_point=entry_point,
     )
 
 
@@ -1145,6 +1151,14 @@ def proxy_stats_overview(
         latency_q = latency_q.filter(AiResponse.org_id == org_id)
     avg_latency = latency_q.scalar() or 0
 
+    pii_q = db.query(func.count(AiRequest.id)).filter(
+        AiRequest.pii_detected == True,
+        func.date(AiRequest.created_at) >= cutoff,
+    )
+    if org_id:
+        pii_q = pii_q.filter(AiRequest.org_id == org_id)
+    pii_detections = pii_q.scalar() or 0
+
     return {
         "total_requests": cost.total_requests or 0,
         "completed": completed,
@@ -1154,6 +1168,7 @@ def proxy_stats_overview(
         "llm_cost": float(cost.llm_cost or 0),
         "total_cost": float(cost.total_cost or 0),
         "avg_latency_ms": round(float(avg_latency), 2),
+        "pii_detections": pii_detections,
     }
 
 
@@ -1234,7 +1249,10 @@ def proxy_stats_pii(
         ORDER BY count DESC
     """), {"cutoff": cutoff, "org_id": org_id} if org_id else {"cutoff": cutoff}).fetchall()
 
+    total_pii = sum(r.count for r in action_rows)
+
     return {
+        "total_pii_requests": total_pii,
         "pii_type_breakdown": [{"pii_type": r.pii_type, "count": r.count} for r in type_rows],
         "action_breakdown": [{"action": r.action, "count": r.count} for r in action_rows],
     }
@@ -1309,7 +1327,8 @@ def list_proxy_requests(
                 f" COALESCE(tu.input_tokens, r.input_token_estimate) AS prompt_tokens,"
                 f" tu.output_tokens AS completion_tokens,"
                 f" rc.llm_cost,"
-                f" rc.input_token_cost, rc.output_token_cost"
+                f" rc.input_token_cost, rc.output_token_cost,"
+                f" r.entry_point"
                 f" FROM ai_requests r"
                 f" LEFT JOIN token_usage tu ON tu.request_id = r.request_id"
                 f" LEFT JOIN request_cost rc ON rc.request_id = r.request_id"
@@ -1352,6 +1371,7 @@ def list_proxy_requests(
                 "llm_cost":         float(r[20]) if r[20] is not None else None,
                 "input_cost":       float(r[21]) if r[21] is not None else None,
                 "output_cost":      float(r[22]) if r[22] is not None else None,
+                "entry_point":      r[23],
             }
             for r in rows
         ],

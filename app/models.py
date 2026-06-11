@@ -640,6 +640,7 @@ class AiRequest(Base):
     received_at = Column(DateTime, server_default=func.now())
     processing_started_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
+    entry_point = Column(String(100), nullable=True)
 
 
 class AiResponse(Base):

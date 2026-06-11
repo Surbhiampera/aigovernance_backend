@@ -1,72 +1,110 @@
-"""PII detection, masking, and policy enforcement for the proxy layer.
+"""PII detection, masking, and policy enforcement using Microsoft Presidio + spaCy NER.
 
-Detects PII in request text, looks up pii_policies for the org to decide
-the action (mask / block / alert / allow), applies masking to the text, and
-returns a structured result the proxy router can act on.
+Detection pipeline:
+  1. Presidio AnalyzerEngine (spaCy en_core_web_lg) — context-aware NER for names,
+     locations, orgs, plus built-in recognizers for email, phone, SSN, credit card,
+     IP address, date-of-birth, passport, medical licence, etc.
+  2. Custom recognizers for Aadhar and generic national-ID formats not covered by
+     Presidio's default set.
+  3. AnonymizerEngine replaces detected spans with type-labelled placeholders
+     (e.g. [EMAIL], [PHONE]) or org-configured masks from pii_policies.
 """
 
-import re
+from __future__ import annotations
+
+import functools
+import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
+from presidio_analyzer import AnalyzerEngine, Pattern, PatternRecognizer
+from presidio_analyzer.nlp_engine import NlpEngineProvider
+from presidio_anonymizer import AnonymizerEngine
+from presidio_anonymizer.entities import OperatorConfig
 from sqlalchemy.orm import Session
 
-# ---------------------------------------------------------------------------
-# Regex patterns per PII type
-# ---------------------------------------------------------------------------
-_PII_PATTERNS: list[tuple[str, re.Pattern]] = [
-    # National ID — highest priority, checked first
-    ("aadhar",      re.compile(r"\b[2-9]\d{3}[\s\-]?\d{4}[\s\-]?\d{4}\b")),
-    ("ssn",         re.compile(r"\b(?!000|666|9\d{2})\d{3}[\s\-]\d{2}[\s\-]\d{4}\b")),
-    ("national_id", re.compile(r"\b[A-Z]{1,2}\d{6,9}[A-Z]?\b")),   # generic passport/ID
-    ("credit_card", re.compile(
-        r"\b(?:4\d{3}|5[1-5]\d{2}|6(?:011|5\d{2})|3[47]\d{2})"
-        r"[\s\-]?\d{4}[\s\-]?\d{4}[\s\-]?\d{4}\b"
-    )),
-    # High risk
-    ("email",       re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")),
-    ("phone",       re.compile(
-        r"(?:\+?\d{1,3}[\s\-]?)?"          # optional country code
-        r"(?:\(?\d{2,4}\)?[\s\-]?)?"       # optional area code
-        r"\d{3,4}[\s\-]?\d{4}"             # local number
-    )),
-    # Medium risk
-    ("ip_address",  re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")),
-    ("date_of_birth", re.compile(
-        r"\b(?:dob|date[\s\-]of[\s\-]birth)[:\s]+\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}\b",
-        re.IGNORECASE
-    )),
-    # Name — broad pattern, applied last to avoid false positives
-    ("name",        re.compile(
-        r"(?:my name is|i am|i'm|name[:\s]+)\s*([A-Z][a-z]+ [A-Z][a-z]+)",
-        re.IGNORECASE
-    )),
-]
+_log = logging.getLogger(__name__)
 
-# Default mask placeholder when no policy is configured
+# ---------------------------------------------------------------------------
+# Presidio entity type → internal PII label
+# ---------------------------------------------------------------------------
+_PRESIDIO_TO_INTERNAL: dict[str, str] = {
+    "EMAIL_ADDRESS":        "email",
+    "PHONE_NUMBER":         "phone",
+    "CREDIT_CARD":          "credit_card",
+    "US_SSN":               "ssn",
+    "IP_ADDRESS":           "ip_address",
+    "DATE_TIME":            "date_of_birth",
+    "PERSON":               "name",
+    "LOCATION":             "location",
+    "NRP":                  "national_id",
+    "US_PASSPORT":          "passport",
+    "US_DRIVER_LICENSE":    "national_id",
+    "MEDICAL_LICENSE":      "national_id",
+    "IBAN_CODE":            "bank_account",
+    "CRYPTO":               "crypto",
+    "AADHAR":               "aadhar",
+    "NATIONAL_ID":          "national_id",
+}
+
 _DEFAULT_MASKS: dict[str, str] = {
-    "aadhar":        "[AADHAR]",
-    "ssn":           "[SSN]",
-    "national_id":   "[NATIONAL_ID]",
-    "credit_card":   "[CREDIT_CARD]",
     "email":         "[EMAIL]",
     "phone":         "[PHONE]",
+    "credit_card":   "[CREDIT_CARD]",
+    "ssn":           "[SSN]",
     "ip_address":    "[IP_ADDRESS]",
     "date_of_birth": "[DOB]",
     "name":          "[NAME]",
+    "location":      "[LOCATION]",
+    "national_id":   "[NATIONAL_ID]",
+    "passport":      "[PASSPORT]",
+    "bank_account":  "[BANK_ACCOUNT]",
+    "crypto":        "[CRYPTO]",
+    "aadhar":        "[AADHAR]",
 }
 
 
 # ---------------------------------------------------------------------------
-# Result dataclass
+# Custom recognizers for types not in Presidio's default set
+# ---------------------------------------------------------------------------
+_aadhar_recognizer = PatternRecognizer(
+    supported_entity="AADHAR",
+    patterns=[Pattern("AADHAR", r"\b[2-9]\d{3}[\s\-]?\d{4}[\s\-]?\d{4}\b", 0.85)],
+)
+
+_national_id_recognizer = PatternRecognizer(
+    supported_entity="NATIONAL_ID",
+    patterns=[Pattern("NATIONAL_ID", r"\b[A-Z]{1,2}\d{6,9}[A-Z]?\b", 0.6)],
+)
+
+
+# ---------------------------------------------------------------------------
+# Lazy-initialised engines — loaded once, reused across all requests
+# ---------------------------------------------------------------------------
+@functools.lru_cache(maxsize=1)
+def _get_engines() -> tuple[AnalyzerEngine, AnonymizerEngine]:
+    provider = NlpEngineProvider(nlp_configuration={
+        "nlp_engine_name": "spacy",
+        "models": [{"lang_code": "en", "model_name": "en_core_web_lg"}],
+    })
+    nlp_engine = provider.create_engine()
+
+    analyzer = AnalyzerEngine(nlp_engine=nlp_engine, supported_languages=["en"])
+    analyzer.registry.add_recognizer(_aadhar_recognizer)
+    analyzer.registry.add_recognizer(_national_id_recognizer)
+
+    anonymizer = AnonymizerEngine()
+    return analyzer, anonymizer
+
+
+# ---------------------------------------------------------------------------
+# Result dataclass  (unchanged public interface)
 # ---------------------------------------------------------------------------
 @dataclass
 class PiiScanResult:
     detections: list[dict] = field(default_factory=list)
-    # [{pii_type, risk_level, action, count, matches_preview}]
-
-    sanitized_text: str = ""       # text after masking (same as input if no masking)
-    action_taken: str = "allow"    # final action: allow | mask | block | alert
+    sanitized_text: str = ""
+    action_taken: str = "allow"
     should_block: bool = False
     pii_detected: bool = False
     pii_types: list[str] = field(default_factory=list)
@@ -78,7 +116,6 @@ class PiiScanResult:
 # Policy loader
 # ---------------------------------------------------------------------------
 def _load_policies(db: Session, org_id: str) -> dict[str, dict]:
-    """Return {pii_type: policy_row} for the org, falling back to global defaults."""
     from app.models import PiiPolicy
 
     rows = (
@@ -91,7 +128,6 @@ def _load_policies(db: Session, org_id: str) -> dict[str, dict]:
         .all()
     )
 
-    # org-specific rows override global ones for the same pii_type
     policies: dict[str, dict] = {}
     for row in rows:
         if row.pii_type not in policies or row.org_id == org_id:
@@ -105,7 +141,7 @@ def _load_policies(db: Session, org_id: str) -> dict[str, dict]:
 
 
 # ---------------------------------------------------------------------------
-# Core scan function
+# Core scan function  (same signature as before — drop-in replacement)
 # ---------------------------------------------------------------------------
 def scan_and_mask(
     text: str,
@@ -114,7 +150,6 @@ def scan_and_mask(
     policies: Optional[dict[str, dict]] = None,
     project_id: Optional[str] = None,
 ) -> PiiScanResult:
-    """Detect PII in *text*, apply policy actions, return PiiScanResult."""
     if not text:
         return PiiScanResult(sanitized_text=text or "")
 
@@ -123,16 +158,33 @@ def scan_and_mask(
     if policies is None:
         policies = {}
 
+    try:
+        analyzer, anonymizer = _get_engines()
+    except Exception as e:
+        _log.error("Presidio engine init failed: %s", e)
+        return PiiScanResult(sanitized_text=text)
+
+    # --- Analyze -----------------------------------------------------------
+    try:
+        analyzer_results = analyzer.analyze(text=text, language="en")
+    except Exception as e:
+        _log.warning("Presidio analyze failed: %s", e)
+        return PiiScanResult(sanitized_text=text)
+
+    if not analyzer_results:
+        return PiiScanResult(sanitized_text=text)
+
+    # --- Group by internal type, apply policies ----------------------------
     result = PiiScanResult(sanitized_text=text)
-    masked_text = text
     final_action = "allow"
     should_block = False
 
-    for pii_type, pattern in _PII_PATTERNS:
-        matches = pattern.findall(masked_text)
-        if not matches:
-            continue
+    by_type: dict[str, list] = {}
+    for r in analyzer_results:
+        internal = _PRESIDIO_TO_INTERNAL.get(r.entity_type, r.entity_type.lower())
+        by_type.setdefault(internal, []).append(r)
 
+    for pii_type, spans in by_type.items():
         policy = policies.get(pii_type) or {
             "risk_level":    "medium",
             "action":        "mask",
@@ -141,34 +193,50 @@ def scan_and_mask(
         }
 
         action = policy["action"]
-        mask_str = policy["mask_pattern"].replace("{pii_type}", pii_type.upper())
 
         result.pii_detected = True
-        result.pii_types.append(pii_type)
+        if pii_type not in result.pii_types:
+            result.pii_types.append(pii_type)
 
         if policy.get("log_detection"):
             result.audit_required = True
 
-        detection = {
+        result.detections.append({
             "pii_type":   pii_type,
             "risk_level": policy["risk_level"],
             "action":     action,
-            "count":      len(matches),
-        }
-        result.detections.append(detection)
+            "count":      len(spans),
+        })
 
         if action == "block":
             should_block = True
             final_action = "block"
         elif action == "mask" and not should_block:
-            masked_text = pattern.sub(mask_str, masked_text)
-            result.pii_masked = True
             if final_action != "block":
                 final_action = "mask"
         elif action == "alert" and final_action not in ("block", "mask"):
             final_action = "alert"
 
-    result.sanitized_text = masked_text
+    # --- Anonymize in one pass via Presidio AnonymizerEngine ---------------
+    if final_action == "mask" and not should_block:
+        operators: dict[str, OperatorConfig] = {}
+        for r in analyzer_results:
+            internal = _PRESIDIO_TO_INTERNAL.get(r.entity_type, r.entity_type.lower())
+            mask_str = (policies.get(internal) or {}).get("mask_pattern") or _DEFAULT_MASKS.get(internal, f"[{internal.upper()}]")
+            operators[r.entity_type] = OperatorConfig("replace", {"new_value": mask_str})
+
+        try:
+            anonymized = anonymizer.anonymize(
+                text=text,
+                analyzer_results=analyzer_results,
+                operators=operators,
+            )
+            result.sanitized_text = anonymized.text
+            result.pii_masked = True
+        except Exception as e:
+            _log.warning("Presidio anonymize failed: %s", e)
+            result.sanitized_text = text
+
     result.action_taken = final_action
     result.should_block = should_block
     return result
