@@ -63,10 +63,10 @@ def _rebuild_daily_summary(*, db: Session, summary_date: date) -> int:
                 func.extract("epoch", AiRequest.completed_at - AiRequest.created_at) * 1000
             ).label("avg_latency_ms"),
             func.sum(
-                func.cast(AiRequest.status == "success", func.Integer())
+                func.cast(AiRequest.request_status == "success", func.Integer())
             ).label("success_count"),
             func.sum(
-                func.cast(AiRequest.status != "success", func.Integer())
+                func.cast(AiRequest.request_status != "success", func.Integer())
             ).label("failure_count"),
         )
         .filter(func.date(AiRequest.created_at) == summary_date)

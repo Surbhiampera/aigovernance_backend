@@ -22,6 +22,7 @@ from app.routers import (
     projects,
     summary,
 )
+from app.routers.rate_limits import router as rate_limits_router
 from app.routers.deployments import router as deployments_router
 from app.routers.proxy import router as proxy_router
 
@@ -129,6 +130,7 @@ _ALL_ROUTERS = [
     apikeys.router,
     lookups.router,
     audit_logs.router,
+    rate_limits_router,
 ]
 
 

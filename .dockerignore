@@ -3,6 +3,9 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.egg-info/
+dist/
+build/
 
 # Virtual environments
 venv/
@@ -13,22 +16,35 @@ venv/
 .git/
 .gitignore
 
-# IDE files
+# IDE / editor
 .vscode/
 .idea/
+*.code-workspace
 
 # Logs
 *.log
 
-# Test files
+# Tests
 tests/
+test_*.py
+pytest.ini
+.pytest_cache/
 
-# Environment files
+# Environment files — never bake secrets into the image
 .env
+.env.*
 
-# Docker
-Dockerfile
-docker-compose.yml
+# Docs and dev-only files
+*.md
+API_REFERENCE.md
+PROXY_USAGE.md
+schema*.sql
 
 # OS files
 .DS_Store
+Thumbs.db
+
+# Claude / local tooling
+.claude/
+claude/
+CLAUDE.md

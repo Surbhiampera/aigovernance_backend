@@ -586,4 +586,28 @@ class ModelPricingResponse(BaseModel):
     effective_from: Optional[datetime] = None
 
 
+class BudgetUtilizationResponse(BaseModel):
+    org_id: str
+    project_id: Optional[str] = None
+    budget_type: Optional[str] = None
+    limit_amount: Optional[float] = None
+    current_spend: float
+    alert_threshold_percent: int
+    utilization_percent: float
+    status: str  # "ok" | "warning" | "exceeded" | "no_budget"
+
+
+class RateLimitResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    org_id: Optional[str] = None
+    project_id: Optional[str] = None
+    key_id: Optional[str] = None
+    tool_name: Optional[str] = None
+    max_requests_per_min: Optional[int] = None
+    max_tokens_per_day: Optional[int] = None
+    created_at: Optional[datetime] = None
+
+
 TraceDetailResponse.model_rebuild()
