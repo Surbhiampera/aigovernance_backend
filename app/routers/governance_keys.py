@@ -15,6 +15,7 @@ from app.services.governance_key_service import (
     create_governance_key,
     list_governance_keys,
     revoke_governance_key,
+    rotate_governance_key,
 )
 
 router = APIRouter(prefix="/governance-keys", tags=["governance-keys"])
@@ -59,6 +60,16 @@ def create_key(data: GovernanceKeyCreate, db: Session = Depends(get_db)):
 def list_keys(org_id: str = Query(...), db: Session = Depends(get_db)):
     """List all governance keys for an organisation (raw keys not included)."""
     return list_governance_keys(db, org_id=org_id)
+
+
+@router.post("/{key_id}/rotate")
+def rotate_key(key_id: str, db: Session = Depends(get_db)):
+    """Regenerate the secret for an existing key. New raw key is returned once — store it securely."""
+    result = rotate_governance_key(db, key_id=key_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Governance key not found.")
+    db.commit()
+    return result
 
 
 @router.delete("/{key_id}")

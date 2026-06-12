@@ -111,6 +111,31 @@ def revoke_governance_key(db: Session, key_id: str) -> bool:
     return True
 
 
+def rotate_governance_key(db: Session, key_id: str) -> Optional[dict]:
+    """Replace the secret for an existing key (active or revoked). Returns new raw key once."""
+    from app.models import ApiKey
+
+    row = db.query(ApiKey).filter(ApiKey.id == key_id, ApiKey.is_proxy_key == True).first()
+    if row is None:
+        return None
+
+    raw = _generate_raw_key()
+    row.hashed_key = _hash_key(raw)
+    row.raw_key_hint = _hint(raw)
+    row.is_active = True
+    db.flush()
+
+    return {
+        "key_id":       row.id,
+        "raw_key":      raw,
+        "raw_key_hint": row.raw_key_hint,
+        "org_id":       row.org_id,
+        "project_id":   row.project_id,
+        "key_name":     row.key_name,
+        "rotated_at":   datetime.utcnow().isoformat(),
+    }
+
+
 def list_governance_keys(db: Session, org_id: str) -> list[dict]:
     from app.models import ApiKey
 

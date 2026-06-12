@@ -567,6 +567,24 @@ Create a new governance key. **Raw key is returned once — store it immediately
 }
 ```
 
+### `POST /governance-keys/{key_id}/rotate`
+
+Regenerate the secret for an existing governance key. Use this when a team has lost their key. Works on both active and revoked keys (reactivates a revoked key). **New raw key is returned once — store it immediately.**
+
+**Response**
+
+```json
+{
+  "key_id": "gk-...",
+  "raw_key": "gov-xxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "raw_key_hint": "gov-...xyz4",
+  "org_id": "reckit_1780983190087",
+  "project_id": "reckit_marketplace_1780983215793",
+  "key_name": "team-alpha-key",
+  "rotated_at": "2026-06-12T10:00:00.000000"
+}
+```
+
 ### `DELETE /governance-keys/{key_id}`
 
 Revoke (deactivate) a governance key.
@@ -808,6 +826,7 @@ Logout the current session.
 | `DELETE` | `/budgets/{id}`                 | Delete budget                   |
 | `GET`    | `/governance-keys/`             | List governance keys            |
 | `POST`   | `/governance-keys/`             | Create governance key           |
+| `POST`   | `/governance-keys/{id}/rotate`  | Rotate (reset) governance key   |
 | `DELETE` | `/governance-keys/{id}`         | Revoke governance key           |
 | `GET`    | `/api-keys/`                    | List API keys                   |
 | `POST`   | `/api-keys/`                    | Create API key                  |

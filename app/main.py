@@ -90,6 +90,27 @@ _SAFE_ALTERS = [
     "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS provider VARCHAR(100)",
     "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS received_at TIMESTAMP DEFAULT NOW()",
     "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS entry_point VARCHAR(100)",
+    # PII severity and entity counts for per-request detail view
+    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS pii_severity VARCHAR(10)",
+    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS pii_entities_detected INTEGER DEFAULT 0",
+    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS pii_entities_masked INTEGER DEFAULT 0",
+    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS pii_detail JSONB",
+    # Backfill severity + entity count for existing rows using stored pii_types JSONB.
+    # WHERE pii_severity IS NULL ensures this is a no-op on every subsequent startup.
+    (
+        "UPDATE ai_requests SET"
+        "  pii_entities_detected = COALESCE(jsonb_array_length(pii_types::jsonb), 0),"
+        "  pii_severity = CASE"
+        "    WHEN pii_types::jsonb ?| ARRAY['aadhar','credit_card','passport','ssn','bank_account','national_id'] THEN 'high'"
+        "    WHEN jsonb_array_length(pii_types::jsonb) >= 5 THEN 'high'"
+        "    WHEN jsonb_array_length(pii_types::jsonb) >= 3 THEN 'medium'"
+        "    WHEN jsonb_array_length(pii_types::jsonb) >= 1 THEN 'low'"
+        "    ELSE NULL"
+        "  END"
+        " WHERE pii_detected = TRUE"
+        "   AND pii_severity IS NULL"
+        "   AND pii_types IS NOT NULL"
+    ),
 ]
 
 _ALL_ROUTERS = [

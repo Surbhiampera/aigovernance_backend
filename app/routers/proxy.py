@@ -43,7 +43,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_db
-from app.models import AiRequest, AiResponse, RequestCost, TokenUsage
+from app.models import AiRequest, AiResponse, RequestCost, RouteExecution, TokenUsage
 from app.services.audit_service import log_event
 from app.services.budget_service import check_budget
 from app.services.deployment_service import build_provider_request, get_deployment_for_org
@@ -66,6 +66,40 @@ def _new_request_id() -> str:
 
 def _new_response_id() -> str:
     return f"resp-{uuid.uuid4().hex[:20]}"
+
+
+def _new_execution_id() -> str:
+    return f"exec-{uuid.uuid4().hex[:20]}"
+
+
+def _store_route_execution(
+    *,
+    db: Session,
+    ctx: dict,
+    upstream_ms: int,
+    total_ms: int,
+    status: str,
+) -> None:
+    routing_ms = ctx.get("routing_ms", 0)
+    governance_ms = ctx.get("governance_ms", 0)
+    proxy_ms = max(total_ms - routing_ms - governance_ms - upstream_ms, 0)
+    db.add(RouteExecution(
+        execution_id=_new_execution_id(),
+        request_id=ctx["request_id"],
+        org_id=ctx["org_id"],
+        project_id=ctx.get("project_id"),
+        execution_status=status,
+        selected_model=ctx["model"],
+        selected_provider=ctx.get("provider", ""),
+        upstream_url=ctx.get("url", ""),
+        total_latency_ms=total_ms,
+        routing_latency_ms=routing_ms,
+        proxy_latency_ms=proxy_ms,
+        upstream_latency_ms=upstream_ms,
+        governance_check_ms=governance_ms,
+        started_at=datetime.utcfromtimestamp(ctx["t_request_start"]),
+        completed_at=datetime.utcnow(),
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -94,11 +128,11 @@ def _scan_messages(
     project_id: Optional[str],
     db: Session,
 ):
-    """Return (sanitised_messages, pii_detected, pii_types, pii_masked, pii_action_taken)."""
-    from app.services.pii_engine import PiiScanResult
+    """Return (sanitised_messages, combined_pii_result)."""
+    from app.services.pii_engine import PiiScanResult, compute_pii_severity
     sanitised: list[dict] = []
     combined = PiiScanResult(sanitized_text="")
-    for msg in messages:
+    for idx, msg in enumerate(messages):
         content = msg.get("content", "")
         if not isinstance(content, str):
             sanitised.append(msg)
@@ -126,7 +160,16 @@ def _scan_messages(
             )
         if result.action_taken == "mask":
             combined.action_taken = "mask"
+        for entity in result.entity_details:
+            combined.entity_details.append({
+                **entity,
+                "message_index": idx,
+                "role": msg.get("role", "user"),
+            })
+        combined.entities_detected += result.entities_detected
+        combined.entities_masked += result.entities_masked
         sanitised.append({**msg, "content": result.sanitized_text})
+    combined.severity = compute_pii_severity(combined.pii_types, combined.entities_detected)
     return sanitised, combined
 
 
@@ -152,6 +195,10 @@ def _store_request(
     pii_types: list = None,
     pii_masked: bool = False,
     pii_action_taken: Optional[str] = None,
+    pii_severity: str = "",
+    pii_entities_detected: int = 0,
+    pii_entities_masked: int = 0,
+    pii_detail: Optional[list] = None,
     entry_point: Optional[str] = None,
 ) -> AiRequest:
     row = AiRequest(
@@ -171,6 +218,10 @@ def _store_request(
         pii_types=pii_types or [],
         pii_masked=pii_masked,
         pii_action_taken=pii_action_taken,
+        pii_severity=pii_severity or None,
+        pii_entities_detected=pii_entities_detected,
+        pii_entities_masked=pii_entities_masked,
+        pii_detail=pii_detail,
         entry_point=entry_point,
         created_at=datetime.utcnow(),
     )
@@ -577,6 +628,7 @@ async def _stream_azure(
     user_agent: Optional[str],
     db: Session,
     t_start: float,
+    ctx: Optional[dict] = None,
 ) -> AsyncIterator[bytes]:
     chunks_raw: list[str] = []
     finish_reason: Optional[str] = None
@@ -617,35 +669,45 @@ async def _stream_azure(
                 key_id=key_id, source_ip=source_ip, user_agent=user_agent,
                 detail=f"Azure stream 429 rate limit: {exc}",
             )
+            if ctx:
+                _store_route_execution(db=db, ctx=ctx, upstream_ms=int((time.time() - t_start) * 1000), total_ms=int((time.time() - ctx["t_request_start"]) * 1000), status="failed")
         else:
             # Use Azure's error body usage if available (e.g. content filter mid-stream),
             # otherwise use tiktoken on received chunks for input and partial output.
             azure_input, _ = _azure_usage_from_error(exc)
             billed_input = azure_input if azure_input > 0 else input_tokens
             in_src = "azure" if azure_input > 0 else "tiktoken_estimate"
+            _err_upstream_ms = int((time.time() - t_start) * 1000)
             _mark_request_failed_with_cost(
                 db=db, request_id=request_id, org_id=org_id, project_id=project_id,
                 key_id=key_id, model=model, deployment=deployment,
                 input_tokens=billed_input, output_tokens=partial_output_tokens,
-                latency_ms=int((time.time() - t_start) * 1000),
+                latency_ms=_err_upstream_ms,
                 source_ip=source_ip, user_agent=user_agent,
                 detail=f"Azure stream error {status_code} after {len(chunks_raw)} chunks: {exc}",
                 input_token_source=in_src,
                 output_token_source="tiktoken_estimate",
             )
+            if ctx:
+                _store_route_execution(db=db, ctx=ctx, upstream_ms=_err_upstream_ms, total_ms=int((time.time() - ctx["t_request_start"]) * 1000), status="failed")
+        db.commit()
         return
     except httpx.RequestError as exc:
         yield f"data: {json.dumps({'error': f'Azure unreachable: {exc}'})}\n\n".encode()
+        _err_upstream_ms = int((time.time() - t_start) * 1000)
         _mark_request_failed_with_cost(
             db=db, request_id=request_id, org_id=org_id, project_id=project_id,
             key_id=key_id, model=model, deployment=deployment,
             input_tokens=input_tokens, output_tokens=0,
-            latency_ms=int((time.time() - t_start) * 1000),
+            latency_ms=_err_upstream_ms,
             source_ip=source_ip, user_agent=user_agent,
             detail=f"Azure stream unreachable (timeout/connection): {exc}",
             input_token_source="tiktoken_estimate",
             output_token_source="tiktoken_estimate",
         )
+        if ctx:
+            _store_route_execution(db=db, ctx=ctx, upstream_ms=_err_upstream_ms, total_ms=int((time.time() - ctx["t_request_start"]) * 1000), status="failed")
+        db.commit()
         return
 
     latency_ms = int((time.time() - t_start) * 1000)
@@ -672,6 +734,9 @@ async def _stream_azure(
             input_token_source="tiktoken_estimate",
             output_token_source="tiktoken_estimate",
         )
+        if ctx:
+            _store_route_execution(db=db, ctx=ctx, upstream_ms=latency_ms, total_ms=int((time.time() - ctx["t_request_start"]) * 1000), status="partial")
+        db.commit()
         return
 
     _store_response_and_cost(
@@ -702,6 +767,8 @@ async def _stream_azure(
         source_ip=source_ip,
         user_agent=user_agent,
     )
+    if ctx:
+        _store_route_execution(db=db, ctx=ctx, upstream_ms=latency_ms, total_ms=int((time.time() - ctx["t_request_start"]) * 1000), status="success")
     db.commit()
 
 
@@ -721,6 +788,8 @@ async def _run_pre_flight(
     Returns a context dict consumed by both proxy endpoints.
     Raises HTTPException on any enforcement failure.
     """
+    t_request_start = time.time()
+
     identity = _authenticate(db=db, raw_key=x_governance_key)
     org_id: str = identity["org_id"]
     project_id: Optional[str] = identity["project_id"]
@@ -761,6 +830,7 @@ async def _run_pre_flight(
 
     model: str = depl.model_name
     deployment: str = depl.deployment_name or depl.model_name
+    t_routing_done = time.time()
 
     try:
         check_budget(
@@ -789,6 +859,10 @@ async def _run_pre_flight(
     pii_types: list = []
     pii_masked = False
     pii_action_taken: Optional[str] = None
+    pii_severity: str = ""
+    pii_entities_detected: int = 0
+    pii_entities_masked: int = 0
+    pii_detail: Optional[list] = None
     try:
         clean_messages, pii_result = _scan_messages(
             messages=messages, org_id=org_id, project_id=project_id, db=db,
@@ -797,6 +871,10 @@ async def _run_pre_flight(
         pii_types = pii_result.pii_types
         pii_masked = pii_result.pii_masked
         pii_action_taken = pii_result.action_taken if pii_result.pii_detected else None
+        pii_severity = pii_result.severity
+        pii_entities_detected = pii_result.entities_detected
+        pii_entities_masked = pii_result.entities_masked
+        pii_detail = pii_result.entity_details if pii_result.entity_details else None
     except HTTPException:
         raise
     except Exception as _e:
@@ -827,6 +905,7 @@ async def _run_pre_flight(
     except Exception as _e:
         _log.warning("Max input tokens check skipped: %s", _e)
 
+    t_governance_done = time.time()
     entry_point = request.url.path
 
     _store_request(
@@ -845,6 +924,10 @@ async def _run_pre_flight(
         pii_types=pii_types,
         pii_masked=pii_masked,
         pii_action_taken=pii_action_taken,
+        pii_severity=pii_severity,
+        pii_entities_detected=pii_entities_detected,
+        pii_entities_masked=pii_entities_masked,
+        pii_detail=pii_detail,
         user_agent=user_agent,
         entry_point=entry_point,
     )
@@ -867,6 +950,9 @@ async def _run_pre_flight(
         url=url,
         azure_hdrs=azure_hdrs,
         entry_point=entry_point,
+        t_request_start=t_request_start,
+        routing_ms=int((t_routing_done - t_request_start) * 1000),
+        governance_ms=int((t_governance_done - t_routing_done) * 1000),
     )
 
 
@@ -922,6 +1008,9 @@ async def proxy_chat(
             azure_detail = exc.response.json()
         except Exception:
             azure_detail = exc.response.text or str(exc)
+        _err_upstream_ms = int((time.time() - t_start) * 1000)
+        _store_route_execution(db=db, ctx=ctx, upstream_ms=_err_upstream_ms, total_ms=int((time.time() - ctx["t_request_start"]) * 1000), status="failed")
+        db.commit()
         raise HTTPException(status_code=status_code, detail=azure_detail)
     except httpx.RequestError as exc:
         _mark_request_failed_with_cost(
@@ -934,6 +1023,9 @@ async def proxy_chat(
             detail=f"Azure unreachable: {exc}",
             input_token_source="tiktoken_estimate", output_token_source="tiktoken_estimate",
         )
+        _err_upstream_ms = int((time.time() - t_start) * 1000)
+        _store_route_execution(db=db, ctx=ctx, upstream_ms=_err_upstream_ms, total_ms=int((time.time() - ctx["t_request_start"]) * 1000), status="failed")
+        db.commit()
         raise HTTPException(status_code=502, detail=f"Azure OpenAI unreachable: {exc}")
 
     latency_ms = int((time.time() - t_start) * 1000)
@@ -990,6 +1082,8 @@ async def proxy_chat(
         source_ip=ctx["source_ip"],
         user_agent=ctx["user_agent"],
     )
+    total_ms = int((time.time() - ctx["t_request_start"]) * 1000)
+    _store_route_execution(db=db, ctx=ctx, upstream_ms=latency_ms, total_ms=total_ms, status="success")
     db.commit()
 
     return JSONResponse(
@@ -1048,6 +1142,7 @@ async def proxy_chat_stream(
             user_agent=ctx["user_agent"],
             db=db,
             t_start=t_start,
+            ctx=ctx,
         ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Request-Id": ctx["request_id"]},
@@ -1271,6 +1366,8 @@ def list_proxy_requests(
     request_type: Optional[str] = None,
     status: Optional[str] = None,
     pii_only: Optional[bool] = None,
+    pii_severity: Optional[str] = None,
+    pii_action_taken: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
     db: Session = Depends(get_db),
@@ -1307,6 +1404,14 @@ def list_proxy_requests(
     if pii_only:
         filters.append("r.pii_detected = TRUE")
         count_filters.append("pii_detected = TRUE")
+    if pii_severity:
+        filters.append("r.pii_severity = :pii_severity")
+        count_filters.append("pii_severity = :pii_severity")
+        params["pii_severity"] = pii_severity
+    if pii_action_taken:
+        filters.append("r.pii_action_taken = :pii_action_taken")
+        count_filters.append("pii_action_taken = :pii_action_taken")
+        params["pii_action_taken"] = pii_action_taken
 
     where = ("WHERE " + " AND ".join(filters)) if filters else ""
     count_where = ("WHERE " + " AND ".join(count_filters)) if count_filters else ""
@@ -1328,7 +1433,8 @@ def list_proxy_requests(
                 f" tu.output_tokens AS completion_tokens,"
                 f" rc.llm_cost,"
                 f" rc.input_token_cost, rc.output_token_cost,"
-                f" r.entry_point"
+                f" r.entry_point,"
+                f" r.pii_severity, r.pii_entities_detected, r.pii_entities_masked"
                 f" FROM ai_requests r"
                 f" LEFT JOIN token_usage tu ON tu.request_id = r.request_id"
                 f" LEFT JOIN request_cost rc ON rc.request_id = r.request_id"
@@ -1371,8 +1477,58 @@ def list_proxy_requests(
                 "llm_cost":         float(r[20]) if r[20] is not None else None,
                 "input_cost":       float(r[21]) if r[21] is not None else None,
                 "output_cost":      float(r[22]) if r[22] is not None else None,
-                "entry_point":      r[23],
+                "entry_point":           r[23],
+                "pii_severity":          r[24],
+                "pii_entities_detected": r[25] or 0,
+                "pii_entities_masked":   r[26] or 0,
             }
             for r in rows
         ],
+    }
+
+
+@router.get("/v1/requests/{request_id}/pii-detail")
+def get_request_pii_detail(
+    request_id: str,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Return full PII entity detail for a single request, including before/after values."""
+    from sqlalchemy import text as _text
+
+    try:
+        row = db.execute(
+            _text(
+                "SELECT r.request_id, r.org_id, r.project_id,"
+                " r.pii_detected, r.pii_types, r.pii_action_taken,"
+                " r.pii_severity, r.pii_entities_detected, r.pii_entities_masked,"
+                " r.pii_detail, r.request_payload, r.created_at,"
+                " resp.response_text, resp.output_pii_types"
+                " FROM ai_requests r"
+                " LEFT JOIN ai_responses resp ON resp.request_id = r.request_id"
+                " WHERE r.request_id = :request_id"
+            ),
+            {"request_id": request_id},
+        ).fetchone()
+    except Exception as exc:
+        _log.warning("pii_detail query failed for %s: %s", request_id, exc)
+        raise HTTPException(status_code=500, detail="Query failed.")
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Request not found.")
+
+    return {
+        "request_id":            row[0],
+        "org_id":                row[1],
+        "project_id":            row[2],
+        "pii_detected":          row[3],
+        "pii_types":             row[4] or [],
+        "pii_action_taken":      row[5],
+        "pii_severity":          row[6],
+        "pii_entities_detected": row[7] or 0,
+        "pii_entities_masked":   row[8] or 0,
+        "pii_detail":            row[9] or [],
+        "request_payload":       row[10],
+        "created_at":            row[11].isoformat() if row[11] else None,
+        "response_text":         row[12],
+        "output_pii_types":      row[13] or [],
     }

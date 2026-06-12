@@ -63,6 +63,22 @@ _DEFAULT_MASKS: dict[str, str] = {
     "aadhar":        "[AADHAR]",
 }
 
+# Types that elevate severity to High regardless of entity count (includes national_id for PAN)
+_HIGH_SENSITIVITY: frozenset[str] = frozenset({
+    "aadhar", "credit_card", "passport", "ssn", "bank_account", "national_id"
+})
+
+
+def compute_pii_severity(pii_types: list[str], total_count: int) -> str:
+    """Return 'high'/'medium'/'low'/'' based on entity count and type."""
+    if not total_count:
+        return ""
+    if total_count >= 5 or any(t in _HIGH_SENSITIVITY for t in pii_types):
+        return "high"
+    if total_count >= 3:
+        return "medium"
+    return "low"
+
 
 # ---------------------------------------------------------------------------
 # Custom recognizers for types not in Presidio's default set
@@ -98,7 +114,7 @@ def _get_engines() -> tuple[AnalyzerEngine, AnonymizerEngine]:
 
 
 # ---------------------------------------------------------------------------
-# Result dataclass  (unchanged public interface)
+# Result dataclass
 # ---------------------------------------------------------------------------
 @dataclass
 class PiiScanResult:
@@ -110,6 +126,14 @@ class PiiScanResult:
     pii_types: list[str] = field(default_factory=list)
     pii_masked: bool = False
     audit_required: bool = False
+    # Aggregate counts and severity (populated by scan_and_mask)
+    entities_detected: int = 0
+    entities_masked: int = 0
+    severity: str = ""          # "low" | "medium" | "high" | ""
+    entity_details: list[dict] = field(default_factory=list)  # [{pii_type, original_value, masked_as, risk_level}]
+
+
+_RISK_ORDER: dict[str, int] = {"low": 1, "medium": 2, "high": 3}
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +208,8 @@ def scan_and_mask(
         internal = _PRESIDIO_TO_INTERNAL.get(r.entity_type, r.entity_type.lower())
         by_type.setdefault(internal, []).append(r)
 
+    # Resolve policy per type once; reused for detections summary and entity detail
+    resolved_policies: dict[str, dict] = {}
     for pii_type, spans in by_type.items():
         policy = policies.get(pii_type) or {
             "risk_level":    "medium",
@@ -191,6 +217,7 @@ def scan_and_mask(
             "mask_pattern":  _DEFAULT_MASKS.get(pii_type, f"[{pii_type.upper()}]"),
             "log_detection": True,
         }
+        resolved_policies[pii_type] = policy
 
         action = policy["action"]
 
@@ -217,6 +244,24 @@ def scan_and_mask(
         elif action == "alert" and final_action not in ("block", "mask"):
             final_action = "alert"
 
+    # --- Build per-span entity detail with original and masked values -------
+    _entity_details: list[dict] = []
+    for r in analyzer_results:
+        internal = _PRESIDIO_TO_INTERNAL.get(r.entity_type, r.entity_type.lower())
+        p = resolved_policies.get(internal, {
+            "risk_level": "medium",
+            "action": "mask",
+            "mask_pattern": _DEFAULT_MASKS.get(internal, f"[{internal.upper()}]"),
+        })
+        _entity_details.append({
+            "pii_type":      internal,
+            "original_value": text[r.start:r.end],
+            "masked_value":  p["mask_pattern"] if p["action"] == "mask" else None,
+            "risk_level":    p["risk_level"],
+            "start":         r.start,
+            "end":           r.end,
+        })
+
     # --- Anonymize in one pass via Presidio AnonymizerEngine ---------------
     if final_action == "mask" and not should_block:
         operators: dict[str, OperatorConfig] = {}
@@ -239,4 +284,11 @@ def scan_and_mask(
 
     result.action_taken = final_action
     result.should_block = should_block
+    result.entity_details = _entity_details
+    result.entities_detected = len(_entity_details)
+    result.entities_masked = (
+        sum(1 for e in _entity_details if e["masked_value"] is not None)
+        if result.pii_masked else 0
+    )
+    result.severity = compute_pii_severity(result.pii_types, result.entities_detected)
     return result

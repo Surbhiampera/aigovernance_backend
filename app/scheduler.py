@@ -16,14 +16,20 @@ _scheduler: BackgroundScheduler | None = None
 
 def _job_daily_aggregation() -> None:
     import datetime
+    import logging
     from app.database import SessionLocal
-    from app.workers.tasks import _rebuild_daily_summary
+    from app.workers.tasks import _detect_daily_anomalies, _rebuild_daily_summary
 
+    _log = logging.getLogger(__name__)
+    today = datetime.date.today()
     db = SessionLocal()
     try:
-        _rebuild_daily_summary(db=db, summary_date=datetime.date.today())
+        _rebuild_daily_summary(db=db, summary_date=today)
+        db.flush()
+        _detect_daily_anomalies(db=db, summary_date=today)
         db.commit()
     except Exception:
+        _log.exception("daily_aggregation job failed")
         db.rollback()
     finally:
         db.close()

@@ -96,6 +96,23 @@ def security_logs(
 
 
 # ---------------------------------------------------------------------------
+# Open anomaly count (dashboard stat)
+# ---------------------------------------------------------------------------
+@router.get("/anomalies/open-count")
+def open_anomaly_count(
+    org_id: Optional[str] = Query(None),
+    project_id: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+) -> dict:
+    q = db.query(func.count(UsageAnomaly.id)).filter(UsageAnomaly.status == "open")
+    if org_id:
+        q = q.filter(UsageAnomaly.org_id == org_id)
+    if project_id:
+        q = q.filter(UsageAnomaly.project_id == project_id)
+    return {"open_anomalies": q.scalar() or 0}
+
+
+# ---------------------------------------------------------------------------
 # Anomalies
 # ---------------------------------------------------------------------------
 @router.get("/anomalies")
@@ -137,6 +154,23 @@ def security_anomalies(
         }
         for r in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# Resolve an anomaly
+# ---------------------------------------------------------------------------
+@router.patch("/anomalies/{anomaly_id}/resolve")
+def resolve_anomaly(
+    anomaly_id: int,
+    db: Session = Depends(get_db),
+) -> dict:
+    from fastapi import HTTPException
+    anomaly = db.query(UsageAnomaly).filter(UsageAnomaly.id == anomaly_id).first()
+    if not anomaly:
+        raise HTTPException(status_code=404, detail="Anomaly not found")
+    anomaly.status = "resolved"
+    db.commit()
+    return {"id": anomaly_id, "status": "resolved"}
 
 
 # ---------------------------------------------------------------------------
