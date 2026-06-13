@@ -1,0 +1,871 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>AI Governance Proxy — Request Walkthrough</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --border: #2a2d3e;
+    --accent: #6366f1;
+    --accent2: #22d3ee;
+    --success: #4ade80;
+    --warn: #fbbf24;
+    --danger: #f87171;
+    --text: #e2e8f0;
+    --muted: #64748b;
+    --client: #818cf8;
+    --proxy: #6366f1;
+    --db: #34d399;
+    --llm: #f472b6;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Inter', 'Segoe UI', system-ui, sans-serif;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  header {
+    width: 100%;
+    padding: 24px 40px 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+
+  .logo {
+    width: 36px; height: 36px;
+    background: var(--accent);
+    border-radius: 8px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 18px; font-weight: 700; color: #fff;
+  }
+
+  header h1 { font-size: 18px; font-weight: 600; }
+  header p { font-size: 13px; color: var(--muted); margin-top: 2px; }
+
+  .stage-counter {
+    margin-left: auto;
+    font-size: 13px;
+    color: var(--muted);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    padding: 4px 14px;
+  }
+
+  .stage-counter span { color: var(--accent2); font-weight: 600; }
+
+  /* ── MAIN LAYOUT ── */
+  .main {
+    width: 100%;
+    max-width: 1200px;
+    padding: 32px 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 28px;
+  }
+
+  /* ── PIPELINE TRACK ── */
+  .pipeline {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    overflow-x: auto;
+    padding: 8px 0;
+  }
+
+  .pipe-node {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+    width: 90px;
+    opacity: 0.25;
+    transition: opacity 0.4s, transform 0.3s;
+  }
+
+  .pipe-node.active { opacity: 1; transform: scale(1.08); }
+  .pipe-node.done { opacity: 0.7; }
+
+  .pipe-icon {
+    width: 44px; height: 44px;
+    border-radius: 12px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 20px;
+    border: 2px solid transparent;
+    background: var(--surface);
+    transition: border-color 0.4s, background 0.4s, box-shadow 0.4s;
+  }
+
+  .pipe-node.active .pipe-icon {
+    border-color: var(--accent2);
+    box-shadow: 0 0 18px rgba(34,211,238,0.35);
+    background: #1e2a3a;
+  }
+
+  .pipe-node.done .pipe-icon {
+    border-color: var(--success);
+    background: #1a2e24;
+  }
+
+  .pipe-node.blocked .pipe-icon {
+    border-color: var(--danger);
+    background: #2e1a1a;
+    box-shadow: 0 0 14px rgba(248,113,113,0.3);
+  }
+
+  .pipe-label {
+    font-size: 10px;
+    text-align: center;
+    color: var(--muted);
+    line-height: 1.3;
+  }
+
+  .pipe-node.active .pipe-label { color: var(--text); }
+  .pipe-node.done .pipe-label { color: var(--success); }
+
+  .pipe-arrow {
+    flex-shrink: 0;
+    width: 28px;
+    height: 2px;
+    background: var(--border);
+    position: relative;
+    margin-bottom: 20px;
+    transition: background 0.4s;
+  }
+
+  .pipe-arrow.lit { background: var(--accent2); }
+
+  .pipe-arrow::after {
+    content: '';
+    position: absolute;
+    right: -6px; top: -4px;
+    border-left: 7px solid var(--border);
+    border-top: 5px solid transparent;
+    border-bottom: 5px solid transparent;
+    transition: border-color 0.4s;
+  }
+
+  .pipe-arrow.lit::after { border-left-color: var(--accent2); }
+
+  /* ── CENTRE STAGE ── */
+  .stage-area {
+    display: grid;
+    grid-template-columns: 1fr 320px;
+    gap: 20px;
+  }
+
+  .stage-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 28px 32px;
+    min-height: 280px;
+    position: relative;
+    overflow: hidden;
+    transition: border-color 0.4s;
+  }
+
+  .stage-card.active { border-color: var(--accent2); }
+  .stage-card.blocked { border-color: var(--danger); }
+
+  .stage-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: rgba(99,102,241,0.12);
+    border: 1px solid rgba(99,102,241,0.3);
+    border-radius: 20px;
+    padding: 4px 12px;
+    font-size: 12px;
+    color: var(--accent);
+    font-weight: 500;
+    margin-bottom: 16px;
+  }
+
+  .stage-card h2 { font-size: 22px; font-weight: 700; margin-bottom: 8px; }
+  .stage-card .subtitle { font-size: 14px; color: var(--muted); margin-bottom: 20px; line-height: 1.6; }
+
+  .detail-rows { display: flex; flex-direction: column; gap: 10px; }
+
+  .detail-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    font-size: 13px;
+    opacity: 0;
+    transform: translateY(8px);
+    transition: opacity 0.35s, transform 0.35s;
+  }
+
+  .detail-row.visible { opacity: 1; transform: translateY(0); }
+
+  .detail-row .dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--accent2);
+    margin-top: 5px;
+    flex-shrink: 0;
+  }
+
+  .detail-row .key { color: var(--muted); min-width: 110px; flex-shrink: 0; }
+  .detail-row .val { color: var(--text); }
+  .tag {
+    display: inline-block;
+    padding: 1px 7px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-family: monospace;
+  }
+
+  .tag-green { background: rgba(74,222,128,0.15); color: var(--success); }
+  .tag-blue  { background: rgba(99,102,241,0.15); color: #a5b4fc; }
+  .tag-red   { background: rgba(248,113,113,0.15); color: var(--danger); }
+  .tag-yellow{ background: rgba(251,191,36,0.15); color: var(--warn); }
+  .tag-pink  { background: rgba(244,114,182,0.15); color: #f9a8d4; }
+  .tag-cyan  { background: rgba(34,211,238,0.15); color: var(--accent2); }
+
+  .outcome-banner {
+    margin-top: 20px;
+    padding: 10px 14px;
+    border-radius: 10px;
+    font-size: 13px;
+    display: none;
+  }
+
+  .outcome-banner.show { display: block; }
+  .outcome-success { background: rgba(74,222,128,0.1); border: 1px solid rgba(74,222,128,0.3); color: var(--success); }
+  .outcome-block   { background: rgba(248,113,113,0.1); border: 1px solid rgba(248,113,113,0.3); color: var(--danger); }
+  .outcome-warn    { background: rgba(251,191,36,0.1); border: 1px solid rgba(251,191,36,0.3); color: var(--warn); }
+
+  /* ── SIDE PANEL ── */
+  .side-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+
+  .packet-box {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px;
+  }
+
+  .packet-box h3 { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 12px; }
+
+  .packet-line {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 12px;
+    padding: 5px 0;
+    border-bottom: 1px solid var(--border);
+    gap: 8px;
+  }
+
+  .packet-line:last-child { border-bottom: none; }
+  .packet-line .pk { color: var(--muted); font-family: monospace; }
+  .packet-line .pv { color: var(--text); font-family: monospace; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 160px; }
+  .packet-line .pv.hidden { color: var(--border); }
+  .packet-line .pv.highlight { color: var(--accent2); }
+  .packet-line .pv.success { color: var(--success); }
+  .packet-line .pv.danger { color: var(--danger); }
+  .packet-line .pv.warn { color: var(--warn); }
+
+  .log-box {
+    background: #0a0c10;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 14px;
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    font-size: 11px;
+    line-height: 1.7;
+    max-height: 160px;
+    overflow-y: auto;
+    flex: 1;
+  }
+
+  .log-box h3 { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px; font-family: inherit; }
+
+  .log-line { display: flex; gap: 8px; }
+  .log-line .ts { color: var(--muted); }
+  .log-line .info { color: var(--accent2); }
+  .log-line .warn { color: var(--warn); }
+  .log-line .ok   { color: var(--success); }
+  .log-line .err  { color: var(--danger); }
+
+  /* ── CONTROLS ── */
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 20px 0 8px;
+  }
+
+  .btn {
+    padding: 8px 20px;
+    border-radius: 8px;
+    border: none;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 500;
+    transition: opacity 0.2s, transform 0.1s;
+  }
+
+  .btn:active { transform: scale(0.97); }
+  .btn:disabled { opacity: 0.35; cursor: default; }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-outline { background: transparent; color: var(--text); border: 1px solid var(--border); }
+  .btn-danger  { background: rgba(248,113,113,0.2); color: var(--danger); border: 1px solid rgba(248,113,113,0.4); }
+
+  .speed-label { font-size: 13px; color: var(--muted); }
+  .speed-select {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 13px;
+    padding: 4px 10px;
+    cursor: pointer;
+  }
+
+  .progress-bar {
+    width: 100%;
+    height: 3px;
+    background: var(--border);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+
+  .progress-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    border-radius: 2px;
+    transition: width 0.5s ease;
+    width: 0%;
+  }
+
+  /* ── LEGEND ── */
+  .legend {
+    display: flex;
+    gap: 20px;
+    font-size: 12px;
+    color: var(--muted);
+    flex-wrap: wrap;
+  }
+
+  .legend-item { display: flex; align-items: center; gap: 6px; }
+  .legend-dot { width: 8px; height: 8px; border-radius: 50%; }
+
+  /* ── SCROLL ── */
+  .log-box::-webkit-scrollbar { width: 4px; }
+  .log-box::-webkit-scrollbar-track { background: transparent; }
+  .log-box::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+  /* ── FADE IN ── */
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
+  .stage-card { animation: fadeIn 0.4s ease; }
+
+  /* ── PULSE ── */
+  @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.5; } }
+  .pulse { animation: pulse 1.2s infinite; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">G</div>
+  <div>
+    <h1>AI Governance Proxy — Request Walkthrough</h1>
+    <p>End-to-end lifecycle of a proxied AI API call</p>
+  </div>
+  <div class="stage-counter">Step <span id="stepNum">0</span> of <span id="stepTotal">10</span></div>
+</header>
+
+<div class="main">
+
+  <!-- Pipeline track -->
+  <div class="pipeline" id="pipeline"></div>
+
+  <!-- Progress bar -->
+  <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+
+  <!-- Stage + side panel -->
+  <div class="stage-area">
+    <div class="stage-card" id="stageCard">
+      <div class="stage-badge" id="stageBadge">⬡ Ready</div>
+      <h2 id="stageTitle">AI Governance Proxy</h2>
+      <p class="subtitle" id="stageSubtitle">Press <strong>Next Step</strong> to begin the walkthrough. Each step shows exactly what the proxy does before returning a response to your client app.</p>
+      <div class="detail-rows" id="detailRows"></div>
+      <div class="outcome-banner" id="outcomeBanner"></div>
+    </div>
+
+    <div class="side-panel">
+      <!-- Live packet -->
+      <div class="packet-box">
+        <h3>Request Context</h3>
+        <div id="packetLines">
+          <div class="packet-line"><span class="pk">governance_key</span><span class="pv hidden" id="pk-key">••••••••••••••••</span></div>
+          <div class="packet-line"><span class="pk">org_id</span><span class="pv" id="pk-org">—</span></div>
+          <div class="packet-line"><span class="pk">project_id</span><span class="pv" id="pk-proj">—</span></div>
+          <div class="packet-line"><span class="pk">model</span><span class="pv" id="pk-model">—</span></div>
+          <div class="packet-line"><span class="pk">input_tokens</span><span class="pv" id="pk-itok">—</span></div>
+          <div class="packet-line"><span class="pk">output_tokens</span><span class="pv" id="pk-otok">—</span></div>
+          <div class="packet-line"><span class="pk">pii_detected</span><span class="pv" id="pk-pii">—</span></div>
+          <div class="packet-line"><span class="pk">total_cost</span><span class="pv" id="pk-cost">—</span></div>
+          <div class="packet-line"><span class="pk">status</span><span class="pv" id="pk-status">pending</span></div>
+        </div>
+      </div>
+
+      <!-- Live log -->
+      <div class="log-box">
+        <h3>Server Log</h3>
+        <div id="logLines"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Controls -->
+  <div class="controls">
+    <button class="btn btn-primary" id="btnNext" onclick="advance()">▶ Next Step</button>
+    <button class="btn btn-outline" id="btnAuto" onclick="toggleAuto()">⏵ Auto-play</button>
+    <button class="btn btn-outline" id="btnReset" onclick="reset()">↺ Reset</button>
+    <div style="margin-left:auto; display:flex; align-items:center; gap:8px;">
+      <span class="speed-label">Speed</span>
+      <select class="speed-select" id="speedSelect">
+        <option value="2000">Slow</option>
+        <option value="1200" selected>Normal</option>
+        <option value="650">Fast</option>
+      </select>
+    </div>
+  </div>
+
+  <!-- Legend -->
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:#818cf8"></div>Client App</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#6366f1"></div>Proxy Core</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#34d399"></div>Database (PostgreSQL)</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#f472b6"></div>Azure OpenAI (LLM)</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#f87171"></div>Blocked / Rejected</div>
+  </div>
+
+</div>
+
+<script>
+// ─────────────────────────────────────────────
+// PIPELINE NODES
+// ─────────────────────────────────────────────
+const nodes = [
+  { icon: '💻', label: 'Client\nRequest' },
+  { icon: '🔑', label: 'Auth\nKey' },
+  { icon: '🚦', label: 'Rate\nLimit' },
+  { icon: '📋', label: 'Gov\nRules' },
+  { icon: '💰', label: 'Budget\nCheck' },
+  { icon: '🛡️', label: 'PII\nScan' },
+  { icon: '🔢', label: 'Token\nCount' },
+  { icon: '🤖', label: 'Azure\nOpenAI' },
+  { icon: '💵', label: 'Cost\nCalc' },
+  { icon: '🗃️', label: 'Store\nLogs' },
+  { icon: '✅', label: 'Response\nReturned' },
+];
+
+// ─────────────────────────────────────────────
+// STAGES  (step 0 = intro, steps 1-10 = pipeline)
+// ─────────────────────────────────────────────
+const stages = [
+  // 0 — intro (handled separately)
+  null,
+
+  // 1 — Auth
+  {
+    badge: '🔑 Step 1 — Authentication',
+    title: 'Verify Governance Key',
+    subtitle: 'Every request must carry an X-Governance-Key header. The proxy hashes it and looks it up in the api_keys table to resolve an org and project identity. Invalid or expired keys are rejected immediately — the LLM is never contacted.',
+    details: [
+      { key: 'Header',    val: '<span class="tag tag-blue">X-Governance-Key: gov-••••••</span>' },
+      { key: 'Lookup',    val: 'api_keys table (hashed SHA-256)' },
+      { key: 'Resolves',  val: 'org_id, project_id, key_id' },
+      { key: 'Failure',   val: '<span class="tag tag-red">401 Unauthorized</span>' },
+    ],
+    outcome: null,
+    outcomeCls: '',
+    patchPacket: { 'pk-key': { val: 'gov-a3f...', cls: 'highlight' }, 'pk-org': { val: 'org_ampera', cls: 'highlight' }, 'pk-proj': { val: 'proj_gpt4', cls: 'highlight' } },
+    logEntries: [
+      { cls: 'info', msg: 'POST /proxy  key=gov-a3f...' },
+      { cls: 'ok',   msg: 'key verified  org=org_ampera  proj=proj_gpt4' },
+    ],
+  },
+
+  // 2 — Rate limit
+  {
+    badge: '🚦 Step 2 — Rate Limit',
+    title: 'Check Rate Limits',
+    subtitle: 'Before touching the request body, the proxy checks per-key and per-project rate limits stored in the DB. This is the cheapest gate — it reads counters and increments atomically. If the caller is over limit, a 429 is returned with a Retry-After header.',
+    details: [
+      { key: 'Scope',     val: 'Per key <em>and</em> per project' },
+      { key: 'Window',    val: 'Sliding 60-second window' },
+      { key: 'Counter',   val: 'rate_limit_counters table' },
+      { key: 'Failure',   val: '<span class="tag tag-red">429 Too Many Requests</span>' },
+    ],
+    outcome: 'Rate limit OK — 3 of 60 req/min used',
+    outcomeCls: 'outcome-success',
+    patchPacket: {},
+    logEntries: [
+      { cls: 'info', msg: 'rate_limit check  key=gov-a3f...' },
+      { cls: 'ok',   msg: 'allowed  3/60 rpm  proj 12/200 rpm' },
+    ],
+  },
+
+  // 3 — Governance rules
+  {
+    badge: '📋 Step 3 — Governance Rules',
+    title: 'Enforce Governance Rules',
+    subtitle: 'The proxy checks whether the requested model is on the allow-list for this org/project and whether the estimated input token count is within the configured ceiling. Rules can be set at org level, project level, or both — project-level rules take precedence.',
+    details: [
+      { key: 'Checks',      val: 'Model allow/block list, max input tokens' },
+      { key: 'Scope',       val: 'Org-level or project-level rule' },
+      { key: 'Model',       val: '<span class="tag tag-cyan">gpt-4o</span> — allowed ✓' },
+      { key: 'Max tokens',  val: '128 000 — within limit ✓' },
+      { key: 'Failure',     val: '<span class="tag tag-red">403 Forbidden</span>' },
+    ],
+    outcome: 'Model allowed — token ceiling not exceeded',
+    outcomeCls: 'outcome-success',
+    patchPacket: { 'pk-model': { val: 'gpt-4o', cls: 'highlight' } },
+    logEntries: [
+      { cls: 'info', msg: 'governance rules  model=gpt-4o' },
+      { cls: 'ok',   msg: 'model allowed  token ceiling OK' },
+    ],
+  },
+
+  // 4 — Budget
+  {
+    badge: '💰 Step 4 — Budget Check',
+    title: 'Monthly Budget Enforcement',
+    subtitle: 'The proxy queries the current month\'s spend from monthly_org_summaries and compares it to the configured budget limits. Alerts fire at configurable thresholds (e.g. 80%). If the budget is fully exhausted, the request is rejected.',
+    details: [
+      { key: 'Budget',      val: '$500 / month (org)' },
+      { key: 'Spent so far',val: '$127.43 (25.4%)' },
+      { key: 'Alert at',    val: '80%  — not yet triggered' },
+      { key: 'Hard stop',   val: '100% — request rejected' },
+      { key: 'Failure',     val: '<span class="tag tag-red">429 Budget Exceeded</span>' },
+    ],
+    outcome: 'Budget OK — $127.43 of $500.00 used (25.4%)',
+    outcomeCls: 'outcome-success',
+    patchPacket: {},
+    logEntries: [
+      { cls: 'info', msg: 'budget check  org=org_ampera  month=2026-06' },
+      { cls: 'ok',   msg: '$127.43/$500.00  25.4%  no alert' },
+    ],
+  },
+
+  // 5 — PII
+  {
+    badge: '🛡️ Step 5 — PII Scan',
+    title: 'PII Detection & Masking',
+    subtitle: 'Every message in the request body is scanned for sensitive data — emails, phone numbers, credit card numbers, SSNs, names. Depending on the org\'s PII policy: the entity is masked in-place (e.g. replaced with [EMAIL]) or the entire request is blocked if the policy is "block".',
+    details: [
+      { key: 'Engine',      val: 'Regex + entity recognisers (pii_engine.py)' },
+      { key: 'Policy',      val: 'Org/project pii_policies table' },
+      { key: 'Action',      val: '<span class="tag tag-yellow">mask</span> — entities replaced inline' },
+      { key: 'Example',     val: '"john@example.com" → "[EMAIL]"' },
+      { key: 'Block policy',val: '<span class="tag tag-red">403 PII Blocked</span> if set' },
+    ],
+    outcome: '1 email address masked — request continues',
+    outcomeCls: 'outcome-warn',
+    patchPacket: { 'pk-pii': { val: 'masked (email)', cls: 'warn' } },
+    logEntries: [
+      { cls: 'warn', msg: 'PII detected  types=[email]  action=mask' },
+      { cls: 'ok',   msg: '1 entity masked  request sanitised' },
+    ],
+  },
+
+  // 6 — Token count
+  {
+    badge: '🔢 Step 6 — Token Counting & Request Record',
+    title: 'Count Input Tokens & Store AiRequest',
+    subtitle: 'The sanitised messages are tokenised using tiktoken to get an accurate input token estimate. An AiRequest row is written to the database with status "pending". This creates the audit trail entry even if the upstream call later fails.',
+    details: [
+      { key: 'Tokeniser',   val: 'tiktoken (cl100k_base)' },
+      { key: 'Input tokens',val: '847 tokens estimated' },
+      { key: 'DB write',    val: 'AiRequest  status=pending' },
+      { key: 'Fields',      val: 'request_id, org_id, model, payload, pii_*' },
+    ],
+    outcome: null,
+    outcomeCls: '',
+    patchPacket: { 'pk-itok': { val: '847', cls: 'highlight' } },
+    logEntries: [
+      { cls: 'info', msg: 'token count  input=847  model=gpt-4o' },
+      { cls: 'ok',   msg: 'AiRequest stored  id=req-4a9b...' },
+    ],
+  },
+
+  // 7 — Forward to Azure
+  {
+    badge: '🤖 Step 7 — Forward to Azure OpenAI',
+    title: 'Proxy to Azure OpenAI',
+    subtitle: 'The sanitised request is forwarded to Azure OpenAI using admin credentials stored only in the proxy\'s environment. Clients never receive or see these credentials. The proxy swaps the governance key for the Azure API key transparently. Latency is measured precisely.',
+    details: [
+      { key: 'Credentials', val: 'AZURE_OPENAI_API_KEY (server-only)' },
+      { key: 'Endpoint',    val: 'AZURE_OPENAI_ENDPOINT/deployments/…' },
+      { key: 'Transport',   val: 'httpx async client' },
+      { key: 'Modes',       val: 'Standard + Streaming (SSE)' },
+      { key: 'Latency',     val: '⏱ measured from send → first byte' },
+    ],
+    outcome: '200 OK from Azure — 1 243 ms upstream latency',
+    outcomeCls: 'outcome-success',
+    patchPacket: { 'pk-status': { val: 'forwarded', cls: 'highlight' } },
+    logEntries: [
+      { cls: 'info', msg: 'upstream POST  model=gpt-4o  dep=gpt4o-prod' },
+      { cls: 'ok',   msg: 'response 200  latency=1243ms' },
+    ],
+  },
+
+  // 8 — Cost
+  {
+    badge: '💵 Step 8 — Cost Calculation',
+    title: 'Calculate Request Cost',
+    subtitle: 'The exact input and output token counts from the Azure response are used to calculate cost using the pricing catalog stored in the DB. Both prompt and completion costs are computed separately, then summed. A RequestCost and TokenUsage row are written.',
+    details: [
+      { key: 'Input tokens',  val: '847  ×  $0.0025 / 1K  =  $0.002118' },
+      { key: 'Output tokens', val: '312  ×  $0.010  / 1K  =  $0.003120' },
+      { key: 'Total',         val: '<strong>$0.005238</strong>' },
+      { key: 'DB writes',     val: 'TokenUsage, RequestCost' },
+    ],
+    outcome: 'Cost calculated — $0.005238 recorded',
+    outcomeCls: 'outcome-success',
+    patchPacket: {
+      'pk-otok': { val: '312', cls: 'highlight' },
+      'pk-cost': { val: '$0.005238', cls: 'success' },
+    },
+    logEntries: [
+      { cls: 'info', msg: 'cost calc  in=847 out=312  model=gpt-4o' },
+      { cls: 'ok',   msg: 'total=$0.005238  pricing_source=db' },
+    ],
+  },
+
+  // 9 — Store
+  {
+    badge: '🗃️ Step 9 — Persist Metadata & Audit Log',
+    title: 'Store Response & Audit Trail',
+    subtitle: 'The proxy writes all telemetry to PostgreSQL in a single transaction: AiResponse (the model\'s output), TokenUsage, RequestCost, AuditLog (decision trail), and RouteExecution (timing breakdown). The AiRequest row is updated from "pending" to "completed".',
+    details: [
+      { key: 'AiResponse',    val: 'Full response payload + output tokens' },
+      { key: 'TokenUsage',    val: 'input_tokens, output_tokens per request' },
+      { key: 'RequestCost',   val: 'input_cost, output_cost, total_cost' },
+      { key: 'AuditLog',      val: 'Every enforcement decision logged' },
+      { key: 'RouteExecution',val: 'routing_ms, upstream_ms, proxy_ms' },
+    ],
+    outcome: 'All records committed — AiRequest updated to completed',
+    outcomeCls: 'outcome-success',
+    patchPacket: { 'pk-status': { val: 'completed', cls: 'success' } },
+    logEntries: [
+      { cls: 'ok', msg: 'AiResponse stored  id=resp-7c2e...' },
+      { cls: 'ok', msg: 'AuditLog + RouteExecution committed' },
+      { cls: 'ok', msg: 'AiRequest  status=completed' },
+    ],
+  },
+
+  // 10 — Return
+  {
+    badge: '✅ Step 10 — Response Returned',
+    title: 'Return to Client',
+    subtitle: 'The original AI response (identical to what Azure returned) is sent back to the client application. The client app sees a standard OpenAI-compatible response — it has no visibility into the governance checks, PII masking, cost tracking, or audit logging that happened transparently.',
+    details: [
+      { key: 'Format',       val: 'OpenAI-compatible JSON (or SSE stream)' },
+      { key: 'Total latency',val: '~1 270 ms end-to-end' },
+      { key: 'Client sees',  val: 'Only the AI response — no proxy internals' },
+      { key: 'Dashboard',    val: 'Usage & cost visible to admins in real time' },
+    ],
+    outcome: '🎉 Request complete — all governance checks passed, response delivered, audit trail written.',
+    outcomeCls: 'outcome-success',
+    patchPacket: {},
+    logEntries: [
+      { cls: 'ok', msg: 'response sent  total_ms=1271' },
+      { cls: 'ok', msg: '─── request lifecycle complete ───' },
+    ],
+  },
+];
+
+// ─────────────────────────────────────────────
+// STATE
+// ─────────────────────────────────────────────
+let currentStep = 0;
+let autoTimer = null;
+const TOTAL_STEPS = stages.length - 1; // 10
+
+// ─────────────────────────────────────────────
+// BUILD PIPELINE
+// ─────────────────────────────────────────────
+function buildPipeline() {
+  const el = document.getElementById('pipeline');
+  document.getElementById('stepTotal').textContent = TOTAL_STEPS;
+  nodes.forEach((n, i) => {
+    if (i > 0) {
+      const arr = document.createElement('div');
+      arr.className = 'pipe-arrow';
+      arr.id = `arr-${i}`;
+      el.appendChild(arr);
+    }
+    const node = document.createElement('div');
+    node.className = 'pipe-node';
+    node.id = `node-${i}`;
+    node.innerHTML = `<div class="pipe-icon">${n.icon}</div><div class="pipe-label">${n.label}</div>`;
+    el.appendChild(node);
+  });
+}
+
+// ─────────────────────────────────────────────
+// RENDER STEP
+// ─────────────────────────────────────────────
+function renderStep(step) {
+  document.getElementById('stepNum').textContent = step;
+  const pct = step === 0 ? 0 : Math.round((step / TOTAL_STEPS) * 100);
+  document.getElementById('progressFill').style.width = pct + '%';
+
+  // Update pipeline nodes
+  nodes.forEach((_, i) => {
+    const el = document.getElementById(`node-${i}`);
+    el.className = 'pipe-node';
+    if (i === step) el.classList.add('active');
+    else if (i < step) el.classList.add('done');
+  });
+
+  // Arrows
+  for (let i = 1; i < nodes.length; i++) {
+    const arr = document.getElementById(`arr-${i}`);
+    if (arr) arr.className = 'pipe-arrow' + (i <= step ? ' lit' : '');
+  }
+
+  const card = document.getElementById('stageCard');
+
+  if (step === 0) {
+    card.className = 'stage-card';
+    document.getElementById('stageBadge').textContent = '⬡ Ready';
+    document.getElementById('stageTitle').textContent = 'AI Governance Proxy';
+    document.getElementById('stageSubtitle').innerHTML = 'Press <strong>Next Step</strong> to begin the walkthrough. Each step shows exactly what the proxy does before returning a response to your client app.';
+    document.getElementById('detailRows').innerHTML = '';
+    document.getElementById('outcomeBanner').className = 'outcome-banner';
+    return;
+  }
+
+  const s = stages[step];
+  card.className = 'stage-card active';
+
+  document.getElementById('stageBadge').textContent = s.badge;
+  document.getElementById('stageTitle').textContent = s.title;
+  document.getElementById('stageSubtitle').innerHTML = s.subtitle;
+
+  // Details — stagger in
+  const rows = document.getElementById('detailRows');
+  rows.innerHTML = '';
+  s.details.forEach((d, idx) => {
+    const row = document.createElement('div');
+    row.className = 'detail-row';
+    row.innerHTML = `<div class="dot"></div><span class="key">${d.key}</span><span class="val">${d.val}</span>`;
+    rows.appendChild(row);
+    setTimeout(() => row.classList.add('visible'), idx * 120 + 80);
+  });
+
+  // Outcome banner
+  const banner = document.getElementById('outcomeBanner');
+  if (s.outcome) {
+    banner.className = `outcome-banner show ${s.outcomeCls}`;
+    banner.textContent = s.outcome;
+  } else {
+    banner.className = 'outcome-banner';
+  }
+
+  // Patch packet
+  Object.entries(s.patchPacket || {}).forEach(([id, cfg]) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = cfg.val;
+    el.className = 'pv ' + (cfg.cls || '');
+  });
+
+  // Append log lines
+  const logEl = document.getElementById('logLines');
+  (s.logEntries || []).forEach(l => {
+    const ts = new Date().toISOString().substr(11, 8);
+    const line = document.createElement('div');
+    line.className = 'log-line';
+    line.innerHTML = `<span class="ts">${ts}</span><span class="${l.cls}">${l.msg}</span>`;
+    logEl.appendChild(line);
+  });
+  logEl.scrollTop = logEl.scrollHeight;
+
+  // Button state
+  document.getElementById('btnNext').disabled = step >= TOTAL_STEPS;
+}
+
+// ─────────────────────────────────────────────
+// CONTROLS
+// ─────────────────────────────────────────────
+function advance() {
+  if (currentStep < TOTAL_STEPS) {
+    currentStep++;
+    renderStep(currentStep);
+  }
+  if (currentStep >= TOTAL_STEPS && autoTimer) stopAuto();
+}
+
+function toggleAuto() {
+  if (autoTimer) { stopAuto(); return; }
+  const btn = document.getElementById('btnAuto');
+  btn.textContent = '⏸ Pause';
+  btn.classList.add('btn-primary');
+  btn.classList.remove('btn-outline');
+  const speed = parseInt(document.getElementById('speedSelect').value, 10);
+  autoTimer = setInterval(() => {
+    if (currentStep >= TOTAL_STEPS) { stopAuto(); return; }
+    advance();
+  }, speed);
+}
+
+function stopAuto() {
+  clearInterval(autoTimer);
+  autoTimer = null;
+  const btn = document.getElementById('btnAuto');
+  btn.textContent = '⏵ Auto-play';
+  btn.classList.remove('btn-primary');
+  btn.classList.add('btn-outline');
+}
+
+function reset() {
+  stopAuto();
+  currentStep = 0;
+  // Reset packet
+  document.getElementById('pk-key').textContent = '••••••••••••••••';
+  document.getElementById('pk-key').className = 'pv hidden';
+  ['pk-org','pk-proj','pk-model','pk-itok','pk-otok','pk-pii','pk-cost'].forEach(id => {
+    const el = document.getElementById(id);
+    el.textContent = '—';
+    el.className = 'pv';
+  });
+  document.getElementById('pk-status').textContent = 'pending';
+  document.getElementById('pk-status').className = 'pv';
+  document.getElementById('logLines').innerHTML = '';
+  renderStep(0);
+}
+
+// ─────────────────────────────────────────────
+// INIT
+// ─────────────────────────────────────────────
+buildPipeline();
+renderStep(0);
+</script>
+</body>
+</html>

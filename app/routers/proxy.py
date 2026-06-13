@@ -39,7 +39,7 @@ _log = logging.getLogger(__name__)
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from sqlalchemy import func
+from sqlalchemy import Integer, cast, func
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_db
@@ -1231,13 +1231,17 @@ def proxy_stats_overview(
         cost_q = cost_q.filter(RequestCost.org_id == org_id)
     cost = cost_q.first()
 
-    completed_q = db.query(func.count(AiRequest.id)).filter(
-        AiRequest.request_status == "success",
-        func.date(AiRequest.created_at) >= cutoff,
-    )
+    req_q = db.query(
+        func.count(AiRequest.id).label("total"),
+        func.sum(
+            cast(AiRequest.request_status == "success", Integer)
+        ).label("completed"),
+    ).filter(func.date(AiRequest.created_at) >= cutoff)
     if org_id:
-        completed_q = completed_q.filter(AiRequest.org_id == org_id)
-    completed = completed_q.scalar() or 0
+        req_q = req_q.filter(AiRequest.org_id == org_id)
+    req_stats = req_q.first()
+    total_reqs = int(req_stats.total or 0)
+    completed = int(req_stats.completed or 0)
 
     latency_q = db.query(func.avg(AiResponse.latency_ms)).filter(
         func.date(AiResponse.created_at) >= cutoff,
@@ -1254,9 +1258,12 @@ def proxy_stats_overview(
         pii_q = pii_q.filter(AiRequest.org_id == org_id)
     pii_detections = pii_q.scalar() or 0
 
+    success_rate = round((completed / total_reqs * 100), 2) if total_reqs > 0 else 0
+
     return {
-        "total_requests": cost.total_requests or 0,
+        "total_requests": total_reqs,
         "completed": completed,
+        "success_rate": success_rate,
         "prompt_tokens": cost.prompt_tokens or 0,
         "completion_tokens": cost.completion_tokens or 0,
         "total_tokens": cost.total_tokens or 0,

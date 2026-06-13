@@ -10,6 +10,7 @@ rather than re-grouping daily rows at query time.
 Note: monthly data is up to 24 hours stale (scheduler cadence). Today's and
 daily endpoints remain live.
 """
+import datetime as _dt
 from datetime import date, timedelta
 from decimal import Decimal
 from typing import Optional
@@ -30,6 +31,37 @@ from app.models import (
 )
 
 router = APIRouter(prefix="/summary", tags=["summary"])
+
+
+# ---------------------------------------------------------------------------
+# Admin: trigger daily aggregation on demand (backfills missing dates)
+# ---------------------------------------------------------------------------
+@router.post("/admin/rebuild-daily")
+def rebuild_daily_summary(
+    *,
+    days_back: int = Query(7, ge=1, le=90, description="How many past days to rebuild"),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Rebuild DailyOrgSummary for the past N days. Useful after fixing a bug
+    that prevented the scheduler from running. Idempotent — safe to call repeatedly."""
+    import logging
+    from app.workers.tasks import _rebuild_daily_summary, _detect_daily_anomalies
+    _log = logging.getLogger(__name__)
+    rebuilt, errors = [], []
+    today = _dt.date.today()
+    for i in range(days_back):
+        d = today - _dt.timedelta(days=i)
+        try:
+            count = _rebuild_daily_summary(db=db, summary_date=d)
+            if count > 0:
+                _detect_daily_anomalies(db=db, summary_date=d)
+            db.commit()
+            rebuilt.append(str(d))
+        except Exception as exc:
+            db.rollback()
+            errors.append({"date": str(d), "error": str(exc)})
+            _log.exception("rebuild failed for %s", d)
+    return {"rebuilt": rebuilt, "errors": errors}
 
 
 def _org_filter(query, model, *, org_id: Optional[str]):

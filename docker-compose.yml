@@ -1,0 +1,49 @@
+services:
+
+  # ── PostgreSQL ────────────────────────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: aigovernance
+      POSTGRES_USER: aigovuser
+      POSTGRES_PASSWORD: aigovpass
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aigovuser -d aigovernance"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── AI Governance Backend ─────────────────────────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://aigovuser:aigovpass@db:5432/aigovernance
+
+      # Azure OpenAI — override via .env or shell environment
+      AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY:-}
+      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT:-}
+      AZURE_OPENAI_DEPLOYMENT_NAME: ${AZURE_OPENAI_DEPLOYMENT_NAME:-}
+      AZURE_OPENAI_API_VERSION: ${AZURE_OPENAI_API_VERSION:-2024-02-01}
+
+      # Optional overrides
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+      SCHEDULER_MAX_WORKERS: ${SCHEDULER_MAX_WORKERS:-2}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+      # Alert / anomaly thresholds (all have defaults in config.py)
+      ALERT_BUDGET_DEFAULT_THRESHOLD_PCT: ${ALERT_BUDGET_DEFAULT_THRESHOLD_PCT:-80}
+      ANOMALY_SPIKE_RATIO: ${ANOMALY_SPIKE_RATIO:-1.8}
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  postgres_data:

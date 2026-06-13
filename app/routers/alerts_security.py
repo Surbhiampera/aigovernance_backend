@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func
+from sqlalchemy import Integer, cast, func
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_db
@@ -23,9 +23,9 @@ def security_summary(
 ) -> dict:
     q = db.query(
         func.count(DataSecurityLog.id).label("total_events"),
-        func.sum(DataSecurityLog.pii_detected.cast("int")).label("total_with_pii"),
-        func.sum(DataSecurityLog.misuse_pattern_detected.cast("int")).label("misuse_events"),
-        func.sum(DataSecurityLog.data_out_violation.cast("int")).label("data_out_events"),
+        func.sum(cast(DataSecurityLog.pii_detected, Integer)).label("total_with_pii"),
+        func.sum(cast(DataSecurityLog.misuse_pattern_detected, Integer)).label("misuse_events"),
+        func.sum(cast(DataSecurityLog.data_out_violation, Integer)).label("data_out_events"),
         func.avg(DataSecurityLog.risk_score).label("average_risk_score"),
         func.max(DataSecurityLog.risk_score).label("highest_risk_score"),
     )

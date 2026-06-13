@@ -153,6 +153,42 @@ async def lifespan(app: FastAPI):
         pass
 
     start_scheduler()
+
+    # Backfill DailyOrgSummary for any past days that have AiRequest data but no summary.
+    import datetime as _dt
+    import logging as _logging
+    _bflog = _logging.getLogger(__name__)
+    try:
+        from app.database import SessionLocal
+        from app.workers.tasks import _rebuild_daily_summary, _detect_daily_anomalies
+        from app.models import AiRequest as _AiReq, DailyOrgSummary as _Daily
+        from sqlalchemy import func as _func
+        db = SessionLocal()
+        try:
+            dates_with_requests = (
+                db.query(_func.date(_AiReq.created_at).label("d"))
+                .filter(_AiReq.created_at >= _dt.datetime.utcnow() - _dt.timedelta(days=90))
+                .distinct()
+                .all()
+            )
+            dates_already_summarised = {
+                r[0] for r in db.query(_Daily.date).distinct().all()
+            }
+            for (d,) in dates_with_requests:
+                if d not in dates_already_summarised:
+                    try:
+                        _rebuild_daily_summary(db=db, summary_date=d)
+                        _detect_daily_anomalies(db=db, summary_date=d)
+                        db.commit()
+                        _bflog.info("Backfilled DailyOrgSummary for %s", d)
+                    except Exception:
+                        db.rollback()
+                        _bflog.exception("Backfill failed for %s", d)
+        finally:
+            db.close()
+    except Exception:
+        _bflog.exception("Startup backfill failed")
+
     try:
         yield
     finally:

@@ -13,7 +13,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func
+from sqlalchemy import Integer, cast, func
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -43,8 +43,8 @@ def _rebuild_daily_summary(*, db: Session, summary_date: date) -> int:
             func.sum(RequestCost.output_tokens).label("output_tokens"),
             func.sum(RequestCost.total_tokens).label("total_tokens"),
             func.sum(RequestCost.total_cost).label("total_cost"),
-            func.sum(RequestCost.input_cost).label("input_cost"),
-            func.sum(RequestCost.output_cost).label("output_cost"),
+            func.sum(RequestCost.input_token_cost).label("input_cost"),
+            func.sum(RequestCost.output_token_cost).label("output_cost"),
         )
         .filter(func.date(RequestCost.created_at) == summary_date)
         .filter(RequestCost.org_id.isnot(None))
@@ -63,10 +63,10 @@ def _rebuild_daily_summary(*, db: Session, summary_date: date) -> int:
                 func.extract("epoch", AiRequest.completed_at - AiRequest.created_at) * 1000
             ).label("avg_latency_ms"),
             func.sum(
-                func.cast(AiRequest.request_status == "success", func.Integer())
+                cast(AiRequest.request_status == "success", Integer)
             ).label("success_count"),
             func.sum(
-                func.cast(AiRequest.request_status != "success", func.Integer())
+                cast(AiRequest.request_status != "success", Integer)
             ).label("failure_count"),
         )
         .filter(func.date(AiRequest.created_at) == summary_date)
