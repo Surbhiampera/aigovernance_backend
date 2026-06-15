@@ -25,9 +25,9 @@ prs = Presentation(
 )
 
 layouts = {l.name: l for l in prs.slide_master.slide_layouts}
-BLANK_L       = layouts["Blank"]           # AI-background + centered logo
+BLANK_L       = layouts["2_Blank"]         # AI-background + top-right logo, no bottom triangles
 CONTENT_L     = layouts["Title and Content"]  # left triangles + top-right logo
-TWO_CONTENT_L = layouts["Two Content"]     # same + two columns
+TWO_CONTENT_L = layouts["Two Content"]     # two columns (no triangles/logo — added manually)
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -137,6 +137,60 @@ def set_title(slide, text, size_pt=28, color=C_MAGENTA):
     set_font(run, size_pt, bold=True, color=color)
 
 
+def inject_side_triangles(slide):
+    """Inject the left-side triangle decoration into any slide that lacks it."""
+    NS_P = "http://schemas.openxmlformats.org/presentationml/2006/main"
+    NS_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+
+    max_id = max((sh.shape_id for sh in slide.shapes), default=0)
+    spTree = slide.element.find(f'.//{{{NS_P}}}spTree')
+
+    # Triangle 8 — magenta (accent1), full-height, rotated 180° + flipH
+    tri8 = etree.fromstring(
+        f'<p:sp xmlns:p="{NS_P}" xmlns:a="{NS_A}">'
+        f'<p:nvSpPr><p:cNvPr id="{max_id+1}" name="Right Triangle 8"/>'
+        f'<p:cNvSpPr/><p:nvPr/></p:nvSpPr>'
+        f'<p:spPr><a:xfrm rot="10800000" flipH="1">'
+        f'<a:off x="1" y="-4"/><a:ext cx="838200" cy="6858003"/></a:xfrm>'
+        f'<a:prstGeom prst="rtTriangle"><a:avLst/></a:prstGeom>'
+        f'<a:ln><a:noFill/></a:ln></p:spPr>'
+        f'<p:style>'
+        f'<a:lnRef idx="2"><a:schemeClr val="accent1"><a:shade val="15000"/></a:schemeClr></a:lnRef>'
+        f'<a:fillRef idx="1"><a:schemeClr val="accent1"/></a:fillRef>'
+        f'<a:effectRef idx="0"><a:schemeClr val="accent1"/></a:effectRef>'
+        f'<a:fontRef idx="minor"><a:schemeClr val="lt1"/></a:fontRef>'
+        f'</p:style>'
+        f'<p:txBody><a:bodyPr rtlCol="0" anchor="ctr"/><a:lstStyle/><a:p/></p:txBody>'
+        f'</p:sp>'
+    )
+
+    # Triangle 9 — light purple (accent4), from below title area down to bottom
+    tri9 = etree.fromstring(
+        f'<p:sp xmlns:p="{NS_P}" xmlns:a="{NS_A}">'
+        f'<p:nvSpPr><p:cNvPr id="{max_id+2}" name="Right Triangle 9"/>'
+        f'<p:cNvSpPr/><p:nvPr/></p:nvSpPr>'
+        f'<p:spPr><a:xfrm><a:off x="-1" y="1066800"/>'
+        f'<a:ext cx="838201" cy="5796024"/></a:xfrm>'
+        f'<a:prstGeom prst="rtTriangle"><a:avLst/></a:prstGeom>'
+        f'<a:solidFill><a:schemeClr val="accent4"/></a:solidFill>'
+        f'<a:ln><a:noFill/></a:ln></p:spPr>'
+        f'<p:txBody><a:bodyPr rtlCol="0" anchor="ctr"/><a:lstStyle/><a:p/></p:txBody>'
+        f'</p:sp>'
+    )
+
+    # Insert at the front of the draw order so triangles sit behind all other content
+    spTree.insert(2, tri8)
+    spTree.insert(3, tri9)
+
+
+def add_logo_topright(slide):
+    """Add the Ampera logo to the top-right corner (matching layout position)."""
+    slide.shapes.add_picture(
+        '/tmp/image1.jpeg',
+        Inches(11.49), Inches(0.02), Inches(1.85), Inches(0.49)
+    )
+
+
 # ── delete the initial blank slide (index 0) ─────────────────────────────────
 
 def delete_slide(prs, index):
@@ -161,6 +215,7 @@ def delete_slide(prs, index):
 # ═══════════════════════════════════════════════════════════════════════════
 
 s1 = prs.slides.add_slide(BLANK_L)
+inject_side_triangles(s1)   # add left-side bar (same as content slides)
 
 # Main title — centered, large, white
 add_textbox(s1, 1.5, 1.4, 10.33, 1.5,
@@ -391,6 +446,8 @@ def fill_module_column(slide, ph_idx, modules):
 
 fill_module_column(s5, 1, left_modules)
 fill_module_column(s5, 2, right_modules)
+inject_side_triangles(s5)   # Two Content layout has no triangles — add them
+add_logo_topright(s5)       # Two Content layout has no logo — add it
 
 
 # ═══════════════════════════════════════════════════════════════════════════

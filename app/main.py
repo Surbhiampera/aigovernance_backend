@@ -91,6 +91,9 @@ _SAFE_ALTERS = [
     "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS provider VARCHAR(100)",
     "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS received_at TIMESTAMP DEFAULT NOW()",
     "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS entry_point VARCHAR(100)",
+    # PII detection flags (may be missing on DBs created before presidio integration)
+    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS pii_detected BOOLEAN DEFAULT FALSE",
+    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS pii_masked BOOLEAN DEFAULT FALSE",
     # PII severity and entity counts for per-request detail view
     "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS pii_severity VARCHAR(10)",
     "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS pii_entities_detected INTEGER DEFAULT 0",

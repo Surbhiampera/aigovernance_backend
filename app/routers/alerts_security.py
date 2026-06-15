@@ -1,12 +1,12 @@
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import Integer, cast, func
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_db
-from app.models import Alert, DataSecurityLog, UsageAnomaly
+from app.models import AiRequest, Alert, DataSecurityLog, UsageAnomaly
 
 router = APIRouter(prefix="/alerts-security", tags=["alerts-security"])
 
@@ -21,30 +21,45 @@ def security_summary(
     start_date: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ) -> dict:
-    q = db.query(
-        func.count(DataSecurityLog.id).label("total_events"),
-        func.sum(cast(DataSecurityLog.pii_detected, Integer)).label("total_with_pii"),
-        func.sum(cast(DataSecurityLog.misuse_pattern_detected, Integer)).label("misuse_events"),
-        func.sum(cast(DataSecurityLog.data_out_violation, Integer)).label("data_out_events"),
-        func.avg(DataSecurityLog.risk_score).label("average_risk_score"),
-        func.max(DataSecurityLog.risk_score).label("highest_risk_score"),
-    )
-    if org_id:
-        q = q.filter(DataSecurityLog.org_id == org_id)
-    if project_id:
-        q = q.filter(DataSecurityLog.project_id == project_id)
-    if start_date:
-        q = q.filter(func.date(DataSecurityLog.created_at) >= start_date)
+    try:
+        q = db.query(
+            func.count(DataSecurityLog.id).label("total_events"),
+            func.sum(cast(DataSecurityLog.pii_detected, Integer)).label("total_with_pii"),
+            func.sum(cast(DataSecurityLog.misuse_pattern_detected, Integer)).label("misuse_events"),
+            func.sum(cast(DataSecurityLog.data_out_violation, Integer)).label("data_out_events"),
+            func.avg(DataSecurityLog.risk_score).label("average_risk_score"),
+            func.max(DataSecurityLog.risk_score).label("highest_risk_score"),
+        )
+        if org_id:
+            q = q.filter(DataSecurityLog.org_id == org_id)
+        if project_id:
+            q = q.filter(DataSecurityLog.project_id == project_id)
+        if start_date:
+            q = q.filter(func.date(DataSecurityLog.created_at) >= start_date)
 
-    row = q.first()
-    return {
-        "total_events":        row.total_events or 0,
-        "total_with_pii":      int(row.total_with_pii or 0),
-        "misuse_events":       int(row.misuse_events or 0),
-        "data_out_events":     int(row.data_out_events or 0),
-        "average_risk_score":  float(row.average_risk_score or 0),
-        "highest_risk_score":  float(row.highest_risk_score or 0),
-    }
+        row = q.first()
+
+        # Also count PII events from proxy requests (AiRequest path)
+        req_q = db.query(func.count(AiRequest.id)).filter(AiRequest.pii_detected == True)
+        if org_id:
+            req_q = req_q.filter(AiRequest.org_id == org_id)
+        if project_id:
+            req_q = req_q.filter(AiRequest.project_id == project_id)
+        if start_date:
+            req_q = req_q.filter(func.date(AiRequest.created_at) >= start_date)
+        proxy_pii_count = req_q.scalar() or 0
+
+        return {
+            "total_events":        (row.total_events or 0) + proxy_pii_count,
+            "total_with_pii":      int(row.total_with_pii or 0) + proxy_pii_count,
+            "misuse_events":       int(row.misuse_events or 0),
+            "data_out_events":     int(row.data_out_events or 0),
+            "average_risk_score":  float(row.average_risk_score or 0),
+            "highest_risk_score":  float(row.highest_risk_score or 0),
+        }
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"security_summary query failed: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -61,38 +76,77 @@ def security_logs(
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ) -> list:
-    q = db.query(DataSecurityLog)
-    if org_id:
-        q = q.filter(DataSecurityLog.org_id == org_id)
-    if project_id:
-        q = q.filter(DataSecurityLog.project_id == project_id)
-    if pii_detected is not None:
-        q = q.filter(DataSecurityLog.pii_detected == pii_detected)
-    if misuse_detected is not None:
-        q = q.filter(DataSecurityLog.misuse_pattern_detected == misuse_detected)
-    if start_date:
-        q = q.filter(func.date(DataSecurityLog.created_at) >= start_date)
+    try:
+        q = db.query(DataSecurityLog)
+        if org_id:
+            q = q.filter(DataSecurityLog.org_id == org_id)
+        if project_id:
+            q = q.filter(DataSecurityLog.project_id == project_id)
+        if pii_detected is not None:
+            q = q.filter(DataSecurityLog.pii_detected == pii_detected)
+        if misuse_detected is not None:
+            q = q.filter(DataSecurityLog.misuse_pattern_detected == misuse_detected)
+        if start_date:
+            q = q.filter(func.date(DataSecurityLog.created_at) >= start_date)
 
-    rows = q.order_by(DataSecurityLog.created_at.desc()).offset(offset).limit(limit).all()
-    return [
-        {
-            "id":                     r.id,
-            "event_id":               r.event_id,
-            "org_id":                 r.org_id,
-            "project_id":             r.project_id,
-            "pii_detected":           r.pii_detected,
-            "pii_type":               r.pii_type,
-            "data_out_violation":     r.data_out_violation,
-            "misuse_pattern_detected": r.misuse_pattern_detected,
-            "abnormal_usage_spike":   r.abnormal_usage_spike,
-            "masking_applied":        r.masking_applied,
-            "risk_score":             float(r.risk_score or 0),
-            "data_in_mb":             float(r.data_in_mb or 0),
-            "data_out_mb":            float(r.data_out_mb or 0),
-            "created_at":             r.created_at.isoformat() if r.created_at else None,
-        }
-        for r in rows
-    ]
+        # Fetch at most limit rows from each source to avoid unbounded memory use.
+        dsl_rows = q.order_by(DataSecurityLog.created_at.desc()).limit(limit).all()
+
+        combined = [
+            {
+                "id":                      r.id,
+                "event_id":                r.event_id,
+                "org_id":                  r.org_id,
+                "project_id":              r.project_id,
+                "pii_detected":            r.pii_detected,
+                "pii_type":                r.pii_type,
+                "data_out_violation":      r.data_out_violation,
+                "misuse_pattern_detected": r.misuse_pattern_detected,
+                "abnormal_usage_spike":    r.abnormal_usage_spike,
+                "masking_applied":         r.masking_applied,
+                "risk_score":              float(r.risk_score or 0),
+                "data_in_mb":              float(r.data_in_mb or 0),
+                "data_out_mb":             float(r.data_out_mb or 0),
+                "created_at":              r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in dsl_rows
+        ]
+
+        # Also pull PII events from proxy requests (pii_detected stored on AiRequest).
+        # Skip when the caller explicitly filters for non-PII or misuse-only events.
+        if pii_detected is not False and misuse_detected is not True:
+            req_q = db.query(AiRequest).filter(AiRequest.pii_detected == True)
+            if org_id:
+                req_q = req_q.filter(AiRequest.org_id == org_id)
+            if project_id:
+                req_q = req_q.filter(AiRequest.project_id == project_id)
+            if start_date:
+                req_q = req_q.filter(func.date(AiRequest.created_at) >= start_date)
+            _risk_map = {"high": 0.9, "medium": 0.5, "low": 0.2}
+            for r in req_q.order_by(AiRequest.created_at.desc()).limit(limit).all():
+                pii_types = r.pii_types or []
+                combined.append({
+                    "id":                      None,
+                    "event_id":                r.request_id,
+                    "org_id":                  r.org_id,
+                    "project_id":              r.project_id,
+                    "pii_detected":            True,
+                    "pii_type":                pii_types[0] if pii_types else None,
+                    "data_out_violation":      False,
+                    "misuse_pattern_detected": False,
+                    "abnormal_usage_spike":    False,
+                    "masking_applied":         bool(r.pii_masked),
+                    "risk_score":              _risk_map.get(r.pii_severity or "", 0.0),
+                    "data_in_mb":              0.0,
+                    "data_out_mb":             0.0,
+                    "created_at":              r.created_at.isoformat() if r.created_at else None,
+                })
+
+        combined.sort(key=lambda x: x["created_at"] or "", reverse=True)
+        return combined[offset: offset + limit]
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"security_logs query failed: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -125,35 +179,39 @@ def security_anomalies(
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ) -> list:
-    q = db.query(UsageAnomaly)
-    if org_id:
-        q = q.filter(UsageAnomaly.org_id == org_id)
-    if project_id:
-        q = q.filter(UsageAnomaly.project_id == project_id)
-    if status:
-        q = q.filter(UsageAnomaly.status == status)
-    if start_date:
-        q = q.filter(func.date(UsageAnomaly.created_at) >= start_date)
+    try:
+        q = db.query(UsageAnomaly)
+        if org_id:
+            q = q.filter(UsageAnomaly.org_id == org_id)
+        if project_id:
+            q = q.filter(UsageAnomaly.project_id == project_id)
+        if status:
+            q = q.filter(UsageAnomaly.status == status)
+        if start_date:
+            q = q.filter(func.date(UsageAnomaly.created_at) >= start_date)
 
-    rows = q.order_by(UsageAnomaly.created_at.desc()).offset(offset).limit(limit).all()
-    return [
-        {
-            "id":             r.id,
-            "org_id":         r.org_id,
-            "project_id":     r.project_id,
-            "tool_name":      r.tool_name,
-            "event_id":       r.event_id,
-            "anomaly_type":   r.anomaly_type,
-            "severity":       r.severity,
-            "anomaly_score":  float(r.anomaly_score or 0),
-            "baseline_value": float(r.baseline_value or 0),
-            "observed_value": float(r.observed_value or 0),
-            "message":        r.message,
-            "status":         r.status,
-            "created_at":     r.created_at.isoformat() if r.created_at else None,
-        }
-        for r in rows
-    ]
+        rows = q.order_by(UsageAnomaly.created_at.desc()).offset(offset).limit(limit).all()
+        return [
+            {
+                "id":             r.id,
+                "org_id":         r.org_id,
+                "project_id":     r.project_id,
+                "tool_name":      r.tool_name,
+                "event_id":       r.event_id,
+                "anomaly_type":   r.anomaly_type,
+                "severity":       r.severity,
+                "anomaly_score":  float(r.anomaly_score or 0),
+                "baseline_value": float(r.baseline_value or 0),
+                "observed_value": float(r.observed_value or 0),
+                "message":        r.message,
+                "status":         r.status,
+                "created_at":     r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in rows
+        ]
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"security_anomalies query failed: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------

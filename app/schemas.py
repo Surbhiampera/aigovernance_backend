@@ -597,6 +597,14 @@ class BudgetUtilizationResponse(BaseModel):
     status: str  # "ok" | "warning" | "exceeded" | "no_budget"
 
 
+class RateLimitCreate(BaseModel):
+    org_id: str
+    project_id: Optional[str] = None
+    key_id: Optional[str] = None
+    max_requests_per_min: Optional[int] = None
+    max_tokens_per_day: Optional[int] = None
+
+
 class RateLimitResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
