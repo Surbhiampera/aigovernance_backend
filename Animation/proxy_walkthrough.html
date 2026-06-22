@@ -392,7 +392,7 @@
     <h1>AI Governance Proxy — Request Walkthrough</h1>
     <p>End-to-end lifecycle of a proxied AI API call</p>
   </div>
-  <div class="stage-counter">Step <span id="stepNum">0</span> of <span id="stepTotal">10</span></div>
+  <div class="stage-counter">Step <span id="stepNum">0</span> of <span id="stepTotal">9</span></div>
 </header>
 
 <div class="main">
@@ -472,7 +472,6 @@ const nodes = [
   { icon: '💻', label: 'Client\nRequest' },
   { icon: '🔑', label: 'Auth\nKey' },
   { icon: '🚦', label: 'Rate\nLimit' },
-  { icon: '📋', label: 'Gov\nRules' },
   { icon: '💰', label: 'Budget\nCheck' },
   { icon: '🛡️', label: 'PII\nScan' },
   { icon: '🔢', label: 'Token\nCount' },
@@ -522,37 +521,16 @@ const stages = [
     ],
     outcome: 'Rate limit OK — 3 of 60 req/min used',
     outcomeCls: 'outcome-success',
-    patchPacket: {},
+    patchPacket: { 'pk-model': { val: 'gpt-4o', cls: 'highlight' } },
     logEntries: [
-      { cls: 'info', msg: 'rate_limit check  key=gov-a3f...' },
+      { cls: 'info', msg: 'rate_limit check  key=gov-a3f...  model=gpt-4o' },
       { cls: 'ok',   msg: 'allowed  3/60 rpm  proj 12/200 rpm' },
     ],
   },
 
-  // 3 — Governance rules
+  // 3 — Budget
   {
-    badge: '📋 Step 3 — Governance Rules',
-    title: 'Enforce Governance Rules',
-    subtitle: 'The proxy checks whether the requested model is on the allow-list for this org/project and whether the estimated input token count is within the configured ceiling. Rules can be set at org level, project level, or both — project-level rules take precedence.',
-    details: [
-      { key: 'Checks',      val: 'Model allow/block list, max input tokens' },
-      { key: 'Scope',       val: 'Org-level or project-level rule' },
-      { key: 'Model',       val: '<span class="tag tag-cyan">gpt-4o</span> — allowed ✓' },
-      { key: 'Max tokens',  val: '128 000 — within limit ✓' },
-      { key: 'Failure',     val: '<span class="tag tag-red">403 Forbidden</span>' },
-    ],
-    outcome: 'Model allowed — token ceiling not exceeded',
-    outcomeCls: 'outcome-success',
-    patchPacket: { 'pk-model': { val: 'gpt-4o', cls: 'highlight' } },
-    logEntries: [
-      { cls: 'info', msg: 'governance rules  model=gpt-4o' },
-      { cls: 'ok',   msg: 'model allowed  token ceiling OK' },
-    ],
-  },
-
-  // 4 — Budget
-  {
-    badge: '💰 Step 4 — Budget Check',
+    badge: '💰 Step 3 — Budget Check',
     title: 'Monthly Budget Enforcement',
     subtitle: 'The proxy queries the current month\'s spend from monthly_org_summaries and compares it to the configured budget limits. Alerts fire at configurable thresholds (e.g. 80%). If the budget is fully exhausted, the request is rejected.',
     details: [
@@ -571,9 +549,9 @@ const stages = [
     ],
   },
 
-  // 5 — PII
+  // 4 — PII
   {
-    badge: '🛡️ Step 5 — PII Scan',
+    badge: '🛡️ Step 4 — PII Scan',
     title: 'PII Detection & Masking',
     subtitle: 'Every message in the request body is scanned for sensitive data — emails, phone numbers, credit card numbers, SSNs, names. Depending on the org\'s PII policy: the entity is masked in-place (e.g. replaced with [EMAIL]) or the entire request is blocked if the policy is "block".',
     details: [
@@ -592,9 +570,9 @@ const stages = [
     ],
   },
 
-  // 6 — Token count
+  // 5 — Token count
   {
-    badge: '🔢 Step 6 — Token Counting & Request Record',
+    badge: '🔢 Step 5 — Token Counting & Request Record',
     title: 'Count Input Tokens & Store AiRequest',
     subtitle: 'The sanitised messages are tokenised using tiktoken to get an accurate input token estimate. An AiRequest row is written to the database with status "pending". This creates the audit trail entry even if the upstream call later fails.',
     details: [
@@ -612,9 +590,9 @@ const stages = [
     ],
   },
 
-  // 7 — Forward to Azure
+  // 6 — Forward to Azure
   {
-    badge: '🤖 Step 7 — Forward to Azure OpenAI',
+    badge: '🤖 Step 6 — Forward to Azure OpenAI',
     title: 'Proxy to Azure OpenAI',
     subtitle: 'The sanitised request is forwarded to Azure OpenAI using admin credentials stored only in the proxy\'s environment. Clients never receive or see these credentials. The proxy swaps the governance key for the Azure API key transparently. Latency is measured precisely.',
     details: [
@@ -633,9 +611,9 @@ const stages = [
     ],
   },
 
-  // 8 — Cost
+  // 7 — Cost
   {
-    badge: '💵 Step 8 — Cost Calculation',
+    badge: '💵 Step 7 — Cost Calculation',
     title: 'Calculate Request Cost',
     subtitle: 'The exact input and output token counts from the Azure response are used to calculate cost using the pricing catalog stored in the DB. Both prompt and completion costs are computed separately, then summed. A RequestCost and TokenUsage row are written.',
     details: [
@@ -656,9 +634,9 @@ const stages = [
     ],
   },
 
-  // 9 — Store
+  // 8 — Store
   {
-    badge: '🗃️ Step 9 — Persist Metadata & Audit Log',
+    badge: '🗃️ Step 8 — Persist Metadata & Audit Log',
     title: 'Store Response & Audit Trail',
     subtitle: 'The proxy writes all telemetry to PostgreSQL in a single transaction: AiResponse (the model\'s output), TokenUsage, RequestCost, AuditLog (decision trail), and RouteExecution (timing breakdown). The AiRequest row is updated from "pending" to "completed".',
     details: [
@@ -678,9 +656,9 @@ const stages = [
     ],
   },
 
-  // 10 — Return
+  // 9 — Return
   {
-    badge: '✅ Step 10 — Response Returned',
+    badge: '✅ Step 9 — Response Returned',
     title: 'Return to Client',
     subtitle: 'The original AI response (identical to what Azure returned) is sent back to the client application. The client app sees a standard OpenAI-compatible response — it has no visibility into the governance checks, PII masking, cost tracking, or audit logging that happened transparently.',
     details: [

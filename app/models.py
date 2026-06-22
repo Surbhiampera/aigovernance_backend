@@ -591,6 +591,8 @@ class AiRequest(Base):
     org_id = Column(String(100), ForeignKey("organizations.id"), nullable=False)
     project_id = Column(String(100), ForeignKey("projects.id"), nullable=True)
     project_ref_id = Column(String(100), nullable=True)
+    failure_code = Column(String(50), nullable=True)
+    failure_reason = Column(Text, nullable=True)
     trace_id = Column(String(120), nullable=True)
     span_id = Column(String(120), nullable=True)
     parent_span_id = Column(String(120), nullable=True)

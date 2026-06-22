@@ -48,7 +48,7 @@ from app.services.audit_service import log_event
 from app.services.budget_service import check_budget
 from app.services.deployment_service import build_provider_request, get_deployment_for_org
 from app.services.governance_key_service import verify_governance_key
-from app.services.governance_rule_service import check_governance_rules, check_max_input_tokens
+
 from app.services.pii_engine import scan_and_mask
 from app.services.rate_limit_service import check_rate_limit
 from app.services.token_counter import count_tokens
@@ -70,6 +70,18 @@ def _new_response_id() -> str:
 
 def _new_execution_id() -> str:
     return f"exec-{uuid.uuid4().hex[:20]}"
+
+
+def _estimate_input_tokens(messages: list[dict], model: str) -> int:
+    """Tiktoken fallback — only called when Azure does not return prompt_tokens."""
+    tokens = 2
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            tokens += 4 + count_tokens(text=content, model_name=model)
+        else:
+            tokens += 4
+    return tokens
 
 
 def _store_route_execution(
@@ -414,6 +426,7 @@ def _store_response_and_cost(
     if req_row:
         req_row.request_status = status
         req_row.completed_at = datetime.utcnow()
+        req_row.input_token_estimate = input_tokens
 
     db.flush()
 
@@ -449,6 +462,48 @@ def _store_audit(
     )
 
 
+def _log_blocked_request(
+    *,
+    db: Session,
+    request_id: str,
+    org_id: str,
+    project_id: Optional[str],
+    key_id: str,
+    source_ip: Optional[str],
+    user_agent: Optional[str],
+    failure_code: str,
+    failure_reason: str,
+    request_payload: Optional[dict] = None,
+) -> None:
+    """Create the AiRequest row for requests blocked before _store_request ran.
+
+    Rate limit, budget, malformed-body, and PII-block rejections all raise
+    HTTPException in _run_pre_flight before the normal AiRequest row is
+    created, so without this they'd be invisible in ai_requests (only
+    surfacing, if at all, in audit_logs).
+    """
+    db.add(AiRequest(
+        request_id=request_id,
+        org_id=org_id,
+        project_id=project_id,
+        governance_key_id=key_id,
+        request_type="chat_completion",
+        request_payload=request_payload,
+        source_ip=source_ip,
+        user_agent=user_agent,
+        request_status="blocked",
+        failure_code=failure_code,
+        failure_reason=failure_reason,
+        completed_at=datetime.utcnow(),
+        created_at=datetime.utcnow(),
+    ))
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+
 def _mark_request_failed(
     *,
     db: Session,
@@ -460,6 +515,7 @@ def _mark_request_failed(
     user_agent: Optional[str],
     detail: str,
     req_status: str = "failed",
+    failure_code: str = "error",
 ) -> None:
     """Mark ai_requests.status and write a failure audit row.
 
@@ -470,6 +526,8 @@ def _mark_request_failed(
     req_row = db.query(AiRequest).filter(AiRequest.request_id == request_id).first()
     if req_row:
         req_row.request_status = req_status
+        req_row.failure_code = failure_code
+        req_row.failure_reason = detail
         req_row.completed_at = datetime.utcnow()
 
     _store_audit(
@@ -524,6 +582,7 @@ def _mark_request_failed_with_cost(
     user_agent: Optional[str],
     detail: str,
     req_status: str = "failed",
+    failure_code: str = "upstream_error",
     input_token_source: str = "tiktoken_estimate",
     output_token_source: str = "tiktoken_estimate",
 ) -> None:
@@ -537,6 +596,8 @@ def _mark_request_failed_with_cost(
     req_row = db.query(AiRequest).filter(AiRequest.request_id == request_id).first()
     if req_row:
         req_row.request_status = req_status
+        req_row.failure_code = failure_code
+        req_row.failure_reason = detail
         req_row.completed_at = datetime.utcnow()
 
     input_cost, output_cost, total_cost, pricing_source, pricing_snapshot, pricing_version = _calculate_cost(
@@ -624,6 +685,7 @@ async def _stream_azure(
     deployment: str,
     provider: str = "",
     input_tokens: int,
+    messages: list[dict],
     source_ip: Optional[str],
     user_agent: Optional[str],
     db: Session,
@@ -668,15 +730,20 @@ async def _stream_azure(
                 db=db, request_id=request_id, org_id=org_id, project_id=project_id,
                 key_id=key_id, source_ip=source_ip, user_agent=user_agent,
                 detail=f"Azure stream 429 rate limit: {exc}",
+                failure_code="upstream_rate_limited",
             )
             if ctx:
                 _store_route_execution(db=db, ctx=ctx, upstream_ms=int((time.time() - t_start) * 1000), total_ms=int((time.time() - ctx["t_request_start"]) * 1000), status="failed")
         else:
             # Use Azure's error body usage if available (e.g. content filter mid-stream),
-            # otherwise use tiktoken on received chunks for input and partial output.
+            # otherwise fall back to tiktoken on the original messages.
             azure_input, _ = _azure_usage_from_error(exc)
-            billed_input = azure_input if azure_input > 0 else input_tokens
-            in_src = "azure" if azure_input > 0 else "tiktoken_estimate"
+            if azure_input > 0:
+                billed_input = azure_input
+                in_src = "azure"
+            else:
+                billed_input = _estimate_input_tokens(messages, model)
+                in_src = "tiktoken_estimate"
             _err_upstream_ms = int((time.time() - t_start) * 1000)
             _mark_request_failed_with_cost(
                 db=db, request_id=request_id, org_id=org_id, project_id=project_id,
@@ -685,6 +752,7 @@ async def _stream_azure(
                 latency_ms=_err_upstream_ms,
                 source_ip=source_ip, user_agent=user_agent,
                 detail=f"Azure stream error {status_code} after {len(chunks_raw)} chunks: {exc}",
+                failure_code=f"upstream_error_{status_code}",
                 input_token_source=in_src,
                 output_token_source="tiktoken_estimate",
             )
@@ -695,13 +763,15 @@ async def _stream_azure(
     except httpx.RequestError as exc:
         yield f"data: {json.dumps({'error': f'Azure unreachable: {exc}'})}\n\n".encode()
         _err_upstream_ms = int((time.time() - t_start) * 1000)
+        _fallback_tokens = _estimate_input_tokens(messages, model)
         _mark_request_failed_with_cost(
             db=db, request_id=request_id, org_id=org_id, project_id=project_id,
             key_id=key_id, model=model, deployment=deployment,
-            input_tokens=input_tokens, output_tokens=0,
+            input_tokens=_fallback_tokens, output_tokens=0,
             latency_ms=_err_upstream_ms,
             source_ip=source_ip, user_agent=user_agent,
             detail=f"Azure stream unreachable (timeout/connection): {exc}",
+            failure_code="upstream_unreachable",
             input_token_source="tiktoken_estimate",
             output_token_source="tiktoken_estimate",
         )
@@ -723,14 +793,16 @@ async def _stream_azure(
     # Azure consumed tokens for whatever was generated — record cost with
     # status="partial" so dashboards can distinguish from clean success.
     if finish_reason is None and chunks_raw:
+        _partial_input = _estimate_input_tokens(messages, model)
         _mark_request_failed_with_cost(
             db=db, request_id=request_id, org_id=org_id, project_id=project_id,
             key_id=key_id, model=model, deployment=deployment,
-            input_tokens=input_tokens, output_tokens=output_tokens,
+            input_tokens=_partial_input, output_tokens=output_tokens,
             latency_ms=latency_ms,
             source_ip=source_ip, user_agent=user_agent,
             detail=f"Stream ended without [DONE] after {len(chunks_raw)} chunks",
             req_status="partial",
+            failure_code="stream_incomplete",
             input_token_source="tiktoken_estimate",
             output_token_source="tiktoken_estimate",
         )
@@ -739,6 +811,7 @@ async def _stream_azure(
         db.commit()
         return
 
+    _stream_input_tokens = _estimate_input_tokens(messages, model)
     _store_response_and_cost(
         db=db,
         request_id=request_id,
@@ -748,7 +821,7 @@ async def _stream_azure(
         deployment=deployment,
         provider=provider,
         response_payload={"streamed": True, "chunks": len(chunks_raw)},
-        input_tokens=input_tokens,
+        input_tokens=_stream_input_tokens,
         output_tokens=output_tokens,
         finish_reason=finish_reason,
         latency_ms=latency_ms,
@@ -804,7 +877,12 @@ async def _run_pre_flight(
             db=db, org_id=org_id, project_id=project_id, key_id=key_id,
             model="", request_id=request_id, source_ip=source_ip,
         )
-    except HTTPException:
+    except HTTPException as exc:
+        _log_blocked_request(
+            db=db, request_id=request_id, org_id=org_id, project_id=project_id,
+            key_id=key_id, source_ip=source_ip, user_agent=user_agent,
+            failure_code="rate_limited", failure_reason=str(exc.detail),
+        )
         raise
     except Exception as _e:
         _log.warning("Rate limit check skipped: %s", _e)
@@ -812,21 +890,32 @@ async def _run_pre_flight(
     try:
         body: dict = await request.json()
     except Exception:
+        _log_blocked_request(
+            db=db, request_id=request_id, org_id=org_id, project_id=project_id,
+            key_id=key_id, source_ip=source_ip, user_agent=user_agent,
+            failure_code="invalid_request", failure_reason="Invalid JSON body.",
+        )
         raise HTTPException(status_code=400, detail="Invalid JSON body.")
 
     model_name = model_override or body.get("model")
     if not model_name:
-        raise HTTPException(
-            status_code=400,
-            detail="Model must be specified via ?model= query param or 'model' in the request body.",
+        _reason = "Model must be specified via ?model= query param or 'model' in the request body."
+        _log_blocked_request(
+            db=db, request_id=request_id, org_id=org_id, project_id=project_id,
+            key_id=key_id, source_ip=source_ip, user_agent=user_agent,
+            failure_code="invalid_request", failure_reason=_reason, request_payload=body,
         )
+        raise HTTPException(status_code=400, detail=_reason)
 
     depl = get_deployment_for_org(db, org_id=org_id, project_id=project_id, requested_model=model_name)
     if not depl:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Model '{model_name}' is not configured or not authorized for this project.",
+        _reason = f"Model '{model_name}' is not configured or not authorized for this project."
+        _log_blocked_request(
+            db=db, request_id=request_id, org_id=org_id, project_id=project_id,
+            key_id=key_id, source_ip=source_ip, user_agent=user_agent,
+            failure_code="model_not_authorized", failure_reason=_reason, request_payload=body,
         )
+        raise HTTPException(status_code=404, detail=_reason)
 
     model: str = depl.model_name
     deployment: str = depl.deployment_name or depl.model_name
@@ -837,22 +926,15 @@ async def _run_pre_flight(
             db=db, org_id=org_id, project_id=project_id,
             request_id=request_id, source_ip=source_ip, key_id=key_id,
         )
-    except HTTPException:
+    except HTTPException as exc:
+        _log_blocked_request(
+            db=db, request_id=request_id, org_id=org_id, project_id=project_id,
+            key_id=key_id, source_ip=source_ip, user_agent=user_agent,
+            failure_code="budget_exceeded", failure_reason=str(exc.detail), request_payload=body,
+        )
         raise
     except Exception as _e:
         _log.warning("Budget check skipped: %s", _e)
-
-    try:
-        check_governance_rules(
-            db=db, org_id=org_id, project_id=project_id,
-            model=model,
-            max_output_tokens_requested=body.get("max_tokens"),
-            request_id=request_id, source_ip=source_ip,
-        )
-    except HTTPException:
-        raise
-    except Exception as _e:
-        _log.warning("Governance rules check skipped: %s", _e)
 
     messages: list[dict] = body.get("messages", [])
     pii_detected = False
@@ -875,7 +957,14 @@ async def _run_pre_flight(
         pii_entities_detected = pii_result.entities_detected
         pii_entities_masked = pii_result.entities_masked
         pii_detail = pii_result.entity_details if pii_result.entity_details else None
-    except HTTPException:
+    except HTTPException as exc:
+        _log_blocked_request(
+            db=db, request_id=request_id, org_id=org_id, project_id=project_id,
+            key_id=key_id, source_ip=source_ip, user_agent=user_agent,
+            failure_code="pii_block",
+            failure_reason=exc.detail.get("message") if isinstance(exc.detail, dict) else str(exc.detail),
+            request_payload=body,
+        )
         raise
     except Exception as _e:
         _log.warning("PII scan skipped: %s", _e)
@@ -885,25 +974,7 @@ async def _run_pre_flight(
     forward_body["messages"] = clean_messages
     forward_body["model"] = model
 
-    # Each message: ~4 tokens structural overhead (role + separators). 2 tokens prime the reply.
-    input_tokens = 2
-    for msg in clean_messages:
-        content = msg.get("content", "")
-        if isinstance(content, str):
-            input_tokens += 4 + count_tokens(text=content, model_name=model)
-        else:
-            input_tokens += 4
-
-    try:
-        check_max_input_tokens(
-            db=db, org_id=org_id, project_id=project_id,
-            model=model, input_tokens=input_tokens,
-            request_id=request_id, source_ip=source_ip,
-        )
-    except HTTPException:
-        raise
-    except Exception as _e:
-        _log.warning("Max input tokens check skipped: %s", _e)
+    input_tokens = 0  # real counts come from Azure usage after response
 
     t_governance_done = time.time()
     entry_point = request.url.path
@@ -988,11 +1059,16 @@ async def proxy_chat(
                 project_id=ctx["project_id"], key_id=ctx["key_id"],
                 source_ip=ctx["source_ip"], user_agent=ctx["user_agent"],
                 detail=f"Azure 429 rate limit: {exc}",
+                failure_code="upstream_rate_limited",
             )
         else:
             azure_input, azure_output = _azure_usage_from_error(exc)
-            billed_input = azure_input if azure_input > 0 else ctx["input_tokens"]
-            in_src = "azure" if azure_input > 0 else "tiktoken_estimate"
+            if azure_input > 0:
+                billed_input = azure_input
+                in_src = "azure"
+            else:
+                billed_input = _estimate_input_tokens(ctx["forward_body"].get("messages", []), ctx["model"])
+                in_src = "tiktoken_estimate"
             out_src = "azure" if azure_output > 0 else "tiktoken_estimate"
             _mark_request_failed_with_cost(
                 db=db, request_id=ctx["request_id"], org_id=ctx["org_id"],
@@ -1002,6 +1078,7 @@ async def proxy_chat(
                 latency_ms=int((time.time() - t_start) * 1000),
                 source_ip=ctx["source_ip"], user_agent=ctx["user_agent"],
                 detail=f"Azure error {status_code}: {exc}",
+                failure_code=f"upstream_error_{status_code}",
                 input_token_source=in_src, output_token_source=out_src,
             )
         try:
@@ -1013,14 +1090,16 @@ async def proxy_chat(
         db.commit()
         raise HTTPException(status_code=status_code, detail=azure_detail)
     except httpx.RequestError as exc:
+        _fallback_tokens = _estimate_input_tokens(ctx["forward_body"].get("messages", []), ctx["model"])
         _mark_request_failed_with_cost(
             db=db, request_id=ctx["request_id"], org_id=ctx["org_id"],
             project_id=ctx["project_id"], key_id=ctx["key_id"],
             model=ctx["model"], deployment=ctx["deployment"],
-            input_tokens=ctx["input_tokens"], output_tokens=0,
+            input_tokens=_fallback_tokens, output_tokens=0,
             latency_ms=int((time.time() - t_start) * 1000),
             source_ip=ctx["source_ip"], user_agent=ctx["user_agent"],
             detail=f"Azure unreachable: {exc}",
+            failure_code="upstream_unreachable",
             input_token_source="tiktoken_estimate", output_token_source="tiktoken_estimate",
         )
         _err_upstream_ms = int((time.time() - t_start) * 1000)
@@ -1035,8 +1114,12 @@ async def proxy_chat(
     azure_prompt = int(usage.get("prompt_tokens", 0))
     azure_completion = int(usage.get("completion_tokens", 0))
 
-    input_tokens = azure_prompt if azure_prompt > 0 else ctx["input_tokens"]
-    in_src = "azure" if azure_prompt > 0 else "tiktoken_estimate"
+    if azure_prompt > 0:
+        input_tokens = azure_prompt
+        in_src = "azure"
+    else:
+        input_tokens = _estimate_input_tokens(ctx["forward_body"].get("messages", []), ctx["model"])
+        in_src = "tiktoken_estimate"
 
     if azure_completion > 0:
         output_tokens = azure_completion
@@ -1138,6 +1221,7 @@ async def proxy_chat_stream(
             deployment=ctx["deployment"],
             provider=ctx.get("provider", ""),
             input_tokens=ctx["input_tokens"],
+            messages=ctx["forward_body"].get("messages", []),
             source_ip=ctx["source_ip"],
             user_agent=ctx["user_agent"],
             db=db,
@@ -1375,6 +1459,8 @@ def list_proxy_requests(
     pii_only: Optional[bool] = None,
     pii_severity: Optional[str] = None,
     pii_action_taken: Optional[str] = None,
+    failure_only: Optional[bool] = None,
+    failure_code: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
     db: Session = Depends(get_db),
@@ -1419,6 +1505,13 @@ def list_proxy_requests(
         filters.append("r.pii_action_taken = :pii_action_taken")
         count_filters.append("pii_action_taken = :pii_action_taken")
         params["pii_action_taken"] = pii_action_taken
+    if failure_only:
+        filters.append("r.failure_code IS NOT NULL")
+        count_filters.append("failure_code IS NOT NULL")
+    if failure_code:
+        filters.append("r.failure_code = :failure_code")
+        count_filters.append("failure_code = :failure_code")
+        params["failure_code"] = failure_code
 
     where = ("WHERE " + " AND ".join(filters)) if filters else ""
     count_where = ("WHERE " + " AND ".join(count_filters)) if count_filters else ""
@@ -1441,7 +1534,8 @@ def list_proxy_requests(
                 f" rc.llm_cost,"
                 f" rc.input_token_cost, rc.output_token_cost,"
                 f" r.entry_point,"
-                f" r.pii_severity, r.pii_entities_detected, r.pii_entities_masked"
+                f" r.pii_severity, r.pii_entities_detected, r.pii_entities_masked,"
+                f" r.failure_code, r.failure_reason, r.completed_at, r.request_payload"
                 f" FROM ai_requests r"
                 f" LEFT JOIN token_usage tu ON tu.request_id = r.request_id"
                 f" LEFT JOIN request_cost rc ON rc.request_id = r.request_id"
@@ -1469,7 +1563,7 @@ def list_proxy_requests(
                 "request_status":   r[6],
                 "status":           r[6],  # backward-compat alias
                 "created_at":       r[7].isoformat() if r[7] else None,
-                "completed_at":     None,
+                "completed_at":     r[29].isoformat() if r[29] else None,
                 "pii_detected":     r[8],
                 "pii_types":        r[9] or [],
                 "pii_action_taken": r[10],
@@ -1488,6 +1582,9 @@ def list_proxy_requests(
                 "pii_severity":          r[24],
                 "pii_entities_detected": r[25] or 0,
                 "pii_entities_masked":   r[26] or 0,
+                "failure_code":          r[27],
+                "failure_reason":        r[28],
+                "request_payload":       r[30],
             }
             for r in rows
         ],

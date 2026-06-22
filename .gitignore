@@ -12,7 +12,7 @@ dist/
 build/
 .venv/
 venv/
-
+settings.json
 # Environment
 .env
 .env.local

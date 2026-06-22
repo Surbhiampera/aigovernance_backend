@@ -80,6 +80,9 @@ _SAFE_ALTERS = [
     "ALTER TABLE model_deployments ADD COLUMN IF NOT EXISTS is_default BOOLEAN DEFAULT FALSE",
     # PII-masked version of the prompt stored alongside the original
     "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS sanitized_prompt_text TEXT",
+    # Structured failure logging — every blocked/errored request gets a code + reason
+    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS failure_code VARCHAR(50)",
+    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS failure_reason TEXT",
     # PII detection outcome columns
     "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS pii_action_taken VARCHAR(20)",
     "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS pii_types JSONB",
