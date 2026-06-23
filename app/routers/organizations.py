@@ -26,10 +26,16 @@ def get_organization(*, org_id: str, db: Session = Depends(get_db)):
     return org
 
 
+DEFAULT_ORG_RATE_LIMIT_RPM = 1200
+
+
 @router.post("/", response_model=OrganizationResponse)
 def create_organization(*, data: OrganizationCreate, db: Session = Depends(get_db)):
     org = Organization(id=data.id, org_name=data.org_name, plan_type=data.plan_type)
     db.add(org)
+    # Org-level default (project_id=NULL) so every project under this org,
+    # including ones created later, is covered without a separate row.
+    db.add(RateLimit(org_id=org.id, max_requests_per_min=DEFAULT_ORG_RATE_LIMIT_RPM))
     db.commit()
     db.refresh(org)
     return org

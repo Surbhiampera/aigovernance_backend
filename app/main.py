@@ -244,3 +244,32 @@ app.include_router(deployments_router)
 @app.get("/health")
 def health_check():
     return {"status": "healthy", "version": "3.0.0"}
+
+
+@app.get("/health/detailed")
+def health_check_detailed():
+    """Capacity/health diagnostics for alerting — not used as the liveness
+    probe (kept separate from /health so a slow DB or open circuit doesn't
+    make the platform think the instance itself is dead and kill it).
+    """
+    from app.database import engine
+    from app.routers.proxy import _azure_circuit, _azure_limiter
+    from app.scheduler import get_scheduler_heartbeat
+
+    pool = engine.pool
+    db_pool_stats = {}
+    for attr in ("checkedout", "checkedin", "overflow", "size"):
+        try:
+            db_pool_stats[attr] = getattr(pool, attr)()
+        except Exception:
+            pass
+    return {
+        "status": "healthy",
+        "db_pool": db_pool_stats,
+        "azure": {
+            "concurrent_in_flight": _azure_limiter.in_flight,
+            "concurrent_max": _azure_limiter.max_concurrent,
+            "circuit_open": _azure_circuit.is_open,
+        },
+        "scheduler": get_scheduler_heartbeat(),
+    }

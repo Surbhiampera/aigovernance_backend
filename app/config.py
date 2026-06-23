@@ -48,14 +48,49 @@ def _int(key: str, default: str) -> int:
     return int(os.getenv(key, default))
 
 
+def get_azure_max_concurrent_requests() -> int:
+    """Cap on in-flight requests to Azure OpenAI per process.
+
+    Backpressure valve: once this many requests are already waiting on Azure,
+    new ones get a fast 503 instead of piling up and exhausting the DB pool
+    or httpx connection limits while waiting on a slow/saturated upstream.
+    """
+    return _int("AZURE_MAX_CONCURRENT_REQUESTS", "40")
+
+
+def get_azure_retry_max_attempts() -> int:
+    """Total attempts (including the first) for transient Azure failures."""
+    return _int("AZURE_RETRY_MAX_ATTEMPTS", "3")
+
+
+def get_azure_retry_backoff_seconds() -> float:
+    """Base delay for exponential backoff between Azure retry attempts."""
+    return float(os.getenv("AZURE_RETRY_BACKOFF_SECONDS", "0.5"))
+
+
+def get_azure_circuit_failure_threshold() -> int:
+    """Consecutive Azure failures before the circuit breaker opens."""
+    return _int("AZURE_CIRCUIT_FAILURE_THRESHOLD", "5")
+
+
+def get_azure_circuit_reset_seconds() -> float:
+    """How long the circuit stays open before allowing a probe request."""
+    return float(os.getenv("AZURE_CIRCUIT_RESET_SECONDS", "30"))
+
+
 def get_db_pool_size() -> int:
-    """Maximum persistent DB connections per API process."""
-    return _int("DB_POOL_SIZE", "3")
+    """Maximum persistent DB connections per API process.
+
+    Default sized for 2 Uvicorn workers against a 50-connection Aiven Postgres
+    plan: 2 workers * (14 pool + 6 overflow) = 40, leaving headroom for the
+    scheduler and external clients. Re-tune if worker count or plan changes.
+    """
+    return _int("DB_POOL_SIZE", "14")
 
 
 def get_db_max_overflow() -> int:
     """Temporary DB connections above pool size; keep low for managed Postgres."""
-    return _int("DB_MAX_OVERFLOW", "0")
+    return _int("DB_MAX_OVERFLOW", "6")
 
 
 def get_db_pool_timeout() -> int:

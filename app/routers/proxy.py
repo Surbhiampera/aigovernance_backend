@@ -26,6 +26,7 @@ Request lifecycle:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -37,16 +38,32 @@ from typing import Any, AsyncIterator, Optional
 _log = logging.getLogger(__name__)
 
 import httpx
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import Integer, cast, func
 from sqlalchemy.orm import Session
 
+from app.config import (
+    get_azure_circuit_failure_threshold,
+    get_azure_circuit_reset_seconds,
+    get_azure_max_concurrent_requests,
+    get_azure_retry_backoff_seconds,
+    get_azure_retry_max_attempts,
+)
 from app.core.deps import get_db
 from app.models import AiRequest, AiResponse, RequestCost, RouteExecution, TokenUsage
 from app.services.audit_service import log_event
 from app.services.budget_service import check_budget
+from app.services.circuit_breaker import CircuitBreaker
 from app.services.deployment_service import build_provider_request, get_deployment_for_org
+from app.services.provider_translation import (
+    extract_usage,
+    needs_translation,
+    stream_delta_text,
+    stream_finish_reason,
+    stream_is_terminal,
+    translate_outbound_body,
+)
 from app.services.governance_key_service import verify_governance_key
 
 from app.services.pii_engine import scan_and_mask
@@ -54,6 +71,80 @@ from app.services.rate_limit_service import check_rate_limit
 from app.services.token_counter import count_tokens
 
 router = APIRouter(prefix="/proxy", tags=["proxy"])
+
+
+class _ConcurrencyLimiter:
+    """Bounded, non-blocking concurrency cap.
+
+    Unlike asyncio.Semaphore, try_acquire() never waits — callers over the
+    limit get an immediate False so they can fail fast (503) instead of
+    queuing behind a slow/saturated upstream and holding a DB connection
+    while they wait.
+    """
+
+    def __init__(self, max_concurrent: int) -> None:
+        self._max = max_concurrent
+        self._count = 0
+        self._lock = asyncio.Lock()
+
+    async def try_acquire(self) -> bool:
+        async with self._lock:
+            if self._count >= self._max:
+                return False
+            self._count += 1
+            return True
+
+    async def release(self) -> None:
+        async with self._lock:
+            self._count -= 1
+
+    @property
+    def in_flight(self) -> int:
+        return self._count
+
+    @property
+    def max_concurrent(self) -> int:
+        return self._max
+
+
+# Backpressure valve: caps in-flight Azure calls per process. Once full,
+# new requests get a fast 503 instead of queuing indefinitely behind a
+# slow/saturated upstream and tying up DB connections while they wait.
+_azure_limiter = _ConcurrencyLimiter(get_azure_max_concurrent_requests())
+
+# Stops hammering an already-failing Azure deployment: opens after repeated
+# failures, fails fast while open, then probes once before fully closing.
+_azure_circuit = CircuitBreaker(
+    failure_threshold=get_azure_circuit_failure_threshold(),
+    reset_seconds=get_azure_circuit_reset_seconds(),
+)
+
+
+async def _post_to_azure_with_retry(
+    client: httpx.AsyncClient, *, url: str, headers: dict, json_body: dict,
+) -> httpx.Response:
+    """POST to Azure, retrying transient failures (timeouts, connection
+    errors, 5xx) with exponential backoff. Does not retry 4xx — those are
+    deterministic (bad request, rate limited, content filtered) and retrying
+    them would just waste the budget without changing the outcome.
+    """
+    max_attempts = get_azure_retry_max_attempts()
+    backoff = get_azure_retry_backoff_seconds()
+    last_exc: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            resp = await client.post(url=url, headers=headers, json=json_body)
+            resp.raise_for_status()
+            return resp
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code < 500:
+                raise
+            last_exc = exc
+        except httpx.RequestError as exc:
+            last_exc = exc
+        if attempt < max_attempts - 1:
+            await asyncio.sleep(backoff * (2 ** attempt))
+    raise last_exc
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +163,85 @@ def _new_execution_id() -> str:
     return f"exec-{uuid.uuid4().hex[:20]}"
 
 
+def _image_dimensions(data: bytes) -> Optional[tuple[int, int]]:
+    """Best-effort (width, height) from raw image bytes — PNG/JPEG/GIF/WEBP headers only."""
+    try:
+        if data[:8] == b"\x89PNG\r\n\x1a\n":
+            w, h = int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+            return w, h
+        if data[:6] in (b"GIF87a", b"GIF89a"):
+            w, h = int.from_bytes(data[6:8], "little"), int.from_bytes(data[8:10], "little")
+            return w, h
+        if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            if data[12:16] == b"VP8X":
+                w = 1 + int.from_bytes(data[24:27], "little")
+                h = 1 + int.from_bytes(data[27:30], "little")
+                return w, h
+        if data[:2] == b"\xff\xd8":  # JPEG — scan markers for SOFx frame
+            i = 2
+            while i < len(data) - 9:
+                if data[i] != 0xFF:
+                    i += 1
+                    continue
+                marker = data[i + 1]
+                if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                              0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                    h = int.from_bytes(data[i + 5:i + 7], "big")
+                    w = int.from_bytes(data[i + 7:i + 9], "big")
+                    return w, h
+                seg_len = int.from_bytes(data[i + 2:i + 4], "big")
+                i += 2 + seg_len
+    except Exception:
+        pass
+    return None
+
+
+def _image_block_tokens(image_url_block: dict) -> int:
+    """OpenAI vision token formula (https://platform.openai.com/docs/guides/vision):
+
+    low detail  → flat 85 tokens.
+    high/auto   → scale to fit 2048x2048, shortest side to 768, tile in 512x512
+                  blocks, tokens = 85 + 170 * num_tiles.
+    Dimensions come from decoding embedded base64 image bytes; remote URLs
+    without inline data can't be measured without fetching them, so they fall
+    back to a single-tile (1024x1024) estimate rather than a 1-tile minimum.
+    """
+    info = image_url_block.get("image_url") or {}
+    if info.get("detail") == "low":
+        return 85
+
+    url = info.get("url", "")
+    dims = None
+    if url.startswith("data:") and "base64," in url:
+        import base64
+        try:
+            dims = _image_dimensions(base64.b64decode(url.split("base64,", 1)[1]))
+        except Exception:
+            dims = None
+
+    width, height = dims or (1024, 1024)
+
+    if width > 2048 or height > 2048:
+        scale = 2048 / max(width, height)
+        width, height = width * scale, height * scale
+
+    scale = 768 / min(width, height) if min(width, height) > 768 else 1
+    width, height = width * scale, height * scale
+
+    tiles_w = -(-int(width) // 512)  # ceil div
+    tiles_h = -(-int(height) // 512)
+    return 85 + 170 * tiles_w * tiles_h
+
+
+def _content_block_tokens(block: dict, model: str) -> int:
+    block_type = block.get("type")
+    if block_type == "text":
+        return count_tokens(text=block.get("text", ""), model_name=model)
+    if block_type == "image_url":
+        return _image_block_tokens(block)
+    return 0
+
+
 def _estimate_input_tokens(messages: list[dict], model: str) -> int:
     """Tiktoken fallback — only called when Azure does not return prompt_tokens."""
     tokens = 2
@@ -79,6 +249,11 @@ def _estimate_input_tokens(messages: list[dict], model: str) -> int:
         content = msg.get("content", "")
         if isinstance(content, str):
             tokens += 4 + count_tokens(text=content, model_name=model)
+        elif isinstance(content, list):
+            tokens += 4 + sum(
+                _content_block_tokens(block, model)
+                for block in content if isinstance(block, dict)
+            )
         else:
             tokens += 4
     return tokens
@@ -114,6 +289,60 @@ def _store_route_execution(
     ))
 
 
+def _flush_success_writes(
+    *,
+    request_id: str,
+    org_id: str,
+    project_id: Optional[str],
+    key_id: str,
+    model: str,
+    deployment: str,
+    provider: str,
+    response_payload: dict,
+    input_tokens: int,
+    output_tokens: int,
+    finish_reason: Optional[str],
+    latency_ms: int,
+    input_token_source: str,
+    output_token_source: str,
+    source_ip: Optional[str],
+    user_agent: Optional[str],
+    ctx: dict,
+    upstream_ms: int,
+    total_ms: int,
+) -> None:
+    """Write response/cost/audit/route-execution rows after the client already
+    has its response. Runs on its own DB session/connection so it never holds
+    up the request that triggered it; failures here are logged, not raised.
+    """
+    from app.database import SessionLocal
+
+    db = SessionLocal()
+    try:
+        _store_response_and_cost(
+            db=db, request_id=request_id, org_id=org_id, project_id=project_id,
+            model=model, deployment=deployment, provider=provider,
+            response_payload=response_payload, input_tokens=input_tokens,
+            output_tokens=output_tokens, finish_reason=finish_reason,
+            latency_ms=latency_ms, status="success",
+            input_token_source=input_token_source, output_token_source=output_token_source,
+        )
+        _store_audit(
+            db=db, request_id=request_id, org_id=org_id, project_id=project_id,
+            key_id=key_id, action="proxy_request_complete", status="success",
+            source_ip=source_ip, user_agent=user_agent,
+        )
+        _store_route_execution(
+            db=db, ctx=ctx, upstream_ms=upstream_ms, total_ms=total_ms, status="success",
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        _log.exception("Background write failed for request_id=%s", request_id)
+    finally:
+        db.close()
+
+
 # ---------------------------------------------------------------------------
 # Step 1: Authenticate governance key
 # ---------------------------------------------------------------------------
@@ -144,13 +373,10 @@ def _scan_messages(
     from app.services.pii_engine import PiiScanResult, compute_pii_severity
     sanitised: list[dict] = []
     combined = PiiScanResult(sanitized_text="")
-    for idx, msg in enumerate(messages):
-        content = msg.get("content", "")
-        if not isinstance(content, str):
-            sanitised.append(msg)
-            continue
+
+    def _scan_text(text: str, *, idx: int, role: str) -> str:
         result = scan_and_mask(
-            text=content,
+            text=text,
             org_id=org_id,
             project_id=project_id,
             db=db,
@@ -176,11 +402,27 @@ def _scan_messages(
             combined.entity_details.append({
                 **entity,
                 "message_index": idx,
-                "role": msg.get("role", "user"),
+                "role": role,
             })
         combined.entities_detected += result.entities_detected
         combined.entities_masked += result.entities_masked
-        sanitised.append({**msg, "content": result.sanitized_text})
+        return result.sanitized_text
+
+    for idx, msg in enumerate(messages):
+        content = msg.get("content", "")
+        role = msg.get("role", "user")
+        if isinstance(content, str):
+            sanitised.append({**msg, "content": _scan_text(content, idx=idx, role=role)})
+        elif isinstance(content, list):
+            scanned_blocks = [
+                {**block, "text": _scan_text(block["text"], idx=idx, role=role)}
+                if isinstance(block, dict) and block.get("type") == "text"
+                else block
+                for block in content
+            ]
+            sanitised.append({**msg, "content": scanned_blocks})
+        else:
+            sanitised.append(msg)
     combined.severity = compute_pii_severity(combined.pii_types, combined.entities_detected)
     return sanitised, combined
 
@@ -188,6 +430,13 @@ def _scan_messages(
 # ---------------------------------------------------------------------------
 # Step 5: Store AiRequest
 # ---------------------------------------------------------------------------
+
+def _concat_message_text(messages: list[dict]) -> str:
+    return "\n".join(
+        m.get("content", "") for m in messages
+        if isinstance(m, dict) and isinstance(m.get("content"), str)
+    )
+
 
 def _store_request(
     *,
@@ -203,6 +452,8 @@ def _store_request(
     input_tokens: int,
     source_ip: Optional[str],
     user_agent: Optional[str],
+    original_messages: Optional[list[dict]] = None,
+    sanitized_messages: Optional[list[dict]] = None,
     pii_detected: bool = False,
     pii_types: list = None,
     pii_masked: bool = False,
@@ -222,6 +473,12 @@ def _store_request(
         model_name=model,
         deployment_name=deployment,
         request_payload=payload,
+        # Original (pre-mask) messages and masked text kept side-by-side for
+        # audit/traceability — `request_payload` only holds the masked body
+        # actually forwarded upstream.
+        messages=original_messages,
+        prompt_text=_concat_message_text(original_messages) if original_messages else None,
+        sanitized_prompt_text=_concat_message_text(sanitized_messages) if sanitized_messages else None,
         input_token_estimate=input_tokens,
         source_ip=source_ip,
         user_agent=user_agent,
@@ -717,7 +974,10 @@ async def _stream_azure(
                         except Exception:
                             pass
                         yield (line + "\n\n").encode()
+        await _azure_circuit.record_success()
     except httpx.HTTPStatusError as exc:
+        if exc.response.status_code >= 500:
+            await _azure_circuit.record_failure()
         yield f"data: {json.dumps({'error': str(exc)})}\n\n".encode()
         partial_output = "".join(
             json.loads(c).get("choices", [{}])[0].get("delta", {}).get("content") or ""
@@ -761,6 +1021,7 @@ async def _stream_azure(
         db.commit()
         return
     except httpx.RequestError as exc:
+        await _azure_circuit.record_failure()
         yield f"data: {json.dumps({'error': f'Azure unreachable: {exc}'})}\n\n".encode()
         _err_upstream_ms = int((time.time() - t_start) * 1000)
         _fallback_tokens = _estimate_input_tokens(messages, model)
@@ -845,6 +1106,179 @@ async def _stream_azure(
     db.commit()
 
 
+async def _stream_provider_native(
+    *,
+    url: str,
+    headers: dict,
+    body: dict,
+    request_id: str,
+    org_id: str,
+    project_id: Optional[str],
+    key_id: str,
+    model: str,
+    deployment: str,
+    provider: str,
+    messages: list[dict],
+    source_ip: Optional[str],
+    user_agent: Optional[str],
+    db: Session,
+    t_start: float,
+    ctx: Optional[dict] = None,
+) -> AsyncIterator[bytes]:
+    """Stream Anthropic/Google responses to the client byte-for-byte (native
+    passthrough — no chunk reshaping) while parsing the same SSE events on
+    the side, via provider_translation.stream_*, purely for internal
+    accounting (tokens are always tiktoken-estimated on the stream path,
+    same as the existing Azure stream behavior above).
+    """
+    text_chunks: list[str] = []
+    finish_reason: Optional[str] = None
+    saw_any_chunk = False
+    buffer = ""
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=5.0)
+        ) as client:
+            async with client.stream("POST", url=url, headers=headers, json=body) as resp:
+                resp.raise_for_status()
+                async for raw in resp.aiter_bytes():
+                    if not raw:
+                        continue
+                    yield raw
+                    buffer += raw.decode("utf-8", errors="ignore")
+                    while "\n\n" in buffer:
+                        block, buffer = buffer.split("\n\n", 1)
+                        for line in block.split("\n"):
+                            if not line.startswith("data:"):
+                                continue
+                            json_str = line[5:].strip()
+                            if not json_str:
+                                continue
+                            try:
+                                chunk = json.loads(json_str)
+                            except (json.JSONDecodeError, TypeError):
+                                continue
+                            saw_any_chunk = True
+                            delta = stream_delta_text(provider, chunk)
+                            if delta:
+                                text_chunks.append(delta)
+                            fr = stream_finish_reason(provider, chunk)
+                            if fr:
+                                finish_reason = fr
+                            if stream_is_terminal(provider, chunk):
+                                finish_reason = finish_reason or "stop"
+        await _azure_circuit.record_success()
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code >= 500:
+            await _azure_circuit.record_failure()
+        status_code = exc.response.status_code
+        partial_output = "".join(text_chunks)
+        partial_output_tokens = count_tokens(text=partial_output, model_name=model) if partial_output else 0
+        if status_code == 429 and partial_output_tokens == 0:
+            _mark_request_failed(
+                db=db, request_id=request_id, org_id=org_id, project_id=project_id,
+                key_id=key_id, source_ip=source_ip, user_agent=user_agent,
+                detail=f"{provider} stream 429 rate limit: {exc}",
+                failure_code="upstream_rate_limited",
+            )
+            if ctx:
+                _store_route_execution(db=db, ctx=ctx, upstream_ms=int((time.time() - t_start) * 1000), total_ms=int((time.time() - ctx["t_request_start"]) * 1000), status="failed")
+        else:
+            _err_upstream_ms = int((time.time() - t_start) * 1000)
+            _billed_input = _estimate_input_tokens(messages, model)
+            _mark_request_failed_with_cost(
+                db=db, request_id=request_id, org_id=org_id, project_id=project_id,
+                key_id=key_id, model=model, deployment=deployment,
+                input_tokens=_billed_input, output_tokens=partial_output_tokens,
+                latency_ms=_err_upstream_ms,
+                source_ip=source_ip, user_agent=user_agent,
+                detail=f"{provider} stream error {status_code} after {len(text_chunks)} text chunks: {exc}",
+                failure_code=f"upstream_error_{status_code}",
+                input_token_source="tiktoken_estimate",
+                output_token_source="tiktoken_estimate",
+            )
+            if ctx:
+                _store_route_execution(db=db, ctx=ctx, upstream_ms=_err_upstream_ms, total_ms=int((time.time() - ctx["t_request_start"]) * 1000), status="failed")
+        db.commit()
+        return
+    except httpx.RequestError as exc:
+        await _azure_circuit.record_failure()
+        _err_upstream_ms = int((time.time() - t_start) * 1000)
+        _fallback_tokens = _estimate_input_tokens(messages, model)
+        _mark_request_failed_with_cost(
+            db=db, request_id=request_id, org_id=org_id, project_id=project_id,
+            key_id=key_id, model=model, deployment=deployment,
+            input_tokens=_fallback_tokens, output_tokens=0,
+            latency_ms=_err_upstream_ms,
+            source_ip=source_ip, user_agent=user_agent,
+            detail=f"{provider} unreachable: {exc}",
+            failure_code="upstream_unreachable",
+            input_token_source="tiktoken_estimate",
+            output_token_source="tiktoken_estimate",
+        )
+        if ctx:
+            _store_route_execution(db=db, ctx=ctx, upstream_ms=_err_upstream_ms, total_ms=int((time.time() - ctx["t_request_start"]) * 1000), status="failed")
+        db.commit()
+        return
+
+    latency_ms = int((time.time() - t_start) * 1000)
+    combined = "".join(text_chunks)
+    output_tokens = count_tokens(text=combined, model_name=model) if combined else 0
+
+    if finish_reason is None and saw_any_chunk:
+        _partial_input = _estimate_input_tokens(messages, model)
+        _mark_request_failed_with_cost(
+            db=db, request_id=request_id, org_id=org_id, project_id=project_id,
+            key_id=key_id, model=model, deployment=deployment,
+            input_tokens=_partial_input, output_tokens=output_tokens,
+            latency_ms=latency_ms,
+            source_ip=source_ip, user_agent=user_agent,
+            detail=f"{provider} stream ended without a terminal event after {len(text_chunks)} text chunks",
+            req_status="partial",
+            failure_code="stream_incomplete",
+            input_token_source="tiktoken_estimate",
+            output_token_source="tiktoken_estimate",
+        )
+        if ctx:
+            _store_route_execution(db=db, ctx=ctx, upstream_ms=latency_ms, total_ms=int((time.time() - ctx["t_request_start"]) * 1000), status="partial")
+        db.commit()
+        return
+
+    _stream_input_tokens = _estimate_input_tokens(messages, model)
+    _store_response_and_cost(
+        db=db,
+        request_id=request_id,
+        org_id=org_id,
+        project_id=project_id,
+        model=model,
+        deployment=deployment,
+        provider=provider,
+        response_payload={"streamed": True, "text_chunks": len(text_chunks)},
+        input_tokens=_stream_input_tokens,
+        output_tokens=output_tokens,
+        finish_reason=finish_reason,
+        latency_ms=latency_ms,
+        status="success",
+        input_token_source="tiktoken_estimate",
+        output_token_source="tiktoken_estimate",
+    )
+    _store_audit(
+        db=db,
+        request_id=request_id,
+        org_id=org_id,
+        project_id=project_id,
+        key_id=key_id,
+        action="proxy_stream_complete",
+        status="success",
+        source_ip=source_ip,
+        user_agent=user_agent,
+    )
+    if ctx:
+        _store_route_execution(db=db, ctx=ctx, upstream_ms=latency_ms, total_ms=int((time.time() - ctx["t_request_start"]) * 1000), status="success")
+    db.commit()
+
+
 # ---------------------------------------------------------------------------
 # Shared enforcement pipeline (steps 1-6)
 # ---------------------------------------------------------------------------
@@ -855,6 +1289,7 @@ async def _run_pre_flight(
     x_governance_key: str,
     model_override: Optional[str],
     db: Session,
+    stream: bool = False,
 ) -> dict:
     """Auth, rate-limit, model resolution, budget/governance checks, PII scan, token count.
 
@@ -991,6 +1426,8 @@ async def _run_pre_flight(
         payload=forward_body,
         input_tokens=input_tokens,
         source_ip=source_ip,
+        original_messages=messages,
+        sanitized_messages=clean_messages,
         pii_detected=pii_detected,
         pii_types=pii_types,
         pii_masked=pii_masked,
@@ -1004,7 +1441,9 @@ async def _run_pre_flight(
     )
     db.commit()
 
-    url, azure_hdrs = build_provider_request(depl)
+    url, azure_hdrs = build_provider_request(depl, stream=stream)
+    provider = getattr(depl, "provider", None) or ""
+    outbound_body = translate_outbound_body(provider, forward_body)
 
     return dict(
         request_id=request_id,
@@ -1013,8 +1452,9 @@ async def _run_pre_flight(
         key_id=key_id,
         model=model,
         deployment=deployment,
-        provider=getattr(depl, "provider", None) or "",
+        provider=provider,
         forward_body=forward_body,
+        outbound_body=outbound_body,
         input_tokens=input_tokens,
         source_ip=source_ip,
         user_agent=user_agent,
@@ -1034,6 +1474,7 @@ async def _run_pre_flight(
 @router.post("")
 async def proxy_chat(
     request: Request,
+    background_tasks: BackgroundTasks,
     model: Optional[str] = Query(None, description="AI model name (overrides body 'model' field)"),
     x_governance_key: str = Header(..., alias="X-Governance-Key"),
     db: Session = Depends(get_db),
@@ -1043,14 +1484,35 @@ async def proxy_chat(
     )
     t_start = time.time()
 
+    if not await _azure_limiter.try_acquire():
+        raise HTTPException(
+            status_code=503,
+            detail="Server busy: too many concurrent requests to Azure OpenAI. Please retry shortly.",
+        )
+    if not await _azure_circuit.allow_request():
+        await _azure_limiter.release()
+        raise HTTPException(
+            status_code=503,
+            detail="Azure OpenAI is failing repeatedly; circuit breaker open. Please retry shortly.",
+        )
     try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=5.0)
-        ) as client:
-            azure_resp = await client.post(
-                url=ctx["url"], headers=ctx["azure_hdrs"], json=ctx["forward_body"],
-            )
-            azure_resp.raise_for_status()
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=5.0)
+            ) as client:
+                azure_resp = await _post_to_azure_with_retry(
+                    client, url=ctx["url"], headers=ctx["azure_hdrs"], json_body=ctx["outbound_body"],
+                )
+            await _azure_circuit.record_success()
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code >= 500:
+                await _azure_circuit.record_failure()
+            raise
+        except httpx.RequestError:
+            await _azure_circuit.record_failure()
+            raise
+        finally:
+            await _azure_limiter.release()
     except httpx.HTTPStatusError as exc:
         status_code = exc.response.status_code
         if status_code == 429:
@@ -1110,38 +1572,31 @@ async def proxy_chat(
     latency_ms = int((time.time() - t_start) * 1000)
     response_data: dict = azure_resp.json()
 
-    usage = response_data.get("usage", {})
-    azure_prompt = int(usage.get("prompt_tokens", 0))
-    azure_completion = int(usage.get("completion_tokens", 0))
+    provider_usage = extract_usage(ctx.get("provider", ""), response_data)
 
-    if azure_prompt > 0:
-        input_tokens = azure_prompt
+    if provider_usage.input_tokens_known:
+        input_tokens = provider_usage.input_tokens
         in_src = "azure"
     else:
         input_tokens = _estimate_input_tokens(ctx["forward_body"].get("messages", []), ctx["model"])
         in_src = "tiktoken_estimate"
 
-    if azure_completion > 0:
-        output_tokens = azure_completion
+    if provider_usage.output_tokens_known:
+        output_tokens = provider_usage.output_tokens
         out_src = "azure"
     else:
-        output_text = "".join(
-            (c.get("message", {}).get("content") or "")
-            for c in response_data.get("choices", [])
-        )
-        output_tokens = count_tokens(text=output_text, model_name=ctx["model"])
+        output_tokens = count_tokens(text=provider_usage.output_text, model_name=ctx["model"])
         out_src = "tiktoken_estimate"
 
-    finish_reason: Optional[str] = None
-    choices = response_data.get("choices", [])
-    if choices:
-        finish_reason = choices[0].get("finish_reason")
+    finish_reason: Optional[str] = provider_usage.finish_reason
 
-    _store_response_and_cost(
-        db=db,
+    total_ms = int((time.time() - ctx["t_request_start"]) * 1000)
+    background_tasks.add_task(
+        _flush_success_writes,
         request_id=ctx["request_id"],
         org_id=ctx["org_id"],
         project_id=ctx["project_id"],
+        key_id=ctx["key_id"],
         model=ctx["model"],
         deployment=ctx["deployment"],
         provider=ctx.get("provider", ""),
@@ -1150,24 +1605,14 @@ async def proxy_chat(
         output_tokens=output_tokens,
         finish_reason=finish_reason,
         latency_ms=latency_ms,
-        status="success",
         input_token_source=in_src,
         output_token_source=out_src,
-    )
-    _store_audit(
-        db=db,
-        request_id=ctx["request_id"],
-        org_id=ctx["org_id"],
-        project_id=ctx["project_id"],
-        key_id=ctx["key_id"],
-        action="proxy_request_complete",
-        status="success",
         source_ip=ctx["source_ip"],
         user_agent=ctx["user_agent"],
+        ctx=ctx,
+        upstream_ms=latency_ms,
+        total_ms=total_ms,
     )
-    total_ms = int((time.time() - ctx["t_request_start"]) * 1000)
-    _store_route_execution(db=db, ctx=ctx, upstream_ms=latency_ms, total_ms=total_ms, status="success")
-    db.commit()
 
     return JSONResponse(
         content=response_data,
@@ -1186,11 +1631,15 @@ async def proxy_chat(
 @router.post("/v1/chat/completions")
 async def proxy_chat_openai_compat(
     request: Request,
+    background_tasks: BackgroundTasks,
     model: Optional[str] = Query(None, description="AI model name (overrides body 'model' field)"),
     x_governance_key: str = Header(..., alias="X-Governance-Key"),
     db: Session = Depends(get_db),
 ) -> Any:
-    return await proxy_chat(request=request, model=model, x_governance_key=x_governance_key, db=db)
+    return await proxy_chat(
+        request=request, background_tasks=background_tasks, model=model,
+        x_governance_key=x_governance_key, db=db,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1206,20 +1655,55 @@ async def proxy_chat_stream(
 ) -> Any:
     ctx = await _run_pre_flight(
         request=request, x_governance_key=x_governance_key, model_override=model, db=db,
+        stream=True,
     )
     t_start = time.time()
-    return StreamingResponse(
-        _stream_azure(
+
+    if not await _azure_limiter.try_acquire():
+        raise HTTPException(
+            status_code=503,
+            detail="Server busy: too many concurrent requests to Azure OpenAI. Please retry shortly.",
+        )
+    if not await _azure_circuit.allow_request():
+        await _azure_limiter.release()
+        raise HTTPException(
+            status_code=503,
+            detail="Azure OpenAI is failing repeatedly; circuit breaker open. Please retry shortly.",
+        )
+    release_tasks = BackgroundTasks()
+    release_tasks.add_task(_azure_limiter.release)
+    provider = ctx.get("provider", "")
+    stream_generator = (
+        _stream_provider_native(
             url=ctx["url"],
             headers=ctx["azure_hdrs"],
-            body={**ctx["forward_body"], "stream": True},
+            body={**ctx["outbound_body"], "stream": True},
             request_id=ctx["request_id"],
             org_id=ctx["org_id"],
             project_id=ctx["project_id"],
             key_id=ctx["key_id"],
             model=ctx["model"],
             deployment=ctx["deployment"],
-            provider=ctx.get("provider", ""),
+            provider=provider,
+            messages=ctx["forward_body"].get("messages", []),
+            source_ip=ctx["source_ip"],
+            user_agent=ctx["user_agent"],
+            db=db,
+            t_start=t_start,
+            ctx=ctx,
+        )
+        if needs_translation(provider) else
+        _stream_azure(
+            url=ctx["url"],
+            headers=ctx["azure_hdrs"],
+            body={**ctx["outbound_body"], "stream": True},
+            request_id=ctx["request_id"],
+            org_id=ctx["org_id"],
+            project_id=ctx["project_id"],
+            key_id=ctx["key_id"],
+            model=ctx["model"],
+            deployment=ctx["deployment"],
+            provider=provider,
             input_tokens=ctx["input_tokens"],
             messages=ctx["forward_body"].get("messages", []),
             source_ip=ctx["source_ip"],
@@ -1227,8 +1711,12 @@ async def proxy_chat_stream(
             db=db,
             t_start=t_start,
             ctx=ctx,
-        ),
+        )
+    )
+    return StreamingResponse(
+        stream_generator,
         media_type="text/event-stream",
+        background=release_tasks,
         headers={"Cache-Control": "no-cache", "X-Request-Id": ctx["request_id"]},
     )
 
@@ -1606,6 +2094,7 @@ def get_request_pii_detail(
                 " r.pii_detected, r.pii_types, r.pii_action_taken,"
                 " r.pii_severity, r.pii_entities_detected, r.pii_entities_masked,"
                 " r.pii_detail, r.request_payload, r.created_at,"
+                " r.messages, r.prompt_text, r.sanitized_prompt_text,"
                 " resp.response_text, resp.output_pii_types"
                 " FROM ai_requests r"
                 " LEFT JOIN ai_responses resp ON resp.request_id = r.request_id"
@@ -1633,6 +2122,9 @@ def get_request_pii_detail(
         "pii_detail":            row[9] or [],
         "request_payload":       row[10],
         "created_at":            row[11].isoformat() if row[11] else None,
-        "response_text":         row[12],
-        "output_pii_types":      row[13] or [],
+        "original_messages":     row[12] or [],
+        "original_prompt_text":  row[13],
+        "sanitized_prompt_text": row[14],
+        "response_text":         row[15],
+        "output_pii_types":      row[16] or [],
     }

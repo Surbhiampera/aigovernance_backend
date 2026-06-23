@@ -13,6 +13,23 @@ from app.config import get_scheduler_max_workers
 
 _scheduler: BackgroundScheduler | None = None
 
+# Last successful run per job, for health-check staleness alerts — a hung
+# scheduler thread fails silently otherwise (no exception, just stops ticking).
+_last_success: dict[str, "datetime.datetime | None"] = {
+    "daily_agg": None,
+    "monthly_agg": None,
+}
+
+
+def get_scheduler_heartbeat() -> dict:
+    return {
+        "running": bool(_scheduler and _scheduler.running),
+        "last_success": {
+            job_id: (ts.isoformat() if ts else None)
+            for job_id, ts in _last_success.items()
+        },
+    }
+
 
 def _job_daily_aggregation() -> None:
     import datetime
@@ -28,6 +45,7 @@ def _job_daily_aggregation() -> None:
         db.flush()
         _detect_daily_anomalies(db=db, summary_date=today)
         db.commit()
+        _last_success["daily_agg"] = datetime.datetime.utcnow()
     except Exception:
         _log.exception("daily_aggregation job failed")
         db.rollback()
@@ -36,6 +54,8 @@ def _job_daily_aggregation() -> None:
 
 
 def _job_monthly_aggregation() -> None:
+    import datetime
+
     from app.database import SessionLocal
     from app.workers.tasks import _rebuild_monthly_summary
 
@@ -43,6 +63,7 @@ def _job_monthly_aggregation() -> None:
     try:
         _rebuild_monthly_summary(db=db)
         db.commit()
+        _last_success["monthly_agg"] = datetime.datetime.utcnow()
     except Exception:
         db.rollback()
     finally:

@@ -99,8 +99,12 @@ def _env_fallback(*, org_id: str, project_id: Optional[str]):
     return _EnvDeployment()
 
 
-def build_provider_request(depl) -> tuple[str, dict]:
-    """Return (url, headers) for the given deployment config."""
+def build_provider_request(depl, stream: bool = False) -> tuple[str, dict]:
+    """Return (url, headers) for the given deployment config.
+
+    `stream` only changes the URL for providers with a distinct streaming
+    endpoint (currently Google Gemini's streamGenerateContent).
+    """
     provider  = (depl.provider or "").lower().replace("-", "_").replace(" ", "_")
     api_key   = depl.api_key or ""
     endpoint  = (depl.endpoint_url or "").rstrip("/")
@@ -132,6 +136,12 @@ def build_provider_request(depl) -> tuple[str, dict]:
             "anthropic-version": "2023-06-01",
             "Content-Type": _CONTENT_TYPE_JSON,
         }
+
+    elif provider == "google":
+        base = endpoint or "https://generativelanguage.googleapis.com/v1beta"
+        method = "streamGenerateContent?alt=sse" if stream else "generateContent"
+        url = f"{base}/models/{dep_name}:{method}"
+        headers = {"x-goog-api-key": api_key, "Content-Type": _CONTENT_TYPE_JSON}
 
     else:
         url = f"{endpoint}/chat/completions"
