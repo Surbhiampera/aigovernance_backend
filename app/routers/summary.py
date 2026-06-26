@@ -89,12 +89,18 @@ def get_today_summary(
 ) -> dict:
     today = date.today()
     q = db.query(
-        func.count(RequestCost.request_id).label("total_requests"),
+        # One pipeline (parent + child LLM calls) counts as one request;
+        # token/cost sums still cover every call.
+        func.count(
+            func.distinct(func.coalesce(AiRequest.parent_request_id, AiRequest.request_id))
+        ).label("total_requests"),
         func.sum(RequestCost.input_tokens).label("input_tokens"),
         func.sum(RequestCost.output_tokens).label("output_tokens"),
         func.sum(RequestCost.total_tokens).label("total_tokens"),
         func.sum(RequestCost.total_cost).label("total_cost"),
-    ).filter(func.date(RequestCost.created_at) == today)
+    ).join(AiRequest, AiRequest.request_id == RequestCost.request_id).filter(
+        func.date(RequestCost.created_at) == today
+    )
     q = _org_filter(q, RequestCost, org_id=org_id)
     q = _project_filter(q, RequestCost, project_id=project_id)
     r = q.first()

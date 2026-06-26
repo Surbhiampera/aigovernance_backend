@@ -5,10 +5,11 @@ from sqlalchemy.orm import Session
 from app.core.deps import get_db
 from app.models import (
     Alert, AiRequest, AiResponse, ApiKey, AuditLog, Budget,
-    DailyOrgSummary, GovernanceRule, MonthlyOrgSummary,
+    DailyOrgSummary, GovernanceRule, ModelDeployment, MonthlyOrgSummary,
     Organization, Project, RateLimit, RequestCost, TokenUsage, User,
 )
 from app.schemas import OrganizationCreate, OrganizationResponse, OrganizationUpdate
+from app.services.deployment_service import provision_standard_deployments
 
 router = APIRouter(prefix="/organizations", tags=["organizations"])
 
@@ -36,9 +37,25 @@ def create_organization(*, data: OrganizationCreate, db: Session = Depends(get_d
     # Org-level default (project_id=NULL) so every project under this org,
     # including ones created later, is covered without a separate row.
     db.add(RateLimit(org_id=org.id, max_requests_per_min=DEFAULT_ORG_RATE_LIMIT_RPM))
+    # Auto-provision the standard model deployments (see STANDARD_MODEL_DEPLOYMENTS
+    # in config.py) so every org gets all configured models without a manual
+    # POST /deployments call per model.
+    provision_standard_deployments(db, org_id=org.id)
     db.commit()
     db.refresh(org)
     return org
+
+
+@router.post("/{org_id}/provision-deployments")
+def provision_deployments_for_org(*, org_id: str, db: Session = Depends(get_db)):
+    """Backfill the standard model deployments for an org created before
+    STANDARD_MODEL_DEPLOYMENTS auto-provisioning existed."""
+    org = db.query(Organization).filter(Organization.id == org_id).first()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    created = provision_standard_deployments(db, org_id=org_id)
+    db.commit()
+    return {"org_id": org_id, "deployments_created": created}
 
 
 @router.put("/{org_id}", response_model=OrganizationResponse)
@@ -77,6 +94,7 @@ def delete_organization(*, org_id: str, db: Session = Depends(get_db)):
         db.query(DailyOrgSummary).filter(DailyOrgSummary.org_id == org_id).delete(synchronize_session=False)
         db.query(MonthlyOrgSummary).filter(MonthlyOrgSummary.org_id == org_id).delete(synchronize_session=False)
         db.query(RateLimit).filter(RateLimit.org_id == org_id).delete(synchronize_session=False)
+        db.query(ModelDeployment).filter(ModelDeployment.org_id == org_id).delete(synchronize_session=False)
         db.query(Budget).filter(Budget.org_id == org_id).delete(synchronize_session=False)
         db.query(ApiKey).filter(ApiKey.org_id == org_id).delete(synchronize_session=False)
         db.query(User).filter(User.org_id == org_id).delete(synchronize_session=False)

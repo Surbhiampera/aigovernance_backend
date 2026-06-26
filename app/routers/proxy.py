@@ -55,7 +55,7 @@ from app.models import AiRequest, AiResponse, RequestCost, RouteExecution, Token
 from app.services.audit_service import log_event
 from app.services.budget_service import check_budget
 from app.services.circuit_breaker import CircuitBreaker
-from app.services.deployment_service import build_provider_request, get_deployment_for_org
+from app.services.deployment_service import build_provider_request, get_deployments_for_org
 from app.services.provider_translation import (
     extract_usage,
     needs_translation,
@@ -67,7 +67,7 @@ from app.services.provider_translation import (
 from app.services.governance_key_service import verify_governance_key
 
 from app.services.pii_engine import scan_and_mask
-from app.services.rate_limit_service import check_rate_limit
+from app.services.rate_limit_service import check_rate_limit, record_tokens_used
 from app.services.token_counter import count_tokens
 
 router = APIRouter(prefix="/proxy", tags=["proxy"])
@@ -112,12 +112,26 @@ class _ConcurrencyLimiter:
 # slow/saturated upstream and tying up DB connections while they wait.
 _azure_limiter = _ConcurrencyLimiter(get_azure_max_concurrent_requests())
 
-# Stops hammering an already-failing Azure deployment: opens after repeated
+# Stops hammering an already-failing deployment: opens after repeated
 # failures, fails fast while open, then probes once before fully closing.
-_azure_circuit = CircuitBreaker(
-    failure_threshold=get_azure_circuit_failure_threshold(),
-    reset_seconds=get_azure_circuit_reset_seconds(),
-)
+# Keyed per (provider, deployment) — not global — so a failing primary
+# deployment doesn't trip the breaker for an unrelated fallback deployment.
+_circuit_breakers: dict[str, CircuitBreaker] = {}
+
+
+def _circuit_key(provider: str, deployment: str) -> str:
+    return f"{provider or 'azure_openai'}:{deployment}"
+
+
+def _get_circuit_breaker(key: str) -> CircuitBreaker:
+    cb = _circuit_breakers.get(key)
+    if cb is None:
+        cb = CircuitBreaker(
+            failure_threshold=get_azure_circuit_failure_threshold(),
+            reset_seconds=get_azure_circuit_reset_seconds(),
+        )
+        _circuit_breakers[key] = cb
+    return cb
 
 
 async def _post_to_azure_with_retry(
@@ -463,6 +477,8 @@ def _store_request(
     pii_entities_masked: int = 0,
     pii_detail: Optional[list] = None,
     entry_point: Optional[str] = None,
+    trace_id: Optional[str] = None,
+    parent_request_id: Optional[str] = None,
 ) -> AiRequest:
     row = AiRequest(
         request_id=request_id,
@@ -473,6 +489,8 @@ def _store_request(
         model_name=model,
         deployment_name=deployment,
         request_payload=payload,
+        trace_id=trace_id,
+        parent_request_id=parent_request_id,
         # Original (pre-mask) messages and masked text kept side-by-side for
         # audit/traceability — `request_payload` only holds the masked body
         # actually forwarded upstream.
@@ -679,11 +697,18 @@ def _store_response_and_cost(
         created_at=datetime.utcnow(),
     ))
 
+    record_tokens_used(org_id=org_id, project_id=project_id, tokens=input_tokens + output_tokens)
+
     req_row = db.query(AiRequest).filter(AiRequest.request_id == request_id).first()
     if req_row:
         req_row.request_status = status
         req_row.completed_at = datetime.utcnow()
         req_row.input_token_estimate = input_tokens
+        # Reflects whichever deployment actually served the request — may
+        # differ from the primary if failover happened, so the request row
+        # never disagrees with its own AiResponse/TokenUsage/RequestCost rows.
+        req_row.model_name = model
+        req_row.deployment_name = deployment
 
     db.flush()
 
@@ -731,6 +756,8 @@ def _log_blocked_request(
     failure_code: str,
     failure_reason: str,
     request_payload: Optional[dict] = None,
+    trace_id: Optional[str] = None,
+    parent_request_id: Optional[str] = None,
 ) -> None:
     """Create the AiRequest row for requests blocked before _store_request ran.
 
@@ -751,6 +778,8 @@ def _log_blocked_request(
         request_status="blocked",
         failure_code=failure_code,
         failure_reason=failure_reason,
+        trace_id=trace_id,
+        parent_request_id=parent_request_id,
         completed_at=datetime.utcnow(),
         created_at=datetime.utcnow(),
     ))
@@ -773,12 +802,18 @@ def _mark_request_failed(
     detail: str,
     req_status: str = "failed",
     failure_code: str = "error",
+    model: Optional[str] = None,
+    deployment: Optional[str] = None,
 ) -> None:
     """Mark ai_requests.status and write a failure audit row.
 
     Use this only when NO tokens were consumed (e.g. 429 rate limit, auth
     failure, PII block). Does not create request_costs or token_usage.
     For errors where Azure consumed tokens, use _mark_request_failed_with_cost().
+
+    model/deployment are optional — pass them when known (e.g. after a
+    failover attempt) so the request row shows which deployment actually
+    issued the error, not just whichever was selected before the call.
     """
     req_row = db.query(AiRequest).filter(AiRequest.request_id == request_id).first()
     if req_row:
@@ -786,6 +821,10 @@ def _mark_request_failed(
         req_row.failure_code = failure_code
         req_row.failure_reason = detail
         req_row.completed_at = datetime.utcnow()
+        if model:
+            req_row.model_name = model
+        if deployment:
+            req_row.deployment_name = deployment
 
     _store_audit(
         db=db,
@@ -856,6 +895,11 @@ def _mark_request_failed_with_cost(
         req_row.failure_code = failure_code
         req_row.failure_reason = detail
         req_row.completed_at = datetime.utcnow()
+        # Reflects whichever deployment was actually attempted last — may
+        # differ from the primary if failover happened, so the request row
+        # never disagrees with its own TokenUsage/RequestCost rows.
+        req_row.model_name = model
+        req_row.deployment_name = deployment
 
     input_cost, output_cost, total_cost, pricing_source, pricing_snapshot, pricing_version = _calculate_cost(
         db=db,
@@ -898,6 +942,8 @@ def _mark_request_failed_with_cost(
         created_at=datetime.utcnow(),
     ))
 
+    record_tokens_used(org_id=org_id, project_id=project_id, tokens=input_tokens + output_tokens)
+
     _store_audit(
         db=db,
         request_id=request_id,
@@ -931,16 +977,11 @@ def _is_valid_json(s: str) -> bool:
 
 async def _stream_azure(
     *,
-    url: str,
-    headers: dict,
-    body: dict,
+    attempts: list[dict],
     request_id: str,
     org_id: str,
     project_id: Optional[str],
     key_id: str,
-    model: str,
-    deployment: str,
-    provider: str = "",
     input_tokens: int,
     messages: list[dict],
     source_ip: Optional[str],
@@ -949,97 +990,143 @@ async def _stream_azure(
     t_start: float,
     ctx: Optional[dict] = None,
 ) -> AsyncIterator[bytes]:
+    """Stream Azure/OpenAI-shaped SSE to the client, failing over to the next
+    same-class candidate in `attempts` if the connection itself fails (5xx,
+    429, or unreachable) before any bytes have been sent downstream. Once a
+    chunk has been yielded, no more switching — same as the original
+    single-deployment behavior below that point.
+    """
     chunks_raw: list[str] = []
     finish_reason: Optional[str] = None
+    model = deployment = provider = ""
 
-    try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=5.0)
-        ) as client:
-            async with client.stream("POST", url=url, headers=headers, json=body) as resp:
-                resp.raise_for_status()
-                async for line in resp.aiter_lines():
-                    if not line:
-                        continue
-                    if line == "data: [DONE]":
-                        yield b"data: [DONE]\n\n"
-                        break
-                    if line.startswith("data: "):
-                        json_str = line[6:]
-                        chunks_raw.append(json_str)
-                        try:
-                            chunk = json.loads(json_str)
-                            choice = (chunk.get("choices") or [{}])[0]
-                            finish_reason = finish_reason or choice.get("finish_reason")
-                        except Exception:
-                            pass
-                        yield (line + "\n\n").encode()
-        await _azure_circuit.record_success()
-    except httpx.HTTPStatusError as exc:
-        if exc.response.status_code >= 500:
-            await _azure_circuit.record_failure()
-        yield f"data: {json.dumps({'error': str(exc)})}\n\n".encode()
-        partial_output = "".join(
-            json.loads(c).get("choices", [{}])[0].get("delta", {}).get("content") or ""
-            for c in chunks_raw if _is_valid_json(c)
-        )
-        partial_output_tokens = count_tokens(text=partial_output, model_name=model) if partial_output else 0
-        status_code = exc.response.status_code
-        if status_code == 429 and partial_output_tokens == 0:
+    for i, attempt in enumerate(attempts):
+        is_last = i == len(attempts) - 1
+        url, headers, body = attempt["url"], attempt["azure_hdrs"], attempt["outbound_body"]
+        model, deployment, provider = attempt["model"], attempt["deployment"], attempt["provider"]
+        circuit = _get_circuit_breaker(_circuit_key(provider, deployment))
+
+        if not await circuit.allow_request():
+            if not is_last:
+                continue
+            if ctx:
+                ctx.update(attempt)
+            _circuit_msg = f"{provider or 'Provider'} circuit breaker open"
+            yield f"data: {json.dumps({'error': _circuit_msg})}\n\n".encode()
             _mark_request_failed(
                 db=db, request_id=request_id, org_id=org_id, project_id=project_id,
                 key_id=key_id, source_ip=source_ip, user_agent=user_agent,
-                detail=f"Azure stream 429 rate limit: {exc}",
-                failure_code="upstream_rate_limited",
+                detail=_circuit_msg,
+                failure_code="circuit_open",
+                model=model, deployment=deployment,
             )
             if ctx:
                 _store_route_execution(db=db, ctx=ctx, upstream_ms=int((time.time() - t_start) * 1000), total_ms=int((time.time() - ctx["t_request_start"]) * 1000), status="failed")
-        else:
-            # Use Azure's error body usage if available (e.g. content filter mid-stream),
-            # otherwise fall back to tiktoken on the original messages.
-            azure_input, _ = _azure_usage_from_error(exc)
-            if azure_input > 0:
-                billed_input = azure_input
-                in_src = "azure"
+            db.commit()
+            return
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=5.0)
+            ) as client:
+                async with client.stream("POST", url=url, headers=headers, json=body) as resp:
+                    resp.raise_for_status()
+                    async for line in resp.aiter_lines():
+                        if not line:
+                            continue
+                        if line == "data: [DONE]":
+                            yield b"data: [DONE]\n\n"
+                            break
+                        if line.startswith("data: "):
+                            json_str = line[6:]
+                            chunks_raw.append(json_str)
+                            try:
+                                chunk = json.loads(json_str)
+                                choice = (chunk.get("choices") or [{}])[0]
+                                finish_reason = finish_reason or choice.get("finish_reason")
+                            except Exception:
+                                pass
+                            yield (line + "\n\n").encode()
+            await circuit.record_success()
+            if ctx:
+                ctx.update(attempt)
+            break
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code
+            if not chunks_raw and not is_last and (status_code >= 500 or status_code == 429):
+                await circuit.record_failure()
+                continue
+            if status_code >= 500:
+                await circuit.record_failure()
+            if ctx:
+                ctx.update(attempt)
+            yield f"data: {json.dumps({'error': str(exc)})}\n\n".encode()
+            partial_output = "".join(
+                json.loads(c).get("choices", [{}])[0].get("delta", {}).get("content") or ""
+                for c in chunks_raw if _is_valid_json(c)
+            )
+            partial_output_tokens = count_tokens(text=partial_output, model_name=model) if partial_output else 0
+            if status_code == 429 and partial_output_tokens == 0:
+                _mark_request_failed(
+                    db=db, request_id=request_id, org_id=org_id, project_id=project_id,
+                    key_id=key_id, source_ip=source_ip, user_agent=user_agent,
+                    detail=f"Azure stream 429 rate limit: {exc}",
+                    failure_code="upstream_rate_limited",
+                    model=model, deployment=deployment,
+                )
+                if ctx:
+                    _store_route_execution(db=db, ctx=ctx, upstream_ms=int((time.time() - t_start) * 1000), total_ms=int((time.time() - ctx["t_request_start"]) * 1000), status="failed")
             else:
-                billed_input = _estimate_input_tokens(messages, model)
-                in_src = "tiktoken_estimate"
+                # Use Azure's error body usage if available (e.g. content filter mid-stream),
+                # otherwise fall back to tiktoken on the original messages.
+                azure_input, _ = _azure_usage_from_error(exc)
+                if azure_input > 0:
+                    billed_input = azure_input
+                    in_src = "azure"
+                else:
+                    billed_input = _estimate_input_tokens(messages, model)
+                    in_src = "tiktoken_estimate"
+                _err_upstream_ms = int((time.time() - t_start) * 1000)
+                _mark_request_failed_with_cost(
+                    db=db, request_id=request_id, org_id=org_id, project_id=project_id,
+                    key_id=key_id, model=model, deployment=deployment,
+                    input_tokens=billed_input, output_tokens=partial_output_tokens,
+                    latency_ms=_err_upstream_ms,
+                    source_ip=source_ip, user_agent=user_agent,
+                    detail=f"Azure stream error {status_code} after {len(chunks_raw)} chunks: {exc}",
+                    failure_code=f"upstream_error_{status_code}",
+                    input_token_source=in_src,
+                    output_token_source="tiktoken_estimate",
+                )
+                if ctx:
+                    _store_route_execution(db=db, ctx=ctx, upstream_ms=_err_upstream_ms, total_ms=int((time.time() - ctx["t_request_start"]) * 1000), status="failed")
+            db.commit()
+            return
+        except httpx.RequestError as exc:
+            if not chunks_raw and not is_last:
+                await circuit.record_failure()
+                continue
+            await circuit.record_failure()
+            if ctx:
+                ctx.update(attempt)
+            yield f"data: {json.dumps({'error': f'Azure unreachable: {exc}'})}\n\n".encode()
             _err_upstream_ms = int((time.time() - t_start) * 1000)
+            _fallback_tokens = _estimate_input_tokens(messages, model)
             _mark_request_failed_with_cost(
                 db=db, request_id=request_id, org_id=org_id, project_id=project_id,
                 key_id=key_id, model=model, deployment=deployment,
-                input_tokens=billed_input, output_tokens=partial_output_tokens,
+                input_tokens=_fallback_tokens, output_tokens=0,
                 latency_ms=_err_upstream_ms,
                 source_ip=source_ip, user_agent=user_agent,
-                detail=f"Azure stream error {status_code} after {len(chunks_raw)} chunks: {exc}",
-                failure_code=f"upstream_error_{status_code}",
-                input_token_source=in_src,
+                detail=f"Azure stream unreachable (timeout/connection): {exc}",
+                failure_code="upstream_unreachable",
+                input_token_source="tiktoken_estimate",
                 output_token_source="tiktoken_estimate",
             )
             if ctx:
                 _store_route_execution(db=db, ctx=ctx, upstream_ms=_err_upstream_ms, total_ms=int((time.time() - ctx["t_request_start"]) * 1000), status="failed")
-        db.commit()
-        return
-    except httpx.RequestError as exc:
-        await _azure_circuit.record_failure()
-        yield f"data: {json.dumps({'error': f'Azure unreachable: {exc}'})}\n\n".encode()
-        _err_upstream_ms = int((time.time() - t_start) * 1000)
-        _fallback_tokens = _estimate_input_tokens(messages, model)
-        _mark_request_failed_with_cost(
-            db=db, request_id=request_id, org_id=org_id, project_id=project_id,
-            key_id=key_id, model=model, deployment=deployment,
-            input_tokens=_fallback_tokens, output_tokens=0,
-            latency_ms=_err_upstream_ms,
-            source_ip=source_ip, user_agent=user_agent,
-            detail=f"Azure stream unreachable (timeout/connection): {exc}",
-            failure_code="upstream_unreachable",
-            input_token_source="tiktoken_estimate",
-            output_token_source="tiktoken_estimate",
-        )
-        if ctx:
-            _store_route_execution(db=db, ctx=ctx, upstream_ms=_err_upstream_ms, total_ms=int((time.time() - ctx["t_request_start"]) * 1000), status="failed")
-        db.commit()
-        return
+            db.commit()
+            return
 
     latency_ms = int((time.time() - t_start) * 1000)
 
@@ -1108,16 +1195,11 @@ async def _stream_azure(
 
 async def _stream_provider_native(
     *,
-    url: str,
-    headers: dict,
-    body: dict,
+    attempts: list[dict],
     request_id: str,
     org_id: str,
     project_id: Optional[str],
     key_id: str,
-    model: str,
-    deployment: str,
-    provider: str,
     messages: list[dict],
     source_ip: Optional[str],
     user_agent: Optional[str],
@@ -1130,97 +1212,143 @@ async def _stream_provider_native(
     the side, via provider_translation.stream_*, purely for internal
     accounting (tokens are always tiktoken-estimated on the stream path,
     same as the existing Azure stream behavior above).
+
+    Fails over to the next same-class candidate in `attempts` if the
+    connection itself fails (5xx, 429, unreachable) before any raw bytes
+    have been sent downstream. Once a byte has been yielded, no more
+    switching — same safety boundary as _stream_azure.
     """
     text_chunks: list[str] = []
     finish_reason: Optional[str] = None
     saw_any_chunk = False
     buffer = ""
+    model = deployment = provider = ""
 
-    try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=5.0)
-        ) as client:
-            async with client.stream("POST", url=url, headers=headers, json=body) as resp:
-                resp.raise_for_status()
-                async for raw in resp.aiter_bytes():
-                    if not raw:
-                        continue
-                    yield raw
-                    buffer += raw.decode("utf-8", errors="ignore")
-                    while "\n\n" in buffer:
-                        block, buffer = buffer.split("\n\n", 1)
-                        for line in block.split("\n"):
-                            if not line.startswith("data:"):
-                                continue
-                            json_str = line[5:].strip()
-                            if not json_str:
-                                continue
-                            try:
-                                chunk = json.loads(json_str)
-                            except (json.JSONDecodeError, TypeError):
-                                continue
-                            saw_any_chunk = True
-                            delta = stream_delta_text(provider, chunk)
-                            if delta:
-                                text_chunks.append(delta)
-                            fr = stream_finish_reason(provider, chunk)
-                            if fr:
-                                finish_reason = fr
-                            if stream_is_terminal(provider, chunk):
-                                finish_reason = finish_reason or "stop"
-        await _azure_circuit.record_success()
-    except httpx.HTTPStatusError as exc:
-        if exc.response.status_code >= 500:
-            await _azure_circuit.record_failure()
-        status_code = exc.response.status_code
-        partial_output = "".join(text_chunks)
-        partial_output_tokens = count_tokens(text=partial_output, model_name=model) if partial_output else 0
-        if status_code == 429 and partial_output_tokens == 0:
+    for i, attempt in enumerate(attempts):
+        is_last = i == len(attempts) - 1
+        url, headers, body = attempt["url"], attempt["azure_hdrs"], attempt["outbound_body"]
+        model, deployment, provider = attempt["model"], attempt["deployment"], attempt["provider"]
+        circuit = _get_circuit_breaker(_circuit_key(provider, deployment))
+        started_streaming = False
+
+        if not await circuit.allow_request():
+            if not is_last:
+                continue
+            if ctx:
+                ctx.update(attempt)
+            _circuit_msg = f"{provider or 'Provider'} circuit breaker open"
             _mark_request_failed(
                 db=db, request_id=request_id, org_id=org_id, project_id=project_id,
                 key_id=key_id, source_ip=source_ip, user_agent=user_agent,
-                detail=f"{provider} stream 429 rate limit: {exc}",
-                failure_code="upstream_rate_limited",
+                detail=_circuit_msg,
+                failure_code="circuit_open",
+                model=model, deployment=deployment,
             )
             if ctx:
                 _store_route_execution(db=db, ctx=ctx, upstream_ms=int((time.time() - t_start) * 1000), total_ms=int((time.time() - ctx["t_request_start"]) * 1000), status="failed")
-        else:
+            db.commit()
+            return
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=5.0)
+            ) as client:
+                async with client.stream("POST", url=url, headers=headers, json=body) as resp:
+                    resp.raise_for_status()
+                    async for raw in resp.aiter_bytes():
+                        if not raw:
+                            continue
+                        started_streaming = True
+                        yield raw
+                        buffer += raw.decode("utf-8", errors="ignore")
+                        while "\n\n" in buffer:
+                            block, buffer = buffer.split("\n\n", 1)
+                            for line in block.split("\n"):
+                                if not line.startswith("data:"):
+                                    continue
+                                json_str = line[5:].strip()
+                                if not json_str:
+                                    continue
+                                try:
+                                    chunk = json.loads(json_str)
+                                except (json.JSONDecodeError, TypeError):
+                                    continue
+                                saw_any_chunk = True
+                                delta = stream_delta_text(provider, chunk)
+                                if delta:
+                                    text_chunks.append(delta)
+                                fr = stream_finish_reason(provider, chunk)
+                                if fr:
+                                    finish_reason = fr
+                                if stream_is_terminal(provider, chunk):
+                                    finish_reason = finish_reason or "stop"
+            await circuit.record_success()
+            if ctx:
+                ctx.update(attempt)
+            break
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code
+            if not started_streaming and not is_last and (status_code >= 500 or status_code == 429):
+                await circuit.record_failure()
+                continue
+            if status_code >= 500:
+                await circuit.record_failure()
+            if ctx:
+                ctx.update(attempt)
+            partial_output = "".join(text_chunks)
+            partial_output_tokens = count_tokens(text=partial_output, model_name=model) if partial_output else 0
+            if status_code == 429 and partial_output_tokens == 0:
+                _mark_request_failed(
+                    db=db, request_id=request_id, org_id=org_id, project_id=project_id,
+                    key_id=key_id, source_ip=source_ip, user_agent=user_agent,
+                    detail=f"{provider} stream 429 rate limit: {exc}",
+                    failure_code="upstream_rate_limited",
+                    model=model, deployment=deployment,
+                )
+                if ctx:
+                    _store_route_execution(db=db, ctx=ctx, upstream_ms=int((time.time() - t_start) * 1000), total_ms=int((time.time() - ctx["t_request_start"]) * 1000), status="failed")
+            else:
+                _err_upstream_ms = int((time.time() - t_start) * 1000)
+                _billed_input = _estimate_input_tokens(messages, model)
+                _mark_request_failed_with_cost(
+                    db=db, request_id=request_id, org_id=org_id, project_id=project_id,
+                    key_id=key_id, model=model, deployment=deployment,
+                    input_tokens=_billed_input, output_tokens=partial_output_tokens,
+                    latency_ms=_err_upstream_ms,
+                    source_ip=source_ip, user_agent=user_agent,
+                    detail=f"{provider} stream error {status_code} after {len(text_chunks)} text chunks: {exc}",
+                    failure_code=f"upstream_error_{status_code}",
+                    input_token_source="tiktoken_estimate",
+                    output_token_source="tiktoken_estimate",
+                )
+                if ctx:
+                    _store_route_execution(db=db, ctx=ctx, upstream_ms=_err_upstream_ms, total_ms=int((time.time() - ctx["t_request_start"]) * 1000), status="failed")
+            db.commit()
+            return
+        except httpx.RequestError as exc:
+            if not started_streaming and not is_last:
+                await circuit.record_failure()
+                continue
+            await circuit.record_failure()
+            if ctx:
+                ctx.update(attempt)
             _err_upstream_ms = int((time.time() - t_start) * 1000)
-            _billed_input = _estimate_input_tokens(messages, model)
+            _fallback_tokens = _estimate_input_tokens(messages, model)
             _mark_request_failed_with_cost(
                 db=db, request_id=request_id, org_id=org_id, project_id=project_id,
                 key_id=key_id, model=model, deployment=deployment,
-                input_tokens=_billed_input, output_tokens=partial_output_tokens,
+                input_tokens=_fallback_tokens, output_tokens=0,
                 latency_ms=_err_upstream_ms,
                 source_ip=source_ip, user_agent=user_agent,
-                detail=f"{provider} stream error {status_code} after {len(text_chunks)} text chunks: {exc}",
-                failure_code=f"upstream_error_{status_code}",
+                detail=f"{provider} unreachable: {exc}",
+                failure_code="upstream_unreachable",
                 input_token_source="tiktoken_estimate",
                 output_token_source="tiktoken_estimate",
             )
             if ctx:
                 _store_route_execution(db=db, ctx=ctx, upstream_ms=_err_upstream_ms, total_ms=int((time.time() - ctx["t_request_start"]) * 1000), status="failed")
-        db.commit()
-        return
-    except httpx.RequestError as exc:
-        await _azure_circuit.record_failure()
-        _err_upstream_ms = int((time.time() - t_start) * 1000)
-        _fallback_tokens = _estimate_input_tokens(messages, model)
-        _mark_request_failed_with_cost(
-            db=db, request_id=request_id, org_id=org_id, project_id=project_id,
-            key_id=key_id, model=model, deployment=deployment,
-            input_tokens=_fallback_tokens, output_tokens=0,
-            latency_ms=_err_upstream_ms,
-            source_ip=source_ip, user_agent=user_agent,
-            detail=f"{provider} unreachable: {exc}",
-            failure_code="upstream_unreachable",
-            input_token_source="tiktoken_estimate",
-            output_token_source="tiktoken_estimate",
-        )
-        if ctx:
-            _store_route_execution(db=db, ctx=ctx, upstream_ms=_err_upstream_ms, total_ms=int((time.time() - ctx["t_request_start"]) * 1000), status="failed")
-        db.commit()
-        return
+            db.commit()
+            return
 
     latency_ms = int((time.time() - t_start) * 1000)
     combined = "".join(text_chunks)
@@ -1290,6 +1418,7 @@ async def _run_pre_flight(
     model_override: Optional[str],
     db: Session,
     stream: bool = False,
+    trace_id: Optional[str] = None,
 ) -> dict:
     """Auth, rate-limit, model resolution, budget/governance checks, PII scan, token count.
 
@@ -1307,6 +1436,21 @@ async def _run_pre_flight(
     user_agent: Optional[str] = request.headers.get("user-agent")
     request_id = _new_request_id()
 
+    # First call with a given trace_id is the parent (parent_request_id stays
+    # NULL); later calls in the same multi-step pipeline point back at it, so
+    # the request list can show one row per user turn while every call keeps
+    # its own tokens/payload for audit.
+    parent_request_id: Optional[str] = None
+    if trace_id:
+        parent_row = (
+            db.query(AiRequest.request_id)
+            .filter(AiRequest.trace_id == trace_id, AiRequest.parent_request_id.is_(None))
+            .order_by(AiRequest.created_at.asc())
+            .first()
+        )
+        if parent_row:
+            parent_request_id = parent_row[0]
+
     try:
         check_rate_limit(
             db=db, org_id=org_id, project_id=project_id, key_id=key_id,
@@ -1315,7 +1459,8 @@ async def _run_pre_flight(
     except HTTPException as exc:
         _log_blocked_request(
             db=db, request_id=request_id, org_id=org_id, project_id=project_id,
-            key_id=key_id, source_ip=source_ip, user_agent=user_agent,
+            key_id=key_id, source_ip=source_ip, user_agent=user_agent, trace_id=trace_id,
+            parent_request_id=parent_request_id,
             failure_code="rate_limited", failure_reason=str(exc.detail),
         )
         raise
@@ -1327,7 +1472,8 @@ async def _run_pre_flight(
     except Exception:
         _log_blocked_request(
             db=db, request_id=request_id, org_id=org_id, project_id=project_id,
-            key_id=key_id, source_ip=source_ip, user_agent=user_agent,
+            key_id=key_id, source_ip=source_ip, user_agent=user_agent, trace_id=trace_id,
+            parent_request_id=parent_request_id,
             failure_code="invalid_request", failure_reason="Invalid JSON body.",
         )
         raise HTTPException(status_code=400, detail="Invalid JSON body.")
@@ -1337,21 +1483,26 @@ async def _run_pre_flight(
         _reason = "Model must be specified via ?model= query param or 'model' in the request body."
         _log_blocked_request(
             db=db, request_id=request_id, org_id=org_id, project_id=project_id,
-            key_id=key_id, source_ip=source_ip, user_agent=user_agent,
+            key_id=key_id, source_ip=source_ip, user_agent=user_agent, trace_id=trace_id,
+            parent_request_id=parent_request_id,
             failure_code="invalid_request", failure_reason=_reason, request_payload=body,
         )
         raise HTTPException(status_code=400, detail=_reason)
 
-    depl = get_deployment_for_org(db, org_id=org_id, project_id=project_id, requested_model=model_name)
-    if not depl:
+    candidate_deployments = get_deployments_for_org(
+        db, org_id=org_id, project_id=project_id, requested_model=model_name,
+    )
+    if not candidate_deployments:
         _reason = f"Model '{model_name}' is not configured or not authorized for this project."
         _log_blocked_request(
             db=db, request_id=request_id, org_id=org_id, project_id=project_id,
-            key_id=key_id, source_ip=source_ip, user_agent=user_agent,
+            key_id=key_id, source_ip=source_ip, user_agent=user_agent, trace_id=trace_id,
+            parent_request_id=parent_request_id,
             failure_code="model_not_authorized", failure_reason=_reason, request_payload=body,
         )
         raise HTTPException(status_code=404, detail=_reason)
 
+    depl = candidate_deployments[0]
     model: str = depl.model_name
     deployment: str = depl.deployment_name or depl.model_name
     t_routing_done = time.time()
@@ -1364,7 +1515,8 @@ async def _run_pre_flight(
     except HTTPException as exc:
         _log_blocked_request(
             db=db, request_id=request_id, org_id=org_id, project_id=project_id,
-            key_id=key_id, source_ip=source_ip, user_agent=user_agent,
+            key_id=key_id, source_ip=source_ip, user_agent=user_agent, trace_id=trace_id,
+            parent_request_id=parent_request_id,
             failure_code="budget_exceeded", failure_reason=str(exc.detail), request_payload=body,
         )
         raise
@@ -1395,7 +1547,8 @@ async def _run_pre_flight(
     except HTTPException as exc:
         _log_blocked_request(
             db=db, request_id=request_id, org_id=org_id, project_id=project_id,
-            key_id=key_id, source_ip=source_ip, user_agent=user_agent,
+            key_id=key_id, source_ip=source_ip, user_agent=user_agent, trace_id=trace_id,
+            parent_request_id=parent_request_id,
             failure_code="pii_block",
             failure_reason=exc.detail.get("message") if isinstance(exc.detail, dict) else str(exc.detail),
             request_payload=body,
@@ -1438,33 +1591,125 @@ async def _run_pre_flight(
         pii_detail=pii_detail,
         user_agent=user_agent,
         entry_point=entry_point,
+        trace_id=trace_id,
+        parent_request_id=parent_request_id,
     )
     db.commit()
 
-    url, azure_hdrs = build_provider_request(depl, stream=stream)
-    provider = getattr(depl, "provider", None) or ""
-    outbound_body = translate_outbound_body(provider, forward_body)
+    # Build one ready-to-send attempt per candidate deployment (primary first),
+    # so the outbound call site can fail over to the next entry without
+    # redoing auth/budget/PII/governance checks above.
+    attempts: list[dict] = []
+    for cand in candidate_deployments:
+        cand_url, cand_hdrs = build_provider_request(cand, stream=stream)
+        cand_provider = getattr(cand, "provider", None) or ""
+        attempts.append(dict(
+            depl_id=getattr(cand, "deployment_id", None),
+            url=cand_url,
+            azure_hdrs=cand_hdrs,
+            outbound_body=translate_outbound_body(cand_provider, forward_body),
+            provider=cand_provider,
+            model=cand.model_name,
+            deployment=cand.deployment_name or cand.model_name,
+        ))
+
+    primary = attempts[0]
 
     return dict(
         request_id=request_id,
         org_id=org_id,
         project_id=project_id,
         key_id=key_id,
-        model=model,
-        deployment=deployment,
-        provider=provider,
+        model=primary["model"],
+        deployment=primary["deployment"],
+        provider=primary["provider"],
         forward_body=forward_body,
-        outbound_body=outbound_body,
+        outbound_body=primary["outbound_body"],
         input_tokens=input_tokens,
         source_ip=source_ip,
         user_agent=user_agent,
-        url=url,
-        azure_hdrs=azure_hdrs,
+        url=primary["url"],
+        azure_hdrs=primary["azure_hdrs"],
+        attempts=attempts,
         entry_point=entry_point,
         t_request_start=t_request_start,
         routing_ms=int((t_routing_done - t_request_start) * 1000),
         governance_ms=int((t_governance_done - t_routing_done) * 1000),
     )
+
+
+# ---------------------------------------------------------------------------
+# Outbound call with failover across candidate deployments
+# ---------------------------------------------------------------------------
+
+async def _call_with_failover(*, ctx: dict) -> httpx.Response:
+    """Try each candidate deployment in ctx['attempts'] (primary first) until
+    one responds successfully.
+
+    Skips a candidate whose circuit breaker is open. Fails over to the next
+    candidate on connection errors, 5xx, and 429 (capacity/availability
+    problems with that specific deployment) — not on other 4xx, since those
+    are deterministic outcomes for the request itself (bad request, content
+    filter, etc.) that a different provider wouldn't fix, and silently
+    retrying a content-filter block against a laxer provider would be a
+    governance decision, not just an engineering one.
+
+    Mutates ctx in place with whichever attempt actually served the request
+    (or was the last one tried, on total failure), so all downstream cost/
+    token/audit logging — none of which changes — reflects what really
+    happened.
+    """
+    attempts: list[dict] = ctx["attempts"]
+    last_exc: Optional[Exception] = None
+
+    for i, attempt in enumerate(attempts):
+        is_last = (i == len(attempts) - 1)
+        circuit = _get_circuit_breaker(_circuit_key(attempt["provider"], attempt["deployment"]))
+
+        if not await circuit.allow_request():
+            if is_last:
+                ctx.update(attempt)
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        f"{attempt['provider'] or 'Provider'} is failing repeatedly; "
+                        "circuit breaker open. Please retry shortly."
+                    ),
+                )
+            continue
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=5.0)
+            ) as client:
+                resp = await _post_to_azure_with_retry(
+                    client, url=attempt["url"], headers=attempt["azure_hdrs"],
+                    json_body=attempt["outbound_body"],
+                )
+            await circuit.record_success()
+            ctx.update(attempt)
+            return resp
+        except httpx.HTTPStatusError as exc:
+            ctx.update(attempt)
+            status = exc.response.status_code
+            if status >= 500 or status == 429:
+                await circuit.record_failure()
+                last_exc = exc
+                if is_last:
+                    raise
+                continue
+            raise
+        except httpx.RequestError as exc:
+            await circuit.record_failure()
+            ctx.update(attempt)
+            last_exc = exc
+            if is_last:
+                raise
+            continue
+
+    if last_exc:
+        raise last_exc
+    raise HTTPException(status_code=503, detail="No deployment available.")
 
 
 # ---------------------------------------------------------------------------
@@ -1477,10 +1722,12 @@ async def proxy_chat(
     background_tasks: BackgroundTasks,
     model: Optional[str] = Query(None, description="AI model name (overrides body 'model' field)"),
     x_governance_key: str = Header(..., alias="X-Governance-Key"),
+    x_trace_id: Optional[str] = Header(None, alias="X-Trace-Id"),
     db: Session = Depends(get_db),
 ) -> Any:
     ctx = await _run_pre_flight(
         request=request, x_governance_key=x_governance_key, model_override=model, db=db,
+        trace_id=x_trace_id,
     )
     t_start = time.time()
 
@@ -1489,28 +1736,9 @@ async def proxy_chat(
             status_code=503,
             detail="Server busy: too many concurrent requests to Azure OpenAI. Please retry shortly.",
         )
-    if not await _azure_circuit.allow_request():
-        await _azure_limiter.release()
-        raise HTTPException(
-            status_code=503,
-            detail="Azure OpenAI is failing repeatedly; circuit breaker open. Please retry shortly.",
-        )
     try:
         try:
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=5.0)
-            ) as client:
-                azure_resp = await _post_to_azure_with_retry(
-                    client, url=ctx["url"], headers=ctx["azure_hdrs"], json_body=ctx["outbound_body"],
-                )
-            await _azure_circuit.record_success()
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code >= 500:
-                await _azure_circuit.record_failure()
-            raise
-        except httpx.RequestError:
-            await _azure_circuit.record_failure()
-            raise
+            azure_resp = await _call_with_failover(ctx=ctx)
         finally:
             await _azure_limiter.release()
     except httpx.HTTPStatusError as exc:
@@ -1522,6 +1750,7 @@ async def proxy_chat(
                 source_ip=ctx["source_ip"], user_agent=ctx["user_agent"],
                 detail=f"Azure 429 rate limit: {exc}",
                 failure_code="upstream_rate_limited",
+                model=ctx["model"], deployment=ctx["deployment"],
             )
         else:
             azure_input, azure_output = _azure_usage_from_error(exc)
@@ -1634,11 +1863,12 @@ async def proxy_chat_openai_compat(
     background_tasks: BackgroundTasks,
     model: Optional[str] = Query(None, description="AI model name (overrides body 'model' field)"),
     x_governance_key: str = Header(..., alias="X-Governance-Key"),
+    x_trace_id: Optional[str] = Header(None, alias="X-Trace-Id"),
     db: Session = Depends(get_db),
 ) -> Any:
     return await proxy_chat(
         request=request, background_tasks=background_tasks, model=model,
-        x_governance_key=x_governance_key, db=db,
+        x_governance_key=x_governance_key, x_trace_id=x_trace_id, db=db,
     )
 
 
@@ -1651,11 +1881,12 @@ async def proxy_chat_stream(
     request: Request,
     model: Optional[str] = Query(None, description="AI model name (overrides body 'model' field)"),
     x_governance_key: str = Header(..., alias="X-Governance-Key"),
+    x_trace_id: Optional[str] = Header(None, alias="X-Trace-Id"),
     db: Session = Depends(get_db),
 ) -> Any:
     ctx = await _run_pre_flight(
         request=request, x_governance_key=x_governance_key, model_override=model, db=db,
-        stream=True,
+        stream=True, trace_id=x_trace_id,
     )
     t_start = time.time()
 
@@ -1664,27 +1895,29 @@ async def proxy_chat_stream(
             status_code=503,
             detail="Server busy: too many concurrent requests to Azure OpenAI. Please retry shortly.",
         )
-    if not await _azure_circuit.allow_request():
-        await _azure_limiter.release()
-        raise HTTPException(
-            status_code=503,
-            detail="Azure OpenAI is failing repeatedly; circuit breaker open. Please retry shortly.",
-        )
     release_tasks = BackgroundTasks()
     release_tasks.add_task(_azure_limiter.release)
-    provider = ctx.get("provider", "")
+
+    # Same-class failover only (see _stream_azure / _stream_provider_native
+    # docstrings): the primary's provider class decides which streaming
+    # handler runs; only candidates of that same class are eligible
+    # fallbacks for this stream. Cross-class streaming failover (e.g. Azure
+    # primary -> Anthropic secondary) isn't supported yet.
+    primary_provider = ctx["provider"]
+    primary_is_translated = needs_translation(primary_provider)
+    same_class_attempts = [
+        {**a, "outbound_body": {**a["outbound_body"], "stream": True}}
+        for a in ctx["attempts"]
+        if needs_translation(a["provider"]) == primary_is_translated
+    ]
+
     stream_generator = (
         _stream_provider_native(
-            url=ctx["url"],
-            headers=ctx["azure_hdrs"],
-            body={**ctx["outbound_body"], "stream": True},
+            attempts=same_class_attempts,
             request_id=ctx["request_id"],
             org_id=ctx["org_id"],
             project_id=ctx["project_id"],
             key_id=ctx["key_id"],
-            model=ctx["model"],
-            deployment=ctx["deployment"],
-            provider=provider,
             messages=ctx["forward_body"].get("messages", []),
             source_ip=ctx["source_ip"],
             user_agent=ctx["user_agent"],
@@ -1692,18 +1925,13 @@ async def proxy_chat_stream(
             t_start=t_start,
             ctx=ctx,
         )
-        if needs_translation(provider) else
+        if primary_is_translated else
         _stream_azure(
-            url=ctx["url"],
-            headers=ctx["azure_hdrs"],
-            body={**ctx["outbound_body"], "stream": True},
+            attempts=same_class_attempts,
             request_id=ctx["request_id"],
             org_id=ctx["org_id"],
             project_id=ctx["project_id"],
             key_id=ctx["key_id"],
-            model=ctx["model"],
-            deployment=ctx["deployment"],
-            provider=provider,
             input_tokens=ctx["input_tokens"],
             messages=ctx["forward_body"].get("messages", []),
             source_ip=ctx["source_ip"],
@@ -1737,7 +1965,12 @@ def stats_by_project_model(
     q = db.query(
         RequestCost.project_id,
         RequestCost.model_name,
-        func.count(RequestCost.request_id).label("total_requests"),
+        # Count distinct pipeline groups (parent + its child LLM calls count
+        # once), not raw call rows, while token/cost sums below still cover
+        # every call — real usage/spend stays accurate.
+        func.count(
+            func.distinct(func.coalesce(AiRequest.parent_request_id, AiRequest.request_id))
+        ).label("total_requests"),
         func.sum(RequestCost.input_tokens).label("input_tokens"),
         func.sum(RequestCost.output_tokens).label("output_tokens"),
         func.sum(RequestCost.total_tokens).label("total_tokens"),
@@ -1745,7 +1978,7 @@ def stats_by_project_model(
         func.sum(RequestCost.output_token_cost).label("output_cost"),
         func.sum(RequestCost.llm_cost).label("llm_cost"),
         func.sum(RequestCost.total_cost).label("total_cost"),
-    )
+    ).join(AiRequest, AiRequest.request_id == RequestCost.request_id)
     if org_id:
         q = q.filter(RequestCost.org_id == org_id)
     if project_id:
@@ -1790,30 +2023,73 @@ def proxy_stats_overview(
     db: Session = Depends(get_db),
 ) -> dict:
     cutoff = datetime.utcnow().date() - timedelta(days=days - 1)
+    # Requests that never reached a terminal status (crashed/timed out before
+    # the handler could mark them success/failed/partial/blocked) stay stuck
+    # at "pending" forever. Treat any pending row older than this as failed.
+    stale_pending_cutoff = datetime.utcnow() - timedelta(minutes=5)
 
     cost_q = db.query(
-        func.count(RequestCost.request_id).label("total_requests"),
+        # One pipeline (parent + child LLM calls) counts as one request;
+        # token/cost sums still cover every call.
+        func.count(
+            func.distinct(func.coalesce(AiRequest.parent_request_id, AiRequest.request_id))
+        ).label("total_requests"),
         func.sum(RequestCost.input_tokens).label("prompt_tokens"),
         func.sum(RequestCost.output_tokens).label("completion_tokens"),
         func.sum(RequestCost.total_tokens).label("total_tokens"),
         func.sum(RequestCost.llm_cost).label("llm_cost"),
         func.sum(RequestCost.total_cost).label("total_cost"),
-    ).filter(func.date(RequestCost.created_at) >= cutoff)
+    ).join(AiRequest, AiRequest.request_id == RequestCost.request_id).filter(
+        func.date(RequestCost.created_at) >= cutoff
+    )
     if org_id:
         cost_q = cost_q.filter(RequestCost.org_id == org_id)
     cost = cost_q.first()
 
     req_q = db.query(
-        func.count(AiRequest.id).label("total"),
+        func.count(
+            func.distinct(func.coalesce(AiRequest.parent_request_id, AiRequest.request_id))
+        ).label("total"),
         func.sum(
-            cast(AiRequest.request_status == "success", Integer)
+            cast(
+                (AiRequest.parent_request_id.is_(None)) & (AiRequest.request_status == "success"),
+                Integer,
+            )
         ).label("completed"),
+        func.sum(
+            cast(
+                (AiRequest.parent_request_id.is_(None))
+                & (
+                    (AiRequest.request_status == "failed")
+                    | (
+                        (AiRequest.request_status == "pending")
+                        & (AiRequest.created_at < stale_pending_cutoff)
+                    )
+                ),
+                Integer,
+            )
+        ).label("failed"),
+        func.sum(
+            cast(
+                (AiRequest.parent_request_id.is_(None)) & (AiRequest.request_status == "partial"),
+                Integer,
+            )
+        ).label("partial"),
+        func.sum(
+            cast(
+                (AiRequest.parent_request_id.is_(None)) & (AiRequest.request_status == "blocked"),
+                Integer,
+            )
+        ).label("blocked"),
     ).filter(func.date(AiRequest.created_at) >= cutoff)
     if org_id:
         req_q = req_q.filter(AiRequest.org_id == org_id)
     req_stats = req_q.first()
     total_reqs = int(req_stats.total or 0)
     completed = int(req_stats.completed or 0)
+    failed = int(req_stats.failed or 0)
+    partial = int(req_stats.partial or 0)
+    blocked = int(req_stats.blocked or 0)
 
     latency_q = db.query(func.avg(AiResponse.latency_ms)).filter(
         func.date(AiResponse.created_at) >= cutoff,
@@ -1835,6 +2111,9 @@ def proxy_stats_overview(
     return {
         "total_requests": total_reqs,
         "completed": completed,
+        "failed": failed,
+        "partial": partial,
+        "blocked": blocked,
         "success_rate": success_rate,
         "prompt_tokens": cost.prompt_tokens or 0,
         "completion_tokens": cost.completion_tokens or 0,
@@ -1857,11 +2136,15 @@ def proxy_stats_trends(
 
     q = db.query(
         func.date(RequestCost.created_at).label("date"),
-        func.count(RequestCost.request_id).label("total_requests"),
+        func.count(
+            func.distinct(func.coalesce(AiRequest.parent_request_id, AiRequest.request_id))
+        ).label("total_requests"),
         func.sum(RequestCost.total_tokens).label("total_tokens"),
         func.sum(RequestCost.llm_cost).label("llm_cost"),
         func.sum(RequestCost.total_cost).label("total_cost"),
-    ).filter(func.date(RequestCost.created_at) >= cutoff)
+    ).join(AiRequest, AiRequest.request_id == RequestCost.request_id).filter(
+        func.date(RequestCost.created_at) >= cutoff
+    )
     if org_id:
         q = q.filter(RequestCost.org_id == org_id)
 
@@ -1949,6 +2232,10 @@ def list_proxy_requests(
     pii_action_taken: Optional[str] = None,
     failure_only: Optional[bool] = None,
     failure_code: Optional[str] = None,
+    trace_id: Optional[str] = None,
+    group_by: Optional[str] = None,
+    parent_request_id: Optional[str] = None,
+    include_children: bool = False,
     limit: int = 50,
     offset: int = 0,
     db: Session = Depends(get_db),
@@ -2000,6 +2287,30 @@ def list_proxy_requests(
         filters.append("r.failure_code = :failure_code")
         count_filters.append("failure_code = :failure_code")
         params["failure_code"] = failure_code
+    if trace_id:
+        filters.append("r.trace_id = :trace_id")
+        count_filters.append("trace_id = :trace_id")
+        params["trace_id"] = trace_id
+    if parent_request_id:
+        filters.append("(r.request_id = :parent_request_id OR r.parent_request_id = :parent_request_id)")
+        count_filters.append("(request_id = :parent_request_id OR parent_request_id = :parent_request_id)")
+        params["parent_request_id"] = parent_request_id
+
+    if group_by == "trace_id":
+        where = ("WHERE " + " AND ".join(filters)) if filters else ""
+        return _list_proxy_requests_grouped_by_trace(
+            db=db, where=where, params=dict(params), limit=limit, offset=offset,
+        )
+
+    # Default view: one row per multi-call pipeline (the parent), with totals
+    # summed across its child calls — a single user question that fans out
+    # into several internal LLM calls is reported as one request. Pass
+    # ?parent_request_id=<id> to drill into a specific group's individual
+    # calls, or ?include_children=true for the old flat per-call list.
+    collapse_to_parents = not (request_id or parent_request_id or include_children)
+    if collapse_to_parents:
+        filters.append("r.parent_request_id IS NULL")
+        count_filters.append("parent_request_id IS NULL")
 
     where = ("WHERE " + " AND ".join(filters)) if filters else ""
     count_where = ("WHERE " + " AND ".join(count_filters)) if count_filters else ""
@@ -2010,28 +2321,72 @@ def list_proxy_requests(
         )
         params["limit"] = limit
         params["offset"] = offset
-        rows = db.execute(
-            _text(
-                f"SELECT r.request_id, r.org_id, r.project_id, r.request_type, r.model_name,"
-                f" r.input_token_estimate, r.request_status, r.created_at,"
-                f" r.pii_detected, r.pii_types, r.pii_action_taken,"
-                f" r.client_ip, r.source_ip, r.received_at, r.provider, r.source_system,"
-                f" tu.total_tokens, rc.total_cost,"
-                f" COALESCE(tu.input_tokens, r.input_token_estimate) AS prompt_tokens,"
-                f" tu.output_tokens AS completion_tokens,"
-                f" rc.llm_cost,"
-                f" rc.input_token_cost, rc.output_token_cost,"
-                f" r.entry_point,"
-                f" r.pii_severity, r.pii_entities_detected, r.pii_entities_masked,"
-                f" r.failure_code, r.failure_reason, r.completed_at, r.request_payload"
-                f" FROM ai_requests r"
-                f" LEFT JOIN token_usage tu ON tu.request_id = r.request_id"
-                f" LEFT JOIN request_cost rc ON rc.request_id = r.request_id"
-                f" {where}"
-                f" ORDER BY r.created_at DESC LIMIT :limit OFFSET :offset"
-            ),
-            params,
-        ).fetchall()
+
+        if collapse_to_parents:
+            # group_totals sums tokens/cost across a parent and every child
+            # sharing its request_id as parent_request_id (or just itself,
+            # for requests that never fanned out into multiple calls).
+            rows = db.execute(
+                _text(
+                    f"WITH group_totals AS ("
+                    f"  SELECT COALESCE(r2.parent_request_id, r2.request_id) AS group_id,"
+                    f"  COUNT(*) AS request_count,"
+                    f"  SUM(COALESCE(tu2.input_tokens, r2.input_token_estimate)) AS g_input_tokens,"
+                    f"  SUM(tu2.output_tokens) AS g_output_tokens,"
+                    f"  SUM(tu2.total_tokens) AS g_total_tokens,"
+                    f"  SUM(rc2.total_cost) AS g_total_cost,"
+                    f"  SUM(rc2.llm_cost) AS g_llm_cost,"
+                    f"  SUM(rc2.input_token_cost) AS g_input_cost,"
+                    f"  SUM(rc2.output_token_cost) AS g_output_cost"
+                    f"  FROM ai_requests r2"
+                    f"  LEFT JOIN token_usage tu2 ON tu2.request_id = r2.request_id"
+                    f"  LEFT JOIN request_cost rc2 ON rc2.request_id = r2.request_id"
+                    f"  GROUP BY COALESCE(r2.parent_request_id, r2.request_id)"
+                    f")"
+                    f" SELECT r.request_id, r.org_id, r.project_id, r.request_type, r.model_name,"
+                    f" r.input_token_estimate, r.request_status, r.created_at,"
+                    f" r.pii_detected, r.pii_types, r.pii_action_taken,"
+                    f" r.client_ip, r.source_ip, r.received_at, r.provider, r.source_system,"
+                    f" gt.g_total_tokens, gt.g_total_cost,"
+                    f" gt.g_input_tokens AS prompt_tokens,"
+                    f" gt.g_output_tokens AS completion_tokens,"
+                    f" gt.g_llm_cost,"
+                    f" gt.g_input_cost, gt.g_output_cost,"
+                    f" r.entry_point,"
+                    f" r.pii_severity, r.pii_entities_detected, r.pii_entities_masked,"
+                    f" r.failure_code, r.failure_reason, r.completed_at, r.request_payload,"
+                    f" r.trace_id, gt.request_count"
+                    f" FROM ai_requests r"
+                    f" LEFT JOIN group_totals gt ON gt.group_id = r.request_id"
+                    f" {where}"
+                    f" ORDER BY r.created_at DESC LIMIT :limit OFFSET :offset"
+                ),
+                params,
+            ).fetchall()
+        else:
+            rows = db.execute(
+                _text(
+                    f"SELECT r.request_id, r.org_id, r.project_id, r.request_type, r.model_name,"
+                    f" r.input_token_estimate, r.request_status, r.created_at,"
+                    f" r.pii_detected, r.pii_types, r.pii_action_taken,"
+                    f" r.client_ip, r.source_ip, r.received_at, r.provider, r.source_system,"
+                    f" tu.total_tokens, rc.total_cost,"
+                    f" COALESCE(tu.input_tokens, r.input_token_estimate) AS prompt_tokens,"
+                    f" tu.output_tokens AS completion_tokens,"
+                    f" rc.llm_cost,"
+                    f" rc.input_token_cost, rc.output_token_cost,"
+                    f" r.entry_point,"
+                    f" r.pii_severity, r.pii_entities_detected, r.pii_entities_masked,"
+                    f" r.failure_code, r.failure_reason, r.completed_at, r.request_payload,"
+                    f" r.trace_id, NULL AS request_count, r.parent_request_id"
+                    f" FROM ai_requests r"
+                    f" LEFT JOIN token_usage tu ON tu.request_id = r.request_id"
+                    f" LEFT JOIN request_cost rc ON rc.request_id = r.request_id"
+                    f" {where}"
+                    f" ORDER BY r.created_at DESC LIMIT :limit OFFSET :offset"
+                ),
+                params,
+            ).fetchall()
     except Exception as exc:
         _log.warning("list_proxy_requests query failed: %s", exc)
         return {"total": 0, "offset": offset, "items": []}
@@ -2073,6 +2428,79 @@ def list_proxy_requests(
                 "failure_code":          r[27],
                 "failure_reason":        r[28],
                 "request_payload":       r[30],
+                "trace_id":              r[31],
+                "request_count":         r[32] or 1,
+                "parent_request_id":     (r[33] if len(r) > 33 else None),
+            }
+            for r in rows
+        ],
+    }
+
+
+def _list_proxy_requests_grouped_by_trace(
+    *, db: Session, where: str, params: dict, limit: int, offset: int,
+) -> dict:
+    """Aggregate ai_requests by trace_id — one summary row per user question
+    (e.g. the classify -> tool-select -> response-generation LLM calls a
+    chatbot issues for a single turn, when it sends the same X-Trace-Id on
+    each). Callers expand a group by re-querying with ?trace_id=<id>.
+    """
+    from sqlalchemy import text as _text
+
+    trace_where = where or "WHERE 1=1"
+    trace_where += " AND r.trace_id IS NOT NULL"
+
+    try:
+        total = (
+            db.execute(
+                _text(
+                    f"SELECT COUNT(DISTINCT r.trace_id) FROM ai_requests r {trace_where}"
+                ),
+                params,
+            ).scalar() or 0
+        )
+        params["limit"] = limit
+        params["offset"] = offset
+        rows = db.execute(
+            _text(
+                f"SELECT r.trace_id,"
+                f" COUNT(*) AS request_count,"
+                f" MIN(r.created_at) AS first_created_at,"
+                f" MAX(r.created_at) AS last_created_at,"
+                f" SUM(COALESCE(tu.input_tokens, r.input_token_estimate)) AS total_input_tokens,"
+                f" SUM(tu.output_tokens) AS total_output_tokens,"
+                f" SUM(tu.total_tokens) AS total_tokens,"
+                f" SUM(rc.total_cost) AS total_cost,"
+                f" MAX(r.org_id) AS org_id,"
+                f" MAX(r.project_id) AS project_id"
+                f" FROM ai_requests r"
+                f" LEFT JOIN token_usage tu ON tu.request_id = r.request_id"
+                f" LEFT JOIN request_cost rc ON rc.request_id = r.request_id"
+                f" {trace_where}"
+                f" GROUP BY r.trace_id"
+                f" ORDER BY MAX(r.created_at) DESC LIMIT :limit OFFSET :offset"
+            ),
+            params,
+        ).fetchall()
+    except Exception as exc:
+        _log.warning("list_proxy_requests grouped query failed: %s", exc)
+        return {"total": 0, "offset": offset, "items": []}
+
+    return {
+        "total": total,
+        "offset": offset,
+        "items": [
+            {
+                "trace_id":           r[0],
+                "request_count":      r[1],
+                "first_created_at":   r[2].isoformat() if r[2] else None,
+                "last_created_at":    r[3].isoformat() if r[3] else None,
+                "total_input_tokens": r[4],
+                "total_output_tokens": r[5],
+                "total_tokens":       r[6],
+                "total_cost":         float(r[7]) if r[7] is not None else None,
+                "org_id":             r[8],
+                "project_id":         r[9],
             }
             for r in rows
         ],

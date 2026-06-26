@@ -38,7 +38,13 @@ def _rebuild_daily_summary(*, db: Session, summary_date: date) -> int:
             RequestCost.org_id,
             RequestCost.project_id,
             RequestCost.model_name,
-            func.count(RequestCost.request_id).label("total_requests"),
+            # A multi-step pipeline (e.g. classify -> tool-select -> generate)
+            # makes several LLM calls sharing one parent_request_id; count
+            # the group once for request-volume reporting while still
+            # summing tokens/cost across every call (real usage/spend).
+            func.count(
+                func.distinct(func.coalesce(AiRequest.parent_request_id, AiRequest.request_id))
+            ).label("total_requests"),
             func.sum(RequestCost.input_tokens).label("input_tokens"),
             func.sum(RequestCost.output_tokens).label("output_tokens"),
             func.sum(RequestCost.total_tokens).label("total_tokens"),
@@ -46,6 +52,7 @@ def _rebuild_daily_summary(*, db: Session, summary_date: date) -> int:
             func.sum(RequestCost.input_token_cost).label("input_cost"),
             func.sum(RequestCost.output_token_cost).label("output_cost"),
         )
+        .join(AiRequest, AiRequest.request_id == RequestCost.request_id)
         .filter(func.date(RequestCost.created_at) == summary_date)
         .filter(RequestCost.org_id.isnot(None))
         .group_by(RequestCost.org_id, RequestCost.project_id, RequestCost.model_name)

@@ -11,14 +11,19 @@ Scope resolution (all applicable limits are checked; any exceeded → 429):
 tool_name = '*' or NULL on a rate_limits row means "applies to all models".
 A specific tool_name value applies only when that model is being called.
 
-Migration note (DB → Redis):
-  Counter logic is isolated in _count_requests_in_window() and _sum_tokens_today().
-  To migrate: replace the bodies of those two functions with Redis INCR+EXPIRE calls.
-  The rate_limits config table stays in Postgres; only counters move.
+Counters (Redis with Postgres fallback):
+  _count_requests_in_window() and _sum_tokens_today() use Redis INCR+EXPIRE
+  via app.services.redis_client when REDIS_URL is configured and reachable,
+  falling back to the original Postgres queries otherwise. The rate_limits
+  config table always stays in Postgres; only counters move to Redis.
+  record_tokens_used() must be called once per completed request (after the
+  Azure response, when total_tokens is known) to keep the daily token
+  counter in Redis up to date.
 """
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timedelta, date
 from typing import Optional
 
@@ -26,9 +31,13 @@ from fastapi import HTTPException
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
+from app.services.redis_client import get_redis_client
+
 _log = logging.getLogger(__name__)
 
 _WINDOW_SECONDS = 60
+_TOKEN_COUNTER_KEY_FMT = "ratelimit:tokens:{scope}:{scope_val}:{day}"
+_REQUEST_COUNTER_KEY_FMT = "ratelimit:reqs:{scope}:{scope_val}:{bucket}"
 
 
 def check_rate_limit(
@@ -146,10 +155,25 @@ def check_rate_limit(
 def _count_requests_in_window(
     *, db: Session, scope: str, scope_val: str, window_seconds: int,
 ) -> int:
-    """Count committed ai_requests rows within the sliding window.
+    """Count requests within the current fixed window.
 
-    Replace this function body with Redis INCR+EXPIRE when migrating.
+    Uses Redis INCR+EXPIRE (one counter per scope per window bucket) when
+    available; each call counts the in-flight request being checked. Falls
+    back to a Postgres count of committed ai_requests rows when Redis is
+    not configured or unreachable.
     """
+    client = get_redis_client()
+    if client is not None:
+        try:
+            bucket = int(time.time() // window_seconds)
+            key = _REQUEST_COUNTER_KEY_FMT.format(scope=scope, scope_val=scope_val, bucket=bucket)
+            count = client.incr(key)
+            if count == 1:
+                client.expire(key, window_seconds)
+            return count
+        except Exception as exc:
+            _log.warning("Redis request counter failed, falling back to Postgres: %s", exc)
+
     from app.models import AiRequest
 
     cutoff = datetime.utcnow() - timedelta(seconds=window_seconds)
@@ -167,10 +191,22 @@ def _count_requests_in_window(
 
 
 def _sum_tokens_today(*, db: Session, scope: str, scope_val: str) -> int:
-    """Sum total_tokens from request_cost for today.
+    """Return today's token usage for this scope.
 
-    Replace this function body with Redis INCR+EXPIRE when migrating.
+    Reads the Redis daily counter (kept up to date by record_tokens_used())
+    when available; falls back to summing request_cost.total_tokens from
+    Postgres when Redis is not configured or unreachable.
     """
+    client = get_redis_client()
+    if client is not None:
+        try:
+            key = _TOKEN_COUNTER_KEY_FMT.format(
+                scope=scope, scope_val=scope_val, day=date.today().isoformat(),
+            )
+            return int(client.get(key) or 0)
+        except Exception as exc:
+            _log.warning("Redis token counter failed, falling back to Postgres: %s", exc)
+
     from app.models import RequestCost
 
     today = date.today()
@@ -182,13 +218,42 @@ def _sum_tokens_today(*, db: Session, scope: str, scope_val: str) -> int:
     col = col_map.get(scope)
     if col is None:
         col = RequestCost.org_id
-        scope_val = scope_val  # keep as-is for org fallback
 
     return (
         db.query(func.coalesce(func.sum(RequestCost.total_tokens), 0))
         .filter(col == scope_val, func.date(RequestCost.created_at) == today)
         .scalar() or 0
     )
+
+
+def record_tokens_used(*, org_id: str, project_id: Optional[str], tokens: int) -> None:
+    """Increment today's Redis token counters for org and project scope.
+
+    Call once per completed request, after total_tokens is known (i.e. after
+    the Azure response), so _sum_tokens_today() reflects current usage.
+    No-ops when Redis is not configured/unreachable — Postgres summation
+    remains the source of truth in that case.
+    """
+    if tokens <= 0:
+        return
+    client = get_redis_client()
+    if client is None:
+        return
+
+    day = date.today().isoformat()
+    ttl = _seconds_until_midnight() + _WINDOW_SECONDS  # small buffer past midnight
+    try:
+        pipe = client.pipeline()
+        org_key = _TOKEN_COUNTER_KEY_FMT.format(scope="org", scope_val=org_id, day=day)
+        pipe.incrby(org_key, tokens)
+        pipe.expire(org_key, ttl)
+        if project_id:
+            project_key = _TOKEN_COUNTER_KEY_FMT.format(scope="project", scope_val=project_id, day=day)
+            pipe.incrby(project_key, tokens)
+            pipe.expire(project_key, ttl)
+        pipe.execute()
+    except Exception as exc:
+        _log.warning("Redis token counter increment failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +270,14 @@ def _resolve_scope(*, limit_row, org_id: str, project_id: Optional[str], key_id:
 
 
 def _retry_after(*, db: Session, scope: str, scope_val: str, window_seconds: int) -> int:
-    """Seconds until the oldest request in the window ages out."""
+    """Seconds until the rate limit window resets."""
+    client = get_redis_client()
+    if client is not None:
+        try:
+            return max(1, window_seconds - int(time.time() % window_seconds))
+        except Exception as exc:
+            _log.warning("Redis retry-after lookup failed, falling back to Postgres: %s", exc)
+
     from app.models import AiRequest
 
     cutoff = datetime.utcnow() - timedelta(seconds=window_seconds)

@@ -41,6 +41,13 @@ _SAFE_ALTERS = [
     "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS source_ip VARCHAR(60)",
     "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS user_agent VARCHAR(500)",
     "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP",
+    # Correlation id so multiple LLM calls from one user turn (e.g. a
+    # classify -> tool-select -> response-generation chatbot pipeline) can
+    # be grouped together via GET /proxy/v1/requests?group_by=trace_id
+    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS trace_id VARCHAR(120)",
+    "CREATE INDEX IF NOT EXISTS ix_ai_requests_trace_id ON ai_requests (trace_id)",
+    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS parent_request_id VARCHAR(120)",
+    "CREATE INDEX IF NOT EXISTS ix_ai_requests_parent_request_id ON ai_requests (parent_request_id)",
     # Audit log
     "ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS request_id VARCHAR(120)",
     "ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS trace_id VARCHAR(120)",

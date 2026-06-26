@@ -1,4 +1,5 @@
 """Application configuration loaded from environment variables."""
+import json
 import logging
 import os
 from decimal import Decimal
@@ -38,6 +39,37 @@ def get_lookup_defaults(name: str) -> list[str]:
     env_key = f"LOOKUP_{name.upper().replace('-', '_')}"
     raw = os.getenv(env_key, "")
     return [item.strip() for item in raw.split(",") if item and item.strip()]
+
+
+def get_standard_model_deployments() -> list[dict]:
+    """Return the deployment templates every new org should be auto-provisioned with.
+
+    Format: env var ``STANDARD_MODEL_DEPLOYMENTS`` is a JSON array, e.g.::
+
+        STANDARD_MODEL_DEPLOYMENTS=[
+          {"model_name": "gpt-5-nano", "provider": "azure_openai",
+           "deployment_name": "gpt-5-nano-prod", "endpoint_url": "https://...",
+           "api_key": "...", "api_version": "2025-01-01-preview"},
+          {"model_name": "gpt-4.1-mini", "provider": "azure_openai",
+           "deployment_name": "gpt-4.1-mini-prod", "endpoint_url": "https://...",
+           "api_key": "...", "api_version": "2025-01-01-preview"}
+        ]
+
+    Not configured or invalid JSON returns an empty list — org creation still
+    succeeds, it just won't auto-provision any deployments.
+    """
+    raw = os.getenv("STANDARD_MODEL_DEPLOYMENTS", "")
+    if not raw.strip():
+        return []
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        _log.warning("STANDARD_MODEL_DEPLOYMENTS is not valid JSON — skipping auto-provisioning.")
+        return []
+    if not isinstance(parsed, list):
+        _log.warning("STANDARD_MODEL_DEPLOYMENTS must be a JSON array — skipping auto-provisioning.")
+        return []
+    return parsed
 
 
 def _dec(key: str, default: str) -> Decimal:
@@ -106,6 +138,16 @@ def get_db_pool_recycle() -> int:
 def get_scheduler_max_workers() -> int:
     """Maximum APScheduler worker threads inside each API process."""
     return _int("SCHEDULER_MAX_WORKERS", "2")
+
+
+def get_redis_url() -> str:
+    """Connection string for the rate-limit counter cache (Azure Cache for Redis).
+
+    Stores only temporary rate-limit counters to reduce Postgres load and
+    improve performance — no sensitive application data. Empty string means
+    Redis is not configured; rate limiting falls back to Postgres counting.
+    """
+    return os.getenv("REDIS_URL", "")
 
 
 # ── Azure OpenAI credentials (admin-only — never exposed to external teams) ─

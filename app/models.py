@@ -596,6 +596,12 @@ class AiRequest(Base):
     trace_id = Column(String(120), nullable=True)
     span_id = Column(String(120), nullable=True)
     parent_span_id = Column(String(120), nullable=True)
+    # The first call sharing a given trace_id is the parent (NULL here); later
+    # calls in the same multi-step pipeline (e.g. classify -> tool-select ->
+    # generate) point back at the parent's request_id. Lets the request list
+    # show one row per user turn while keeping each call's own tokens/payload
+    # for audit, without affecting real-time rate limit/budget counters.
+    parent_request_id = Column(String(120), nullable=True)
     session_id = Column(String(120), nullable=True)
     conversation_id = Column(String(120), nullable=True)
     route_id = Column(String(120), ForeignKey("ai_routes.route_id", ondelete="SET NULL"), nullable=True)

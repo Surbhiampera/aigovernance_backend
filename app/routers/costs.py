@@ -53,7 +53,11 @@ def cost_by_model(
     q = db.query(
         RequestCost.model_name,
         RequestCost.provider,
-        func.count(RequestCost.request_id).label("total_requests"),
+        # One pipeline (parent + child LLM calls touching this model) counts
+        # as one request; token/cost sums still cover every call.
+        func.count(
+            func.distinct(func.coalesce(AiRequest.parent_request_id, AiRequest.request_id))
+        ).label("total_requests"),
         func.sum(RequestCost.input_tokens).label("input_tokens"),
         func.sum(RequestCost.output_tokens).label("output_tokens"),
         func.sum(RequestCost.total_tokens).label("total_tokens"),
@@ -61,7 +65,7 @@ def cost_by_model(
         func.sum(RequestCost.output_token_cost).label("output_token_cost"),
         func.sum(RequestCost.llm_cost).label("llm_cost"),
         func.sum(RequestCost.total_cost).label("total_cost"),
-    )
+    ).join(AiRequest, AiRequest.request_id == RequestCost.request_id)
     q = _org_filter(q, RequestCost, org_id=org_id)
     q = _project_filter(q, RequestCost, project_id=project_id)
     q = _date_filter(q, RequestCost, start=start, end=end)
@@ -99,7 +103,9 @@ def cost_by_project(
     q = db.query(
         RequestCost.org_id,
         RequestCost.project_id,
-        func.count(RequestCost.request_id).label("total_requests"),
+        func.count(
+            func.distinct(func.coalesce(AiRequest.parent_request_id, AiRequest.request_id))
+        ).label("total_requests"),
         func.sum(RequestCost.input_tokens).label("input_tokens"),
         func.sum(RequestCost.output_tokens).label("output_tokens"),
         func.sum(RequestCost.total_tokens).label("total_tokens"),
@@ -107,7 +113,7 @@ def cost_by_project(
         func.sum(RequestCost.output_token_cost).label("output_cost"),
         func.sum(RequestCost.llm_cost).label("llm_cost"),
         func.sum(RequestCost.total_cost).label("total_cost"),
-    )
+    ).join(AiRequest, AiRequest.request_id == RequestCost.request_id)
     q = _org_filter(q, RequestCost, org_id=org_id)
     q = _date_filter(q, RequestCost, start=start, end=end)
     rows = (
@@ -146,12 +152,14 @@ def cost_by_org(
 ) -> list[dict]:
     q = db.query(
         RequestCost.org_id,
-        func.count(RequestCost.request_id).label("total_requests"),
+        func.count(
+            func.distinct(func.coalesce(AiRequest.parent_request_id, AiRequest.request_id))
+        ).label("total_requests"),
         func.sum(RequestCost.input_tokens).label("input_tokens"),
         func.sum(RequestCost.output_tokens).label("output_tokens"),
         func.sum(RequestCost.total_tokens).label("total_tokens"),
         func.sum(RequestCost.total_cost).label("total_cost"),
-    )
+    ).join(AiRequest, AiRequest.request_id == RequestCost.request_id)
     q = _date_filter(q, RequestCost, start=start, end=end)
     rows = (
         q.group_by(RequestCost.org_id)
@@ -188,14 +196,18 @@ def cost_trend_daily(
 
     q = db.query(
         func.date(RequestCost.created_at).label("day"),
-        func.count(RequestCost.request_id).label("total_requests"),
+        func.count(
+            func.distinct(func.coalesce(AiRequest.parent_request_id, AiRequest.request_id))
+        ).label("total_requests"),
         func.sum(RequestCost.input_tokens).label("input_tokens"),
         func.sum(RequestCost.output_tokens).label("output_tokens"),
         func.sum(RequestCost.total_tokens).label("total_tokens"),
         func.sum(RequestCost.input_token_cost).label("input_token_cost"),
         func.sum(RequestCost.output_token_cost).label("output_token_cost"),
         func.sum(RequestCost.total_cost).label("total_cost"),
-    ).filter(func.date(RequestCost.created_at) >= cutoff)
+    ).join(AiRequest, AiRequest.request_id == RequestCost.request_id).filter(
+        func.date(RequestCost.created_at) >= cutoff
+    )
 
     q = _org_filter(q, RequestCost, org_id=org_id)
     q = _project_filter(q, RequestCost, project_id=project_id)
@@ -344,14 +356,16 @@ def cost_summary(
     db: Session = Depends(get_db),
 ) -> dict:
     q = db.query(
-        func.count(RequestCost.request_id).label("total_requests"),
+        func.count(
+            func.distinct(func.coalesce(AiRequest.parent_request_id, AiRequest.request_id))
+        ).label("total_requests"),
         func.sum(RequestCost.input_tokens).label("input_tokens"),
         func.sum(RequestCost.output_tokens).label("output_tokens"),
         func.sum(RequestCost.total_tokens).label("total_tokens"),
         func.sum(RequestCost.input_token_cost).label("input_token_cost"),
         func.sum(RequestCost.output_token_cost).label("output_token_cost"),
         func.sum(RequestCost.total_cost).label("total_cost"),
-    )
+    ).join(AiRequest, AiRequest.request_id == RequestCost.request_id)
     q = _org_filter(q, RequestCost, org_id=org_id)
     q = _project_filter(q, RequestCost, project_id=project_id)
     q = _date_filter(q, RequestCost, start=start, end=end)

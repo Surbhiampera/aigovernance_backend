@@ -13,11 +13,49 @@ from __future__ import annotations
 
 import logging
 import os
+import uuid
+from datetime import datetime
 from typing import Optional
 
 from sqlalchemy.orm import Session
 
 _log = logging.getLogger(__name__)
+
+
+def provision_standard_deployments(db: Session, *, org_id: str) -> int:
+    """Create one org-wide ModelDeployment row per entry in
+    config.get_standard_model_deployments() for a newly created org.
+
+    project_id is left NULL so every project under the org (including ones
+    created later) resolves to these deployments without a separate row.
+    Returns the number of rows created. No-op if the config list is empty.
+    """
+    from app.config import get_standard_model_deployments
+    from app.models import ModelDeployment
+
+    templates = get_standard_model_deployments()
+    created = 0
+    for tpl in templates:
+        model_name = tpl.get("model_name")
+        if not model_name:
+            continue
+        db.add(ModelDeployment(
+            deployment_id=f"depl-{uuid.uuid4().hex[:20]}",
+            org_id=org_id,
+            project_id=None,
+            provider=tpl.get("provider", "azure_openai"),
+            model_name=model_name,
+            deployment_name=tpl.get("deployment_name") or model_name,
+            endpoint_url=tpl.get("endpoint_url"),
+            api_key=tpl.get("api_key"),
+            api_version=tpl.get("api_version"),
+            is_default=bool(tpl.get("is_default", False)),
+            is_active=True,
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow(),
+        ))
+        created += 1
+    return created
 
 
 def get_deployment_for_org(
@@ -31,6 +69,32 @@ def get_deployment_for_org(
 
     When requested_model is given, only exact model_name matches are considered.
     Returns None if no matching deployment is found — caller raises 404.
+
+    Thin wrapper over get_deployments_for_org() — kept for callers that only
+    need the single best match and don't care about failover candidates.
+    """
+    candidates = get_deployments_for_org(
+        db, org_id=org_id, project_id=project_id, requested_model=requested_model,
+    )
+    return candidates[0] if candidates else None
+
+
+def get_deployments_for_org(
+    db: Session,
+    *,
+    org_id: str,
+    project_id: Optional[str],
+    requested_model: Optional[str] = None,
+) -> list:
+    """Return all usable ModelDeployment rows for this org/project/model,
+    ranked primary-first so callers can fail over to the next entry if the
+    primary is unavailable.
+
+    Ranking: project-specific deployments before org-wide ones, then
+    is_default before non-default, then earliest-registered (created_at)
+    before later additions. When no DB deployment matches, falls back to a
+    synthetic deployment built from env vars (see _env_fallbacks) if one
+    matches the requested model.
     """
     from app.models import ModelDeployment
 
@@ -41,27 +105,30 @@ def get_deployment_for_org(
     if requested_model:
         q = q.filter(ModelDeployment.model_name == requested_model)
 
-    candidates = q.all()
+    candidates = [d for d in q.all() if _has_credentials(d)]
     if not candidates:
-        return _fallback(requested_model, org_id=org_id, project_id=project_id)
+        env = _fallback(requested_model, org_id=org_id, project_id=project_id)
+        return [env] if env else []
 
-    def score(d: ModelDeployment) -> tuple:
+    def sort_key(d: ModelDeployment) -> tuple:
         project_match = 1 if d.project_id == project_id else 0
         is_default    = 1 if d.is_default else 0
-        return (project_match, is_default)
+        created       = d.created_at or datetime.max
+        return (-project_match, -is_default, created)
 
-    best = max(candidates, key=score)
-    if _has_credentials(best):
-        return best
-    return _fallback(requested_model, org_id=org_id, project_id=project_id)
+    candidates.sort(key=sort_key)
+    return candidates
 
 
 def _fallback(requested_model, *, org_id: str, project_id):
-    """Return env-fallback deployment if it matches requested_model, else None."""
-    env = _env_fallback(org_id=org_id, project_id=project_id)
+    """Return the env-fallback deployment matching requested_model, else None."""
+    envs = _env_fallbacks(org_id=org_id, project_id=project_id)
     if not requested_model:
-        return env
-    return env if (env and env.model_name == requested_model) else None
+        return envs[0] if envs else None
+    for env in envs:
+        if env.model_name == requested_model:
+            return env
+    return None
 
 
 def _has_credentials(d) -> bool:
@@ -71,32 +138,55 @@ def _has_credentials(d) -> bool:
 _CONTENT_TYPE_JSON = "application/json"
 
 
-def _env_fallback(*, org_id: str, project_id: Optional[str]):
-    """Synthetic deployment from AZURE_OPENAI_* env vars for backward compat."""
-    _key    = os.getenv("AZURE_OPENAI_API_KEY", "")
-    _ep     = os.getenv("AZURE_OPENAI_ENDPOINT", "")
-    _dep    = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "")
-    _ver    = os.getenv("AZURE_OPENAI_API_VERSION") or os.getenv("OPENAI_API_VERSION") or "2024-02-01"
-
-    if not (_key and _ep and _dep):
-        return None
-
-    _log.warning(
-        "No DB deployment found for org=%s project=%s — using AZURE_OPENAI_* env vars. "
-        "Register a deployment via POST /deployments to remove this warning.",
-        org_id, project_id,
-    )
+def _make_env_deployment(*, model_name: str, api_key: str, endpoint: str, api_version: str):
+    _api_key = api_key  # class body below treats `api_key = api_key` as local-before-assignment
 
     class _EnvDeployment:
         provider        = "azure_openai"
-        model_name      = _dep
-        deployment_name = _dep
-        endpoint_url    = _ep
-        api_key         = _key
-        api_version     = _ver
-        is_default      = True
+        deployment_name = model_name
+        endpoint_url    = endpoint
+        api_key         = _api_key
 
+    _EnvDeployment.model_name = model_name
+    _EnvDeployment.api_version = api_version
+    _EnvDeployment.is_default = True
     return _EnvDeployment()
+
+
+def _env_fallbacks(*, org_id: str, project_id: Optional[str]) -> list:
+    """Synthetic deployments built from env vars, for backward compat / quick setup
+    without a DB row. Each set below covers one model; add more sets here as needed.
+    """
+    fallbacks = []
+
+    # gpt-5-nano (and anything else routed via AZURE_OPENAI_DEPLOYMENT_NAME)
+    _key, _ep, _dep = (
+        os.getenv("AZURE_OPENAI_API_KEY", ""),
+        os.getenv("AZURE_OPENAI_ENDPOINT", ""),
+        os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", ""),
+    )
+    _ver = os.getenv("AZURE_OPENAI_API_VERSION") or os.getenv("OPENAI_API_VERSION") or "2024-02-01"
+    if _key and _ep and _dep:
+        fallbacks.append(_make_env_deployment(model_name=_dep, api_key=_key, endpoint=_ep, api_version=_ver))
+
+    # gpt-4.1-mini (and anything else routed via OPENAI_DEPLOYMENT_NAME)
+    _key2, _ep2, _dep2 = (
+        os.getenv("OPENAI_API_KEY", ""),
+        os.getenv("OPENAI_ENDPOINT", ""),
+        os.getenv("OPENAI_DEPLOYMENT_NAME", ""),
+    )
+    _ver2 = os.getenv("OPENAI_API_VERSION") or "2024-02-01"
+    if _key2 and _ep2 and _dep2:
+        fallbacks.append(_make_env_deployment(model_name=_dep2, api_key=_key2, endpoint=_ep2, api_version=_ver2))
+
+    if fallbacks:
+        _log.warning(
+            "No DB deployment found for org=%s project=%s — using env-var fallback for model(s): %s. "
+            "Register a deployment via POST /deployments to remove this warning.",
+            org_id, project_id, [f.model_name for f in fallbacks],
+        )
+
+    return fallbacks
 
 
 def build_provider_request(depl, stream: bool = False) -> tuple[str, dict]:
