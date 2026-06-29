@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import Integer, cast, func
+from sqlalchemy import Integer, case, cast, func
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_db
@@ -39,23 +39,48 @@ def security_summary(
 
         row = q.first()
 
-        # Also count PII events from proxy requests (AiRequest path)
-        req_q = db.query(func.count(AiRequest.id)).filter(AiRequest.pii_detected == True)
+        # Proxy-side PII severity isn't backed by a numeric risk score, so map it
+        # the same way the rest of the dashboard does: high/medium/low -> 0.9/0.5/0.2.
+        risk_expr = case(
+            (AiRequest.pii_severity == "high", 0.9),
+            (AiRequest.pii_severity == "medium", 0.5),
+            (AiRequest.pii_severity == "low", 0.2),
+            else_=0.0,
+        )
+
+        # Also count/score PII events from proxy requests (AiRequest path) —
+        # DataSecurityLog has no producer yet, so this is the only real signal.
+        req_q = db.query(
+            func.count(AiRequest.id).label("count"),
+            func.sum(risk_expr).label("risk_sum"),
+            func.max(risk_expr).label("risk_max"),
+        ).filter(AiRequest.pii_detected == True)
         if org_id:
             req_q = req_q.filter(AiRequest.org_id == org_id)
         if project_id:
             req_q = req_q.filter(AiRequest.project_id == project_id)
         if start_date:
             req_q = req_q.filter(func.date(AiRequest.created_at) >= start_date)
-        proxy_pii_count = req_q.scalar() or 0
+        req_row = req_q.first()
+        proxy_pii_count = req_row.count or 0
+        proxy_risk_sum = float(req_row.risk_sum or 0)
+        proxy_risk_max = float(req_row.risk_max or 0)
+
+        ds_count = row.total_events or 0
+        ds_risk_sum = float(row.average_risk_score or 0) * ds_count
+        ds_risk_max = float(row.highest_risk_score or 0)
+
+        combined_count = ds_count + proxy_pii_count
+        combined_avg = (ds_risk_sum + proxy_risk_sum) / combined_count if combined_count else 0.0
+        combined_peak = max(ds_risk_max, proxy_risk_max)
 
         return {
             "total_events":        (row.total_events or 0) + proxy_pii_count,
             "total_with_pii":      int(row.total_with_pii or 0) + proxy_pii_count,
             "misuse_events":       int(row.misuse_events or 0),
             "data_out_events":     int(row.data_out_events or 0),
-            "average_risk_score":  float(row.average_risk_score or 0),
-            "highest_risk_score":  float(row.highest_risk_score or 0),
+            "average_risk_score":  round(combined_avg, 2),
+            "highest_risk_score":  round(combined_peak, 2),
         }
     except Exception as exc:
         db.rollback()

@@ -479,6 +479,7 @@ def _store_request(
     entry_point: Optional[str] = None,
     trace_id: Optional[str] = None,
     parent_request_id: Optional[str] = None,
+    has_tool_definitions: bool = False,
 ) -> AiRequest:
     row = AiRequest(
         request_id=request_id,
@@ -489,6 +490,7 @@ def _store_request(
         model_name=model,
         deployment_name=deployment,
         request_payload=payload,
+        has_tool_definitions=has_tool_definitions,
         trace_id=trace_id,
         parent_request_id=parent_request_id,
         # Original (pre-mask) messages and masked text kept side-by-side for
@@ -650,6 +652,13 @@ def _store_response_and_cost(
         output_tokens=output_tokens,
     )
 
+    tool_calls = (
+        response_payload.get("choices", [{}])[0].get("message", {}).get("tool_calls")
+        if isinstance(response_payload, dict)
+        else None
+    )
+    num_tool_calls = len(tool_calls) if tool_calls else 0
+
     db.add(AiResponse(
         response_id=_new_response_id(),
         request_id=request_id,
@@ -657,6 +666,8 @@ def _store_response_and_cost(
         project_id=project_id,
         model_name=model,
         response_payload=response_payload,
+        tool_calls=tool_calls,
+        num_tool_calls=num_tool_calls,
         finish_reason=finish_reason,
         latency_ms=latency_ms,
         response_status=status,
@@ -709,6 +720,29 @@ def _store_response_and_cost(
         # never disagrees with its own AiResponse/TokenUsage/RequestCost rows.
         req_row.model_name = model
         req_row.deployment_name = deployment
+
+        if req_row.has_tool_definitions and num_tool_calls == 0:
+            log_event(
+                db,
+                org_id=org_id,
+                project_id=project_id,
+                audit_category="governance",
+                audit_action="tool_call_reliability_flag",
+                audit_status="failure",
+                actor_type="governance_engine",
+                entity_type="ai_response",
+                entity_id=request_id,
+                request_id=request_id,
+                policy_triggered=False,
+                compliance_relevant=False,
+                requires_review=True,
+                change_summary=(
+                    f"Model '{model}' was given tool definitions but invoked zero tools "
+                    f"(finish_reason={finish_reason})."
+                ),
+                metadata={"model": model, "finish_reason": finish_reason},
+                flush=False,
+            )
 
     db.flush()
 
@@ -928,6 +962,7 @@ def _mark_request_failed_with_cost(
         org_id=org_id,
         project_id=project_id,
         model_name=model,
+        provider=provider or None,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         total_tokens=input_tokens + output_tokens,
@@ -1089,7 +1124,7 @@ async def _stream_azure(
                 _err_upstream_ms = int((time.time() - t_start) * 1000)
                 _mark_request_failed_with_cost(
                     db=db, request_id=request_id, org_id=org_id, project_id=project_id,
-                    key_id=key_id, model=model, deployment=deployment,
+                    key_id=key_id, model=model, deployment=deployment, provider=provider,
                     input_tokens=billed_input, output_tokens=partial_output_tokens,
                     latency_ms=_err_upstream_ms,
                     source_ip=source_ip, user_agent=user_agent,
@@ -1114,7 +1149,7 @@ async def _stream_azure(
             _fallback_tokens = _estimate_input_tokens(messages, model)
             _mark_request_failed_with_cost(
                 db=db, request_id=request_id, org_id=org_id, project_id=project_id,
-                key_id=key_id, model=model, deployment=deployment,
+                key_id=key_id, model=model, deployment=deployment, provider=provider,
                 input_tokens=_fallback_tokens, output_tokens=0,
                 latency_ms=_err_upstream_ms,
                 source_ip=source_ip, user_agent=user_agent,
@@ -1144,7 +1179,7 @@ async def _stream_azure(
         _partial_input = _estimate_input_tokens(messages, model)
         _mark_request_failed_with_cost(
             db=db, request_id=request_id, org_id=org_id, project_id=project_id,
-            key_id=key_id, model=model, deployment=deployment,
+            key_id=key_id, model=model, deployment=deployment, provider=provider,
             input_tokens=_partial_input, output_tokens=output_tokens,
             latency_ms=latency_ms,
             source_ip=source_ip, user_agent=user_agent,
@@ -1312,7 +1347,7 @@ async def _stream_provider_native(
                 _billed_input = _estimate_input_tokens(messages, model)
                 _mark_request_failed_with_cost(
                     db=db, request_id=request_id, org_id=org_id, project_id=project_id,
-                    key_id=key_id, model=model, deployment=deployment,
+                    key_id=key_id, model=model, deployment=deployment, provider=provider,
                     input_tokens=_billed_input, output_tokens=partial_output_tokens,
                     latency_ms=_err_upstream_ms,
                     source_ip=source_ip, user_agent=user_agent,
@@ -1336,7 +1371,7 @@ async def _stream_provider_native(
             _fallback_tokens = _estimate_input_tokens(messages, model)
             _mark_request_failed_with_cost(
                 db=db, request_id=request_id, org_id=org_id, project_id=project_id,
-                key_id=key_id, model=model, deployment=deployment,
+                key_id=key_id, model=model, deployment=deployment, provider=provider,
                 input_tokens=_fallback_tokens, output_tokens=0,
                 latency_ms=_err_upstream_ms,
                 source_ip=source_ip, user_agent=user_agent,
@@ -1358,7 +1393,7 @@ async def _stream_provider_native(
         _partial_input = _estimate_input_tokens(messages, model)
         _mark_request_failed_with_cost(
             db=db, request_id=request_id, org_id=org_id, project_id=project_id,
-            key_id=key_id, model=model, deployment=deployment,
+            key_id=key_id, model=model, deployment=deployment, provider=provider,
             input_tokens=_partial_input, output_tokens=output_tokens,
             latency_ms=latency_ms,
             source_ip=source_ip, user_agent=user_agent,
@@ -1593,6 +1628,7 @@ async def _run_pre_flight(
         entry_point=entry_point,
         trace_id=trace_id,
         parent_request_id=parent_request_id,
+        has_tool_definitions=bool(forward_body.get("tools") or forward_body.get("functions")),
     )
     db.commit()
 
@@ -1764,7 +1800,7 @@ async def proxy_chat(
             _mark_request_failed_with_cost(
                 db=db, request_id=ctx["request_id"], org_id=ctx["org_id"],
                 project_id=ctx["project_id"], key_id=ctx["key_id"],
-                model=ctx["model"], deployment=ctx["deployment"],
+                model=ctx["model"], deployment=ctx["deployment"], provider=ctx.get("provider", ""),
                 input_tokens=billed_input, output_tokens=azure_output,
                 latency_ms=int((time.time() - t_start) * 1000),
                 source_ip=ctx["source_ip"], user_agent=ctx["user_agent"],
@@ -1785,7 +1821,7 @@ async def proxy_chat(
         _mark_request_failed_with_cost(
             db=db, request_id=ctx["request_id"], org_id=ctx["org_id"],
             project_id=ctx["project_id"], key_id=ctx["key_id"],
-            model=ctx["model"], deployment=ctx["deployment"],
+            model=ctx["model"], deployment=ctx["deployment"], provider=ctx.get("provider", ""),
             input_tokens=_fallback_tokens, output_tokens=0,
             latency_ms=int((time.time() - t_start) * 1000),
             source_ip=ctx["source_ip"], user_agent=ctx["user_agent"],
@@ -2020,6 +2056,9 @@ def proxy_stats_overview(
     *,
     org_id: Optional[str] = Query(None),
     days: int = Query(30, ge=1, le=365),
+    project_id: Optional[str] = Query(None),
+    provider: Optional[str] = Query(None),
+    model_name: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ) -> dict:
     cutoff = datetime.utcnow().date() - timedelta(days=days - 1)
@@ -2044,6 +2083,12 @@ def proxy_stats_overview(
     )
     if org_id:
         cost_q = cost_q.filter(RequestCost.org_id == org_id)
+    if project_id:
+        cost_q = cost_q.filter(RequestCost.project_id == project_id)
+    if provider:
+        cost_q = cost_q.filter(RequestCost.provider == provider)
+    if model_name:
+        cost_q = cost_q.filter(RequestCost.model_name == model_name)
     cost = cost_q.first()
 
     req_q = db.query(
@@ -2084,6 +2129,12 @@ def proxy_stats_overview(
     ).filter(func.date(AiRequest.created_at) >= cutoff)
     if org_id:
         req_q = req_q.filter(AiRequest.org_id == org_id)
+    if project_id:
+        req_q = req_q.filter(AiRequest.project_id == project_id)
+    if provider:
+        req_q = req_q.filter(AiRequest.provider == provider)
+    if model_name:
+        req_q = req_q.filter(AiRequest.model_name == model_name)
     req_stats = req_q.first()
     total_reqs = int(req_stats.total or 0)
     completed = int(req_stats.completed or 0)
@@ -2096,6 +2147,12 @@ def proxy_stats_overview(
     )
     if org_id:
         latency_q = latency_q.filter(AiResponse.org_id == org_id)
+    if project_id:
+        latency_q = latency_q.filter(AiResponse.project_id == project_id)
+    if provider:
+        latency_q = latency_q.filter(AiResponse.provider == provider)
+    if model_name:
+        latency_q = latency_q.filter(AiResponse.model_name == model_name)
     avg_latency = latency_q.scalar() or 0
 
     pii_q = db.query(func.count(AiRequest.id)).filter(
@@ -2104,6 +2161,12 @@ def proxy_stats_overview(
     )
     if org_id:
         pii_q = pii_q.filter(AiRequest.org_id == org_id)
+    if project_id:
+        pii_q = pii_q.filter(AiRequest.project_id == project_id)
+    if provider:
+        pii_q = pii_q.filter(AiRequest.provider == provider)
+    if model_name:
+        pii_q = pii_q.filter(AiRequest.model_name == model_name)
     pii_detections = pii_q.scalar() or 0
 
     success_rate = round((completed / total_reqs * 100), 2) if total_reqs > 0 else 0
@@ -2130,6 +2193,9 @@ def proxy_stats_trends(
     *,
     org_id: Optional[str] = Query(None),
     days: int = Query(30, ge=1, le=365),
+    project_id: Optional[str] = Query(None),
+    provider: Optional[str] = Query(None),
+    model_name: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ) -> list[dict]:
     cutoff = datetime.utcnow().date() - timedelta(days=days - 1)
@@ -2147,6 +2213,12 @@ def proxy_stats_trends(
     )
     if org_id:
         q = q.filter(RequestCost.org_id == org_id)
+    if project_id:
+        q = q.filter(RequestCost.project_id == project_id)
+    if provider:
+        q = q.filter(RequestCost.provider == provider)
+    if model_name:
+        q = q.filter(RequestCost.model_name == model_name)
 
     rows = (
         q.group_by(func.date(RequestCost.created_at))
@@ -2171,6 +2243,9 @@ def proxy_stats_pii(
     *,
     org_id: Optional[str] = Query(None),
     days: int = Query(30, ge=1, le=365),
+    project_id: Optional[str] = Query(None),
+    provider: Optional[str] = Query(None),
+    model_name: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ) -> dict:
     from sqlalchemy import text as _text
@@ -2178,6 +2253,19 @@ def proxy_stats_pii(
     cutoff = (datetime.utcnow().date() - timedelta(days=days - 1)).isoformat()
 
     org_filter = "AND org_id = :org_id" if org_id else ""
+    project_filter = "AND project_id = :project_id" if project_id else ""
+    provider_filter = "AND provider = :provider" if provider else ""
+    model_filter = "AND model_name = :model_name" if model_name else ""
+
+    params = {"cutoff": cutoff}
+    if org_id:
+        params["org_id"] = org_id
+    if project_id:
+        params["project_id"] = project_id
+    if provider:
+        params["provider"] = provider
+    if model_name:
+        params["model_name"] = model_name
 
     type_rows = db.execute(_text(f"""
         SELECT unnested_type AS pii_type, COUNT(*) AS count
@@ -2191,9 +2279,12 @@ def proxy_stats_pii(
         WHERE pii_detected = TRUE
           AND DATE(created_at) >= :cutoff
           {org_filter}
+          {project_filter}
+          {provider_filter}
+          {model_filter}
         GROUP BY unnested_type
         ORDER BY count DESC
-    """), {"cutoff": cutoff, "org_id": org_id} if org_id else {"cutoff": cutoff}).fetchall()
+    """), params).fetchall()
 
     action_rows = db.execute(_text(f"""
         SELECT pii_action_taken AS action, COUNT(*) AS count
@@ -2202,9 +2293,12 @@ def proxy_stats_pii(
           AND pii_action_taken IS NOT NULL
           AND DATE(created_at) >= :cutoff
           {org_filter}
+          {project_filter}
+          {provider_filter}
+          {model_filter}
         GROUP BY pii_action_taken
         ORDER BY count DESC
-    """), {"cutoff": cutoff, "org_id": org_id} if org_id else {"cutoff": cutoff}).fetchall()
+    """), params).fetchall()
 
     total_pii = sum(r.count for r in action_rows)
 
@@ -2213,6 +2307,53 @@ def proxy_stats_pii(
         "pii_type_breakdown": [{"pii_type": r.pii_type, "count": r.count} for r in type_rows],
         "action_breakdown": [{"action": r.action, "count": r.count} for r in action_rows],
     }
+
+
+@router.get("/stats/tool-call-reliability")
+def proxy_stats_tool_call_reliability(
+    *,
+    org_id: Optional[str] = Query(None),
+    days: int = Query(30, ge=1, le=365),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    """Per-model breakdown of tool-equipped requests vs. requests where the
+    model actually invoked a tool. A model with tools provided but a high
+    zero-tool-call rate is unreliable for agentic/tool-calling workloads —
+    this is the pattern behind silent agent failures that hallucinate an
+    excuse instead of calling any tool.
+    """
+    cutoff = datetime.utcnow().date() - timedelta(days=days - 1)
+
+    q = (
+        db.query(
+            AiRequest.model_name.label("model"),
+            func.count(AiRequest.id).label("tool_equipped_requests"),
+            func.sum(cast(AiResponse.num_tool_calls > 0, Integer)).label("requests_with_tool_calls"),
+        )
+        .join(AiResponse, AiResponse.request_id == AiRequest.request_id)
+        .filter(
+            AiRequest.has_tool_definitions.is_(True),
+            func.date(AiRequest.created_at) >= cutoff,
+        )
+    )
+    if org_id:
+        q = q.filter(AiRequest.org_id == org_id)
+
+    rows = q.group_by(AiRequest.model_name).order_by(func.count(AiRequest.id).desc()).all()
+
+    result = []
+    for r in rows:
+        equipped = r.tool_equipped_requests or 0
+        with_calls = r.requests_with_tool_calls or 0
+        zero_calls = equipped - with_calls
+        result.append({
+            "model": r.model,
+            "tool_equipped_requests": equipped,
+            "requests_with_tool_calls": with_calls,
+            "requests_with_zero_tool_calls": zero_calls,
+            "zero_tool_call_rate_pct": round((zero_calls / equipped) * 100, 1) if equipped else 0.0,
+        })
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -2316,34 +2457,19 @@ def list_proxy_requests(
     count_where = ("WHERE " + " AND ".join(count_filters)) if count_filters else ""
 
     try:
-        total = (
-            db.execute(_text(f"SELECT COUNT(*) FROM ai_requests {count_where}"), params).scalar() or 0
-        )
         params["limit"] = limit
         params["offset"] = offset
 
         if collapse_to_parents:
-            # group_totals sums tokens/cost across a parent and every child
-            # sharing its request_id as parent_request_id (or just itself,
-            # for requests that never fanned out into multiple calls).
+            # Page first (filtered, indexed, capped at `limit`), then a LATERAL
+            # join computes token/cost totals only for each page row's own
+            # group — never scanning/aggregating the whole table — all in a
+            # single round trip to the DB (cuts a network round trip vs. a
+            # separate totals query, which matters most on high-latency
+            # connections like Aiven's managed Postgres).
             rows = db.execute(
                 _text(
-                    f"WITH group_totals AS ("
-                    f"  SELECT COALESCE(r2.parent_request_id, r2.request_id) AS group_id,"
-                    f"  COUNT(*) AS request_count,"
-                    f"  SUM(COALESCE(tu2.input_tokens, r2.input_token_estimate)) AS g_input_tokens,"
-                    f"  SUM(tu2.output_tokens) AS g_output_tokens,"
-                    f"  SUM(tu2.total_tokens) AS g_total_tokens,"
-                    f"  SUM(rc2.total_cost) AS g_total_cost,"
-                    f"  SUM(rc2.llm_cost) AS g_llm_cost,"
-                    f"  SUM(rc2.input_token_cost) AS g_input_cost,"
-                    f"  SUM(rc2.output_token_cost) AS g_output_cost"
-                    f"  FROM ai_requests r2"
-                    f"  LEFT JOIN token_usage tu2 ON tu2.request_id = r2.request_id"
-                    f"  LEFT JOIN request_cost rc2 ON rc2.request_id = r2.request_id"
-                    f"  GROUP BY COALESCE(r2.parent_request_id, r2.request_id)"
-                    f")"
-                    f" SELECT r.request_id, r.org_id, r.project_id, r.request_type, r.model_name,"
+                    f"SELECT r.request_id, r.org_id, r.project_id, r.request_type, r.model_name,"
                     f" r.input_token_estimate, r.request_status, r.created_at,"
                     f" r.pii_detected, r.pii_types, r.pii_action_taken,"
                     f" r.client_ip, r.source_ip, r.received_at, r.provider, r.source_system,"
@@ -2355,14 +2481,34 @@ def list_proxy_requests(
                     f" r.entry_point,"
                     f" r.pii_severity, r.pii_entities_detected, r.pii_entities_masked,"
                     f" r.failure_code, r.failure_reason, r.completed_at, r.request_payload,"
-                    f" r.trace_id, gt.request_count"
+                    f" r.trace_id, gt.request_count,"
+                    f" COUNT(*) OVER() AS total_count"
                     f" FROM ai_requests r"
-                    f" LEFT JOIN group_totals gt ON gt.group_id = r.request_id"
+                    f" LEFT JOIN LATERAL ("
+                    f"   SELECT COUNT(*) AS request_count,"
+                    f"   SUM(COALESCE(tu2.input_tokens, r2.input_token_estimate)) AS g_input_tokens,"
+                    f"   SUM(tu2.output_tokens) AS g_output_tokens,"
+                    f"   SUM(tu2.total_tokens) AS g_total_tokens,"
+                    f"   SUM(rc2.total_cost) AS g_total_cost,"
+                    f"   SUM(rc2.llm_cost) AS g_llm_cost,"
+                    f"   SUM(rc2.input_token_cost) AS g_input_cost,"
+                    f"   SUM(rc2.output_token_cost) AS g_output_cost"
+                    f"   FROM ai_requests r2"
+                    f"   LEFT JOIN token_usage tu2 ON tu2.request_id = r2.request_id"
+                    f"   LEFT JOIN request_cost rc2 ON rc2.request_id = r2.request_id"
+                    f"   WHERE COALESCE(r2.parent_request_id, r2.request_id) = r.request_id"
+                    f" ) gt ON TRUE"
                     f" {where}"
                     f" ORDER BY r.created_at DESC LIMIT :limit OFFSET :offset"
                 ),
                 params,
             ).fetchall()
+            if rows:
+                total = rows[0].total_count
+            else:
+                total = (
+                    db.execute(_text(f"SELECT COUNT(*) FROM ai_requests {count_where}"), params).scalar() or 0
+                )
         else:
             rows = db.execute(
                 _text(
@@ -2378,7 +2524,8 @@ def list_proxy_requests(
                     f" r.entry_point,"
                     f" r.pii_severity, r.pii_entities_detected, r.pii_entities_masked,"
                     f" r.failure_code, r.failure_reason, r.completed_at, r.request_payload,"
-                    f" r.trace_id, NULL AS request_count, r.parent_request_id"
+                    f" r.trace_id, NULL AS request_count, r.parent_request_id,"
+                    f" COUNT(*) OVER() AS total_count"
                     f" FROM ai_requests r"
                     f" LEFT JOIN token_usage tu ON tu.request_id = r.request_id"
                     f" LEFT JOIN request_cost rc ON rc.request_id = r.request_id"
@@ -2387,6 +2534,12 @@ def list_proxy_requests(
                 ),
                 params,
             ).fetchall()
+            if rows:
+                total = rows[0].total_count
+            else:
+                total = (
+                    db.execute(_text(f"SELECT COUNT(*) FROM ai_requests {count_where}"), params).scalar() or 0
+                )
     except Exception as exc:
         _log.warning("list_proxy_requests query failed: %s", exc)
         return {"total": 0, "offset": offset, "items": []}

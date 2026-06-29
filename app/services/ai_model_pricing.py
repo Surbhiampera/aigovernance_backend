@@ -28,6 +28,8 @@ MODEL_PRICING: dict[str, ModelPricing] = {
 
     "gpt-4o":                 ModelPricing(2.50,   10.00, 128_000,  16_384, "OpenAI", "chat"),
     "gpt-4o-mini":            ModelPricing(0.15,    0.60, 128_000,  16_384, "OpenAI", "chat"),
+    "gpt-4.1":                ModelPricing(2.00,    8.00, 1_047_576, 32_768, "OpenAI", "chat"),
+    "gpt-4.1-mini":           ModelPricing(0.40,    1.60, 1_047_576, 32_768, "OpenAI", "chat"),
     "gpt-4o-2024-11-20":      ModelPricing(2.50,   10.00, 128_000,  16_384, "OpenAI", "chat"),
     "gpt-4-turbo":            ModelPricing(10.00,  30.00, 128_000,   4_096, "OpenAI", "chat"),
     "gpt-4":                  ModelPricing(30.00,  60.00,   8_192,   4_096, "OpenAI", "chat"),
@@ -157,6 +159,8 @@ PROVIDER_PRICING: dict[tuple[str, str], ModelPricing] = {
     ("azure_openai", "gpt-5"):        ModelPricing(4.50,  13.50, 400_000,128_000, "Azure OpenAI", "chat"),
     ("azure_openai", "gpt-4o"):       ModelPricing(2.50,  10.00, 128_000, 16_384, "Azure OpenAI", "chat"),
     ("azure_openai", "gpt-4o-mini"):  ModelPricing(0.15,   0.60, 128_000, 16_384, "Azure OpenAI", "chat"),
+    ("azure_openai", "gpt-4.1"):      ModelPricing(2.00,   8.00, 1_047_576, 32_768, "Azure OpenAI", "chat"),
+    ("azure_openai", "gpt-4.1-mini"): ModelPricing(0.40,   1.60, 1_047_576, 32_768, "Azure OpenAI", "chat"),
     ("azure_openai", "gpt-4-turbo"):  ModelPricing(10.00, 30.00, 128_000,  4_096, "Azure OpenAI", "chat"),
     ("azure_openai", "gpt-4"):        ModelPricing(30.00, 60.00,   8_192,  4_096, "Azure OpenAI", "chat"),
     ("azure_openai", "gpt-3.5-turbo"):  ModelPricing(0.50,   1.50,  16_385,  4_096, "Azure OpenAI", "chat"),

@@ -306,6 +306,31 @@ PII detection breakdown by type and action taken.
 
 ---
 
+### `GET /proxy/stats/tool-call-reliability`
+
+Per-model breakdown of tool-equipped requests vs. requests where the model actually invoked a tool. A model that's given tool/function definitions but frequently returns zero tool calls is unreliable for agentic workloads — this surfaces that failure pattern (the model hallucinating an answer instead of calling a tool).
+
+| Query param | Type   | Description                          |
+| ----------- | ------ | ------------------------------------ |
+| `org_id`    | string | Filter by organisation               |
+| `days`      | int    | Lookback window in days (default 30) |
+
+**Response**
+
+```json
+[
+  {
+    "model": "gpt-4o",
+    "tool_equipped_requests": 120,
+    "requests_with_tool_calls": 110,
+    "requests_with_zero_tool_calls": 10,
+    "zero_tool_call_rate_pct": 8.3
+  }
+]
+```
+
+---
+
 ### `GET /proxy/v1/requests/{request_id}/pii-detail`
 
 Full PII entity detail for a single request, including before/after (masked) values for prompt and response text. Used by the PII drill-down view.
@@ -1074,6 +1099,7 @@ Mark an alert as resolved.
 | `GET`    | `/proxy/stats/trends`           | Daily request/cost trends       |
 | `GET`    | `/proxy/stats/by-project-model` | Stats by project + model        |
 | `GET`    | `/proxy/stats/pii`              | PII detection breakdown         |
+| `GET`    | `/proxy/stats/tool-call-reliability` | Per-model zero-tool-call rate |
 | `GET`    | `/proxy/v1/requests/{id}/pii-detail` | Full PII detail for one request |
 | `GET`    | `/costs/summary`                | Total cost summary              |
 | `GET`    | `/costs/by-model`               | Cost breakdown by model         |

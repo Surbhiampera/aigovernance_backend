@@ -45,6 +45,8 @@ _PRESIDIO_TO_INTERNAL: dict[str, str] = {
     "CRYPTO":               "crypto",
     "AADHAR":               "aadhar",
     "NATIONAL_ID":          "national_id",
+    "ORGANIZATION":         "organization",
+    "URL":                  "url",
 }
 
 _DEFAULT_MASKS: dict[str, str] = {
@@ -61,11 +63,21 @@ _DEFAULT_MASKS: dict[str, str] = {
     "bank_account":  "[BANK_ACCOUNT]",
     "crypto":        "[CRYPTO]",
     "aadhar":        "[AADHAR]",
+    "organization":  "[ORGANIZATION]",
+    "url":           "[URL]",
 }
 
 # Types that elevate severity to High regardless of entity count (includes national_id for PAN)
 _HIGH_SENSITIVITY: frozenset[str] = frozenset({
     "aadhar", "credit_card", "passport", "ssn", "bank_account", "national_id"
+})
+
+# Business/contextual entities that NER frequently over-flags (company names, city
+# names, job-posting links) but that are not personal-identifying data on their own.
+# These are logged but allowed through by default unless an org explicitly configures
+# a stricter PiiPolicy for them.
+_LOW_SENSITIVITY_DEFAULT_ALLOW: frozenset[str] = frozenset({
+    "location", "organization", "url"
 })
 
 
@@ -211,9 +223,10 @@ def scan_and_mask(
     # Resolve policy per type once; reused for detections summary and entity detail
     resolved_policies: dict[str, dict] = {}
     for pii_type, spans in by_type.items():
+        default_action = "allow" if pii_type in _LOW_SENSITIVITY_DEFAULT_ALLOW else "mask"
         policy = policies.get(pii_type) or {
-            "risk_level":    "medium",
-            "action":        "mask",
+            "risk_level":    "low" if default_action == "allow" else "medium",
+            "action":        default_action,
             "mask_pattern":  _DEFAULT_MASKS.get(pii_type, f"[{pii_type.upper()}]"),
             "log_detection": True,
         }
@@ -248,9 +261,10 @@ def scan_and_mask(
     _entity_details: list[dict] = []
     for r in analyzer_results:
         internal = _PRESIDIO_TO_INTERNAL.get(r.entity_type, r.entity_type.lower())
+        default_action = "allow" if internal in _LOW_SENSITIVITY_DEFAULT_ALLOW else "mask"
         p = resolved_policies.get(internal, {
-            "risk_level": "medium",
-            "action": "mask",
+            "risk_level": "low" if default_action == "allow" else "medium",
+            "action": default_action,
             "mask_pattern": _DEFAULT_MASKS.get(internal, f"[{internal.upper()}]"),
         })
         _entity_details.append({
@@ -263,9 +277,19 @@ def scan_and_mask(
         })
 
     # --- Anonymize in one pass via Presidio AnonymizerEngine ---------------
-    if final_action == "mask" and not should_block:
+    # Only mask spans whose own resolved policy action is "mask" — a type set to
+    # "allow" (e.g. organization/location/url) must stay untouched even when some
+    # other entity elsewhere in the same text triggers masking.
+    maskable_results = [
+        r for r in analyzer_results
+        if resolved_policies.get(
+            _PRESIDIO_TO_INTERNAL.get(r.entity_type, r.entity_type.lower()), {}
+        ).get("action") == "mask"
+    ]
+
+    if maskable_results and not should_block:
         operators: dict[str, OperatorConfig] = {}
-        for r in analyzer_results:
+        for r in maskable_results:
             internal = _PRESIDIO_TO_INTERNAL.get(r.entity_type, r.entity_type.lower())
             mask_str = (policies.get(internal) or {}).get("mask_pattern") or _DEFAULT_MASKS.get(internal, f"[{internal.upper()}]")
             operators[r.entity_type] = OperatorConfig("replace", {"new_value": mask_str})
@@ -273,7 +297,7 @@ def scan_and_mask(
         try:
             anonymized = anonymizer.anonymize(
                 text=text,
-                analyzer_results=analyzer_results,
+                analyzer_results=maskable_results,
                 operators=operators,
             )
             result.sanitized_text = anonymized.text

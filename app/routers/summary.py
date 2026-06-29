@@ -16,7 +16,7 @@ from decimal import Decimal
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func
+from sqlalchemy import Integer, cast, func
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_db
@@ -300,6 +300,9 @@ def get_usage_trends(
 def get_overview(
     *,
     org_id: Optional[str] = Query(None),
+    project_id: Optional[str] = Query(None),
+    model: Optional[str] = Query(None),
+    provider: Optional[str] = Query(None),
     range: Optional[str] = Query(None, description="today | 7d | 30d | 90d | all"),
     db: Session = Depends(get_db),
 ) -> dict:
@@ -317,18 +320,30 @@ def get_overview(
     else:
         cutoff = None
 
-    # Cost totals from DailyOrgSummary
+    # Cost totals — read live from RequestCost + AiRequest rather than the
+    # pre-aggregated DailyOrgSummary table, since DailyOrgSummary has no
+    # `provider` column and can't express a provider filter.
     cost_q = db.query(
-        func.sum(DailyOrgSummary.total_events).label("total_requests"),
-        func.sum(DailyOrgSummary.total_tokens).label("total_tokens"),
-        func.sum(DailyOrgSummary.total_cost).label("total_cost"),
-        func.sum(DailyOrgSummary.success_count).label("success_count"),
-        func.sum(DailyOrgSummary.failure_count).label("failure_count"),
-        func.avg(DailyOrgSummary.avg_latency_ms).label("avg_latency_ms"),
-    )
+        func.count(
+            func.distinct(func.coalesce(AiRequest.parent_request_id, AiRequest.request_id))
+        ).label("total_requests"),
+        func.sum(RequestCost.total_tokens).label("total_tokens"),
+        func.sum(RequestCost.total_cost).label("total_cost"),
+        func.sum(cast(AiRequest.request_status == "success", Integer)).label("success_count"),
+        func.sum(cast(AiRequest.request_status != "success", Integer)).label("failure_count"),
+        func.avg(
+            func.extract("epoch", AiRequest.completed_at - AiRequest.created_at) * 1000
+        ).label("avg_latency_ms"),
+    ).join(AiRequest, AiRequest.request_id == RequestCost.request_id)
+
     if cutoff:
-        cost_q = cost_q.filter(DailyOrgSummary.date >= cutoff)
-    cost_q = _org_filter(cost_q, DailyOrgSummary, org_id=org_id)
+        cost_q = cost_q.filter(func.date(RequestCost.created_at) >= cutoff)
+    cost_q = _org_filter(cost_q, RequestCost, org_id=org_id)
+    cost_q = _project_filter(cost_q, RequestCost, project_id=project_id)
+    if model:
+        cost_q = cost_q.filter(RequestCost.model_name == model)
+    if provider:
+        cost_q = cost_q.filter(RequestCost.provider == provider)
     totals = cost_q.first()
 
     total_requests = totals.total_requests or 0
@@ -339,23 +354,37 @@ def get_overview(
     # Active alerts count
     alert_q = db.query(func.count(Alert.id)).filter(Alert.status == "active")
     alert_q = _org_filter(alert_q, Alert, org_id=org_id)
+    alert_q = _project_filter(alert_q, Alert, project_id=project_id)
+    if model:
+        alert_q = alert_q.filter(Alert.tool_name == model)
     active_alerts = alert_q.scalar() or 0
 
     # Active governance rules
-    rules_active = db.query(func.count(GovernanceRule.id)).filter(GovernanceRule.is_active.is_(True)).scalar() or 0
+    rules_q = db.query(func.count(GovernanceRule.id)).filter(GovernanceRule.is_active.is_(True))
+    rules_q = _org_filter(rules_q, GovernanceRule, org_id=org_id)
+    rules_q = _project_filter(rules_q, GovernanceRule, project_id=project_id)
+    rules_active = rules_q.scalar() or 0
 
     # Budget tracking — any project over 80% of their budget
     budgets_at_risk = 0
     if org_id:
         budgets = db.query(Budget).filter(Budget.org_id == org_id).all()
+        if project_id:
+            budgets = [b for b in budgets if b.project_id == project_id]
         for b in budgets:
             if not b.limit_amount or b.limit_amount <= 0:
                 continue
             spent_q = db.query(func.sum(RequestCost.total_cost)).filter(
                 RequestCost.org_id == org_id,
             )
+            if cutoff:
+                spent_q = spent_q.filter(func.date(RequestCost.created_at) >= cutoff)
             if b.project_id:
                 spent_q = spent_q.filter(RequestCost.project_id == b.project_id)
+            if model:
+                spent_q = spent_q.filter(RequestCost.model_name == model)
+            if provider:
+                spent_q = spent_q.filter(RequestCost.provider == provider)
             spent = spent_q.scalar() or Decimal("0")
             pct = float(spent) / float(b.limit_amount) * 100
             if pct >= 80:
