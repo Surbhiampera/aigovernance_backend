@@ -81,13 +81,23 @@ _LOW_SENSITIVITY_DEFAULT_ALLOW: frozenset[str] = frozenset({
 })
 
 
-def compute_pii_severity(pii_types: list[str], total_count: int) -> str:
-    """Return 'high'/'medium'/'low'/'' based on entity count and type."""
-    if not total_count:
+def compute_pii_severity(entity_types: list[str]) -> str:
+    """Return 'high'/'medium'/'low'/'' based on the sensitivity of detected entities.
+
+    One occurrence of a high-sensitivity type (ssn, credit_card, ...) is always
+    'high'. Occurrences of low-sensitivity, default-allowed types (organization,
+    location, url) don't count toward the volume thresholds below — only
+    entities that are PII on their own do, so e.g. 11 "organization" mentions
+    and nothing else stays 'low', not 'high'.
+    """
+    if not entity_types:
         return ""
-    if total_count >= 5 or any(t in _HIGH_SENSITIVITY for t in pii_types):
+    if any(t in _HIGH_SENSITIVITY for t in entity_types):
         return "high"
-    if total_count >= 3:
+    significant = [t for t in entity_types if t not in _LOW_SENSITIVITY_DEFAULT_ALLOW]
+    if len(significant) >= 5:
+        return "high"
+    if len(significant) >= 3:
         return "medium"
     return "low"
 
@@ -314,5 +324,5 @@ def scan_and_mask(
         sum(1 for e in _entity_details if e["masked_value"] is not None)
         if result.pii_masked else 0
     )
-    result.severity = compute_pii_severity(result.pii_types, result.entities_detected)
+    result.severity = compute_pii_severity([e["pii_type"] for e in result.entity_details])
     return result

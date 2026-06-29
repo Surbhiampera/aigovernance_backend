@@ -437,7 +437,7 @@ def _scan_messages(
             sanitised.append({**msg, "content": scanned_blocks})
         else:
             sanitised.append(msg)
-    combined.severity = compute_pii_severity(combined.pii_types, combined.entities_detected)
+    combined.severity = compute_pii_severity([e["pii_type"] for e in combined.entity_details])
     return sanitised, combined
 
 

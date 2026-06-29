@@ -137,28 +137,25 @@ def _post_proxy(client, raw_key: str, messages: list[dict]) -> httpx.Response:
 class TestComputePiiSeverity:
 
     def test_no_entities_returns_empty(self):
-        assert compute_pii_severity([], 0) == ""
+        assert compute_pii_severity([]) == ""
 
-    def test_zero_count_returns_empty_even_with_types(self):
-        assert compute_pii_severity(["email"], 0) == ""
+    def test_one_entity_is_low(self):
+        assert compute_pii_severity(["email"]) == "low"
 
-    def test_one_entity_low_sensitivity_is_low(self):
-        assert compute_pii_severity(["email"], 1) == "low"
-
-    def test_two_entities_low_sensitivity_is_low(self):
-        assert compute_pii_severity(["email", "name"], 2) == "low"
+    def test_two_entities_is_low(self):
+        assert compute_pii_severity(["email", "name"]) == "low"
 
     def test_three_entities_is_medium(self):
-        assert compute_pii_severity(["email", "name", "phone"], 3) == "medium"
+        assert compute_pii_severity(["email", "name", "phone"]) == "medium"
 
     def test_four_entities_is_medium(self):
-        assert compute_pii_severity(["email", "name", "phone", "ip_address"], 4) == "medium"
+        assert compute_pii_severity(["email", "name", "phone", "ip_address"]) == "medium"
 
     def test_five_entities_is_high(self):
-        assert compute_pii_severity(["e", "n", "p", "i", "l"], 5) == "high"
+        assert compute_pii_severity(["e", "n", "p", "i", "l"]) == "high"
 
     def test_ten_entities_is_high(self):
-        assert compute_pii_severity(["email"] * 10, 10) == "high"
+        assert compute_pii_severity(["email"] * 10) == "high"
 
     @pytest.mark.parametrize("sensitive_type", [
         "aadhar",
@@ -169,19 +166,37 @@ class TestComputePiiSeverity:
         "national_id",   # covers PAN card
     ])
     def test_high_sensitivity_type_always_high(self, sensitive_type):
-        assert compute_pii_severity([sensitive_type], 1) == "high"
+        assert compute_pii_severity([sensitive_type]) == "high"
 
     def test_high_sensitivity_overrides_low_count(self):
         # Only 1 entity but it's a credit card — count alone would be Low
-        assert compute_pii_severity(["credit_card"], 1) == "high"
+        assert compute_pii_severity(["credit_card"]) == "high"
 
     def test_high_sensitivity_in_mixed_list(self):
         # 2 entities, one is aadhar — must be High, not Low
-        assert compute_pii_severity(["email", "aadhar"], 2) == "high"
+        assert compute_pii_severity(["email", "aadhar"]) == "high"
 
     def test_national_id_covers_pan_card(self):
         # national_id recognizer catches PAN-style IDs
-        assert compute_pii_severity(["national_id"], 1) == "high"
+        assert compute_pii_severity(["national_id"]) == "high"
+
+    def test_many_low_sensitivity_entities_stay_low(self):
+        # 11 "organization" mentions and nothing else — should stay Low, not High,
+        # since organization/location/url don't count toward the volume thresholds.
+        assert compute_pii_severity(["organization"] * 11) == "low"
+
+    def test_low_sensitivity_entities_dont_push_to_medium(self):
+        assert compute_pii_severity(["organization", "location", "url"]) == "low"
+
+    def test_low_sensitivity_mixed_with_two_significant_stays_low(self):
+        # 2 significant entities (email, name) plus a pile of low-sensitivity
+        # organization mentions — significant count is still only 2, so Low.
+        assert compute_pii_severity(["organization"] * 8 + ["email", "name"]) == "low"
+
+    def test_low_sensitivity_mixed_with_three_significant_is_medium(self):
+        assert compute_pii_severity(
+            ["organization"] * 8 + ["email", "name", "phone"]
+        ) == "medium"
 
 
 # ===========================================================================
