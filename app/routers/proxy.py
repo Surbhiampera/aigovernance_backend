@@ -2206,6 +2206,8 @@ def proxy_stats_trends(
             func.distinct(func.coalesce(AiRequest.parent_request_id, AiRequest.request_id))
         ).label("total_requests"),
         func.sum(RequestCost.total_tokens).label("total_tokens"),
+        func.sum(RequestCost.input_tokens).label("prompt_tokens"),
+        func.sum(RequestCost.output_tokens).label("completion_tokens"),
         func.sum(RequestCost.llm_cost).label("llm_cost"),
         func.sum(RequestCost.total_cost).label("total_cost"),
     ).join(AiRequest, AiRequest.request_id == RequestCost.request_id).filter(
@@ -2231,6 +2233,8 @@ def proxy_stats_trends(
             "date": str(r.date),
             "total_requests": r.total_requests or 0,
             "total_tokens": r.total_tokens or 0,
+            "prompt_tokens": r.prompt_tokens or 0,
+            "completion_tokens": r.completion_tokens or 0,
             "llm_cost": float(r.llm_cost or 0),
             "total_cost": float(r.total_cost or 0),
         }
