@@ -16,6 +16,7 @@ import os
 import uuid
 from datetime import datetime
 from typing import Optional
+from urllib.parse import urlparse
 
 from sqlalchemy.orm import Session
 
@@ -153,6 +154,21 @@ def _make_env_deployment(*, model_name: str, api_key: str, endpoint: str, api_ve
     return _EnvDeployment()
 
 
+def _base_endpoint(url: str) -> str:
+    """Strip any path/query from a full Azure resource URL, keeping just scheme+host.
+
+    Some Azure deployment URLs are copied from the portal including the
+    `/openai/deployments/{name}/...` path — build_provider_request() re-appends
+    that path itself, so we need just the bare `https://{resource}.azure.com`.
+    """
+    if not url:
+        return url
+    parsed = urlparse(url)
+    if parsed.scheme and parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}"
+    return url
+
+
 def _env_fallbacks(*, org_id: str, project_id: Optional[str]) -> list:
     """Synthetic deployments built from env vars, for backward compat / quick setup
     without a DB row. Each set below covers one model; add more sets here as needed.
@@ -178,6 +194,29 @@ def _env_fallbacks(*, org_id: str, project_id: Optional[str]) -> list:
     _ver2 = os.getenv("OPENAI_API_VERSION") or "2024-02-01"
     if _key2 and _ep2 and _dep2:
         fallbacks.append(_make_env_deployment(model_name=_dep2, api_key=_key2, endpoint=_ep2, api_version=_ver2))
+
+    # gpt-4o (and anything else routed via AZURE_DEPLOYMENT)
+    _key3, _ep3, _dep3 = (
+        os.getenv("AZURE_API_KEY", ""),
+        _base_endpoint(os.getenv("AZURE_ENDPOINT", "")),
+        os.getenv("AZURE_DEPLOYMENT", ""),
+    )
+    _ver3 = os.getenv("AZURE_API_VERSION") or "2024-02-01"
+    if _key3 and _ep3 and _dep3:
+        fallbacks.append(_make_env_deployment(model_name=_dep3, api_key=_key3, endpoint=_ep3, api_version=_ver3))
+
+    # gpt-4o-mini-tts (and anything else routed via TTS_AZURE_OPENAI_DEPLOYMENT)
+    # Registered for deployment resolution only — the proxy has no TTS/audio
+    # route yet, so build_provider_request() would build a chat/completions
+    # URL for it; wire up an /audio/speech route before proxying real traffic.
+    _key4, _ep4, _dep4 = (
+        os.getenv("TTS_AZURE_OPENAI_API_KEY", ""),
+        _base_endpoint(os.getenv("TTS_AZURE_OPENAI_ENDPOINT", "")),
+        os.getenv("TTS_AZURE_OPENAI_DEPLOYMENT", ""),
+    )
+    _ver4 = os.getenv("TTS_AZURE_OPENAI_API_VERSION") or "2024-02-01"
+    if _key4 and _ep4 and _dep4:
+        fallbacks.append(_make_env_deployment(model_name=_dep4, api_key=_key4, endpoint=_ep4, api_version=_ver4))
 
     if fallbacks:
         _log.warning(

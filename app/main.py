@@ -1,10 +1,13 @@
 from contextlib import asynccontextmanager
+from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy.orm import Session
 
 from app.config import get_cors_origins
+from app.core.deps import get_db
 from app.routers import (
     alerts,
     alerts_security,
@@ -25,6 +28,7 @@ from app.routers import (
 from app.routers.rate_limits import router as rate_limits_router
 from app.routers.deployments import router as deployments_router
 from app.routers.proxy import router as proxy_router
+from app.routers.proxy import proxy_chat_openai_compat
 
 # Safe schema additions — all use IF NOT EXISTS, safe to re-run on every startup.
 _SAFE_ALTERS = [
@@ -243,9 +247,29 @@ async def http_exception_handler(request: Request, exc: HTTPException) -> JSONRe
 for _router in _ALL_ROUTERS:
     app.include_router(_router)
 
-# Proxy registered at root — stable URL for external teams' SDK base_url.
+# All proxy endpoints live under /proxy (see router prefix in app/routers/proxy.py).
+# External teams must set their SDK base_url to "https://<host>/proxy".
 app.include_router(proxy_router)
 app.include_router(deployments_router)
+
+
+# Root-level aliases for misconfigured OpenAI SDK clients that set base_url to
+# the bare host (or "/v1") instead of "/proxy" — the SDK then requests
+# /chat/completions or /v1/chat/completions at root, which would otherwise 404.
+@app.post("/chat/completions")
+@app.post("/v1/chat/completions")
+async def root_chat_completions_alias(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    model: Optional[str] = Query(None, description="AI model name (overrides body 'model' field)"),
+    x_governance_key: str = Header(..., alias="X-Governance-Key"),
+    x_trace_id: Optional[str] = Header(None, alias="X-Trace-Id"),
+    db: Session = Depends(get_db),
+):
+    return await proxy_chat_openai_compat(
+        request=request, background_tasks=background_tasks, model=model,
+        x_governance_key=x_governance_key, x_trace_id=x_trace_id, db=db,
+    )
 
 
 @app.get("/health")

@@ -46,6 +46,9 @@ MODEL_PRICING: dict[str, ModelPricing] = {
     "text-embedding-3-small": ModelPricing(0.02,    0.00,   8_191,       0, "OpenAI", "embedding"),
     "text-embedding-3-large": ModelPricing(0.13,    0.00,   8_191,       0, "OpenAI", "embedding"),
 
+    # input = text tokens in, output = audio tokens out (per OpenAI TTS pricing)
+    "gpt-4o-mini-tts":        ModelPricing(0.60,   12.00,   2_000,       0, "OpenAI", "tts"),
+
     # ── ANTHROPIC ─────────────────────────────────────────────────────────────
     "claude-opus-4-5":            ModelPricing(15.00, 75.00, 200_000, 32_000, "Anthropic", "chat"),
     "claude-sonnet-4-5":          ModelPricing(3.00,  15.00, 200_000, 64_000, "Anthropic", "chat"),
@@ -168,6 +171,7 @@ PROVIDER_PRICING: dict[tuple[str, str], ModelPricing] = {
     ("azure_openai", "text-embedding-3-small"): ModelPricing(0.02, 0.00, 8_191, 0, "Azure OpenAI", "embedding"),
     ("azure_openai", "text-embedding-3-large"): ModelPricing(0.13, 0.00, 8_191, 0, "Azure OpenAI", "embedding"),
     ("azure_openai", "text-embedding-ada-002"): ModelPricing(0.10, 0.00, 8_191, 0, "Azure OpenAI", "embedding"),
+    ("azure_openai", "gpt-4o-mini-tts"): ModelPricing(0.60, 12.00, 2_000, 0, "Azure OpenAI", "tts"),
     # Add more provider-specific overrides here as needed
 }
 
