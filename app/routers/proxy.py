@@ -2157,6 +2157,7 @@ def proxy_stats_overview(
 
     pii_q = db.query(func.count(AiRequest.id)).filter(
         AiRequest.pii_detected == True,
+        AiRequest.parent_request_id.is_(None),
         func.date(AiRequest.created_at) >= cutoff,
     )
     if org_id:
@@ -2281,6 +2282,7 @@ def proxy_stats_pii(
                  END
              ) AS unnested_type
         WHERE pii_detected = TRUE
+          AND parent_request_id IS NULL
           AND DATE(created_at) >= :cutoff
           {org_filter}
           {project_filter}
@@ -2295,6 +2297,7 @@ def proxy_stats_pii(
         FROM ai_requests
         WHERE pii_detected = TRUE
           AND pii_action_taken IS NOT NULL
+          AND parent_request_id IS NULL
           AND DATE(created_at) >= :cutoff
           {org_filter}
           {project_filter}
