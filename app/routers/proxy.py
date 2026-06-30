@@ -2568,7 +2568,7 @@ def list_proxy_requests(
                 "pii_types":        r[9] or [],
                 "pii_action_taken": r[10],
                 "client_ip":        r[11] or r[12],  # client_ip fallback to source_ip
-                "received_at":      r[13].isoformat() if r[13] else (r[7].isoformat() if r[7] else None),
+                "received_at":      (r[13].isoformat() + "Z") if r[13] else ((r[7].isoformat() + "Z") if r[7] else None),
                 "provider":         r[14],
                 "source_system":    r[15],
                 "total_tokens":     r[16],
