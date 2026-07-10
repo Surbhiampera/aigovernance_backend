@@ -140,6 +140,61 @@ def cost_by_project(
 
 
 # ---------------------------------------------------------------------------
+# Cost breakdown by user (within an org/project)
+# ---------------------------------------------------------------------------
+
+@router.get("/by-user")
+def cost_by_user(
+    *,
+    org_id: Optional[str] = Query(None),
+    project_id: Optional[str] = Query(None),
+    start: Optional[date] = Query(None),
+    end: Optional[date] = Query(None),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    q = db.query(
+        AiRequest.user_id,
+        AiRequest.user_email,
+        AiRequest.user_role,
+        func.count(
+            func.distinct(func.coalesce(AiRequest.parent_request_id, AiRequest.request_id))
+        ).label("total_requests"),
+        func.sum(RequestCost.input_tokens).label("input_tokens"),
+        func.sum(RequestCost.output_tokens).label("output_tokens"),
+        func.sum(RequestCost.total_tokens).label("total_tokens"),
+        func.sum(RequestCost.input_token_cost).label("input_cost"),
+        func.sum(RequestCost.output_token_cost).label("output_cost"),
+        func.sum(RequestCost.llm_cost).label("llm_cost"),
+        func.sum(RequestCost.total_cost).label("total_cost"),
+    ).join(AiRequest, AiRequest.request_id == RequestCost.request_id)
+    q = _org_filter(q, RequestCost, org_id=org_id)
+    q = _project_filter(q, RequestCost, project_id=project_id)
+    q = _date_filter(q, RequestCost, start=start, end=end)
+    rows = (
+        q.group_by(AiRequest.user_id, AiRequest.user_email, AiRequest.user_role)
+        .order_by(func.sum(RequestCost.total_cost).desc())
+        .all()
+    )
+
+    return [
+        {
+            "user_id": r.user_id or "unknown",
+            "user_email": r.user_email,
+            "user_role": r.user_role,
+            "total_requests": r.total_requests or 0,
+            "input_tokens": r.input_tokens or 0,
+            "output_tokens": r.output_tokens or 0,
+            "total_tokens": r.total_tokens or 0,
+            "input_cost": float(r.input_cost or 0),
+            "output_cost": float(r.output_cost or 0),
+            "llm_cost": float(r.llm_cost or 0),
+            "total_cost": float(r.total_cost or 0),
+        }
+        for r in rows
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Cost breakdown by organisation
 # ---------------------------------------------------------------------------
 

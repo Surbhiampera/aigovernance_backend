@@ -76,6 +76,15 @@ All AI requests from external teams go through these endpoints. Include your gov
 > 4. No other request changes needed — model, messages, auth header, response shape are all unchanged.
 > 5. This is purely additive: a question that only needs 1 LLM call works identically whether or not `X-Trace-Id` is sent — there is no separate flag for "this is a single-call request" vs. "this is a multi-call request." Grouping only happens when 2+ calls genuinely share the same trace ID; a question resolved in one call is automatically its own one-row group (`request_count: 1`).
 
+> **Per-user tracking with `X-User-Id` (optional)**
+>
+> Every project authenticates with one shared `X-Governance-Key`, so the proxy has no way to tell which person on a team made a given call unless the calling app tells it. Send an optional `X-User-Id` header (whatever ID/email the calling app already uses for its own logged-in user — no pre-registration needed on this side) and every request gets attributed to that person.
+>
+> - `X-User-Email` and `X-User-Role` are two more optional headers for a readable label / role breakdown. If `X-User-Id` is already an email, these are usually redundant and can be skipped.
+> - Requests with no `X-User-Id` are unaffected — they're simply not attributed to a user (`user_id: null` in reports), exactly as before this header existed.
+> - Use the same value for the same person on every call — inconsistent values (e.g. sometimes an email, sometimes a session ID) split one person's usage across multiple buckets in reports.
+> - See [`GET /costs/by-user`](#3-costs) for the per-user cost/token report, and `user_id` on [`GET /proxy/v1/requests`](#2-proxy--stats--request-log) to filter the request log to one person.
+
 ### `POST /proxy`
 
 Non-streaming chat completion. Returns a standard OpenAI-compatible response.
@@ -85,6 +94,9 @@ Non-streaming chat completion. Returns a standard OpenAI-compatible response.
 ```
 X-Governance-Key: gov-xxxxxxxxxxxx
 X-Trace-Id: <uuid>            # optional — groups multi-call pipelines, see above
+X-User-Id: <id-or-email>      # optional — attributes this call to a person, see above
+X-User-Email: <email>         # optional — omit if X-User-Id is already an email
+X-User-Role: <role>           # optional — free-form label (e.g. "developer", "analyst")
 Content-Type: application/json
 ```
 
@@ -194,6 +206,7 @@ By default this returns **one row per parent request** — if a chatbot pipeline
 | -------------------- | ------ | -------------------------------- |
 | `project_id`         | string | Filter by project                |
 | `org_id`             | string | Filter by organisation           |
+| `user_id`            | string | Filter by the `X-User-Id` value sent on the request (see [per-user tracking](#1-proxy--ai-request-routing)) |
 | `request_id`         | string | Fetch a specific request (parent or child) by its own ID |
 | `request_type`       | string | e.g. `chat_completion`           |
 | `status`             | string | e.g. `success`, `error`          |
@@ -234,6 +247,9 @@ By default this returns **one row per parent request** — if a chatbot pipeline
       "provider": "azure_openai",
       "source_system": null,
       "client_ip": "127.0.0.1",
+      "user_id": "alice@theirapp.com",
+      "user_email": null,
+      "user_role": null,
       "trace_id": "a1b2c3d4-...",
       "received_at": "2026-06-09T07:00:00",
       "created_at": "2026-06-09T07:00:01"
@@ -413,6 +429,39 @@ Cost breakdown aggregated by project.
 | `org_id`    | string | Filter by organisation |
 | `start`     | date   | Start date             |
 | `end`       | date   | End date               |
+
+---
+
+### `GET /costs/by-user`
+
+Cost and token breakdown aggregated by user, within an org/project. Requires the calling team to have sent `X-User-Id` on their proxy requests (see [per-user tracking](#1-proxy--ai-request-routing)) — requests without it are excluded from this report.
+
+| Query param  | Type   | Description            |
+| ------------ | ------ | ----------------------- |
+| `org_id`     | string | Filter by organisation |
+| `project_id` | string | Filter by project      |
+| `start`      | date   | Start date             |
+| `end`        | date   | End date               |
+
+**Response**
+
+```json
+[
+  {
+    "user_id": "alice@theirapp.com",
+    "user_email": null,
+    "user_role": null,
+    "total_requests": 42,
+    "input_tokens": 18000,
+    "output_tokens": 9400,
+    "total_tokens": 27400,
+    "input_cost": 0.054,
+    "output_cost": 0.094,
+    "llm_cost": 0.148,
+    "total_cost": 0.148
+  }
+]
+```
 
 ---
 
@@ -1104,6 +1153,7 @@ Mark an alert as resolved.
 | `GET`    | `/costs/summary`                | Total cost summary              |
 | `GET`    | `/costs/by-model`               | Cost breakdown by model         |
 | `GET`    | `/costs/by-project`             | Cost breakdown by project       |
+| `GET`    | `/costs/by-user`                | Cost breakdown by user          |
 | `GET`    | `/costs/by-org`                 | Cost breakdown by org           |
 | `GET`    | `/costs/trend/daily`            | Daily cost trend                |
 | `GET`    | `/costs/trend/monthly`          | Monthly cost trend              |

@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 from app.models import (
     AiRequest,
     DailyOrgSummary,
+    DailyUserUsage,
     MonthlyOrgSummary,
     Organization,
     RequestCost,
@@ -122,6 +123,76 @@ def _rebuild_daily_summary(*, db: Session, summary_date: date) -> int:
             total_input_mb=Decimal("0"),
             total_output_mb=Decimal("0"),
             avg_risk_score=Decimal("0"),
+        ))
+        inserted += 1
+
+    db.flush()
+    return inserted
+
+
+# ---------------------------------------------------------------------------
+# Daily per-user aggregation — AiRequest + RequestCost → DailyUserUsage
+#
+# Only rows with a known AiRequest.user_id (sent via the optional X-User-Id
+# proxy header) are rolled up here — requests with no user attribution stay
+# out of this table but are still counted in DailyOrgSummary above.
+# ---------------------------------------------------------------------------
+
+def _rebuild_daily_user_summary(*, db: Session, summary_date: date) -> int:
+    rows = (
+        db.query(
+            AiRequest.org_id,
+            AiRequest.project_id,
+            AiRequest.user_id,
+            AiRequest.user_email,
+            AiRequest.user_role,
+            RequestCost.model_name,
+            func.count(
+                func.distinct(func.coalesce(AiRequest.parent_request_id, AiRequest.request_id))
+            ).label("total_requests"),
+            func.sum(RequestCost.input_tokens).label("input_tokens"),
+            func.sum(RequestCost.output_tokens).label("output_tokens"),
+            func.sum(RequestCost.total_tokens).label("total_tokens"),
+            func.sum(RequestCost.input_token_cost).label("input_cost"),
+            func.sum(RequestCost.output_token_cost).label("output_cost"),
+            func.sum(RequestCost.total_cost).label("total_cost"),
+        )
+        .join(AiRequest, AiRequest.request_id == RequestCost.request_id)
+        .filter(func.date(RequestCost.created_at) == summary_date)
+        .filter(AiRequest.org_id.isnot(None))
+        .filter(AiRequest.user_id.isnot(None))
+        .group_by(
+            AiRequest.org_id, AiRequest.project_id, AiRequest.user_id,
+            AiRequest.user_email, AiRequest.user_role, RequestCost.model_name,
+        )
+        .all()
+    )
+
+    db.query(DailyUserUsage).filter(DailyUserUsage.date == summary_date).delete(
+        synchronize_session=False
+    )
+
+    inserted = 0
+    for row in rows:
+        org_id = (row.org_id or "").strip()
+        if not org_id:
+            continue
+
+        db.add(DailyUserUsage(
+            org_id=org_id,
+            project_id=row.project_id,
+            user_id=row.user_id,
+            user_email=row.user_email,
+            user_role=row.user_role,
+            model_name=(row.model_name or "").strip() or "unknown",
+            date=summary_date,
+            total_requests=row.total_requests or 0,
+            input_tokens=row.input_tokens or 0,
+            output_tokens=row.output_tokens or 0,
+            total_tokens=row.total_tokens or 0,
+            input_cost=row.input_cost or Decimal("0"),
+            output_cost=row.output_cost or Decimal("0"),
+            total_cost=row.total_cost or Decimal("0"),
         ))
         inserted += 1
 

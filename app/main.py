@@ -177,8 +177,12 @@ async def lifespan(app: FastAPI):
     _bflog = _logging.getLogger(__name__)
     try:
         from app.database import SessionLocal
-        from app.workers.tasks import _rebuild_daily_summary, _detect_daily_anomalies
-        from app.models import AiRequest as _AiReq, DailyOrgSummary as _Daily
+        from app.workers.tasks import (
+            _detect_daily_anomalies,
+            _rebuild_daily_summary,
+            _rebuild_daily_user_summary,
+        )
+        from app.models import AiRequest as _AiReq, DailyOrgSummary as _Daily, DailyUserUsage as _DailyUser
         from sqlalchemy import func as _func
         db = SessionLocal()
         try:
@@ -191,6 +195,9 @@ async def lifespan(app: FastAPI):
             dates_already_summarised = {
                 r[0] for r in db.query(_Daily.date).distinct().all()
             }
+            dates_already_user_summarised = {
+                r[0] for r in db.query(_DailyUser.date).distinct().all()
+            }
             for (d,) in dates_with_requests:
                 if d not in dates_already_summarised:
                     try:
@@ -201,6 +208,13 @@ async def lifespan(app: FastAPI):
                     except Exception:
                         db.rollback()
                         _bflog.exception("Backfill failed for %s", d)
+                if d not in dates_already_user_summarised:
+                    try:
+                        _rebuild_daily_user_summary(db=db, summary_date=d)
+                        db.commit()
+                    except Exception:
+                        db.rollback()
+                        _bflog.exception("DailyUserUsage backfill failed for %s", d)
         finally:
             db.close()
     except Exception:

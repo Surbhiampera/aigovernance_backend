@@ -480,6 +480,9 @@ def _store_request(
     trace_id: Optional[str] = None,
     parent_request_id: Optional[str] = None,
     has_tool_definitions: bool = False,
+    user_id: Optional[str] = None,
+    user_email: Optional[str] = None,
+    user_role: Optional[str] = None,
 ) -> AiRequest:
     row = AiRequest(
         request_id=request_id,
@@ -493,6 +496,9 @@ def _store_request(
         has_tool_definitions=has_tool_definitions,
         trace_id=trace_id,
         parent_request_id=parent_request_id,
+        user_id=user_id,
+        user_email=user_email,
+        user_role=user_role,
         # Original (pre-mask) messages and masked text kept side-by-side for
         # audit/traceability — `request_payload` only holds the masked body
         # actually forwarded upstream.
@@ -792,6 +798,9 @@ def _log_blocked_request(
     request_payload: Optional[dict] = None,
     trace_id: Optional[str] = None,
     parent_request_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    user_email: Optional[str] = None,
+    user_role: Optional[str] = None,
 ) -> None:
     """Create the AiRequest row for requests blocked before _store_request ran.
 
@@ -814,6 +823,9 @@ def _log_blocked_request(
         failure_reason=failure_reason,
         trace_id=trace_id,
         parent_request_id=parent_request_id,
+        user_id=user_id,
+        user_email=user_email,
+        user_role=user_role,
         completed_at=datetime.utcnow(),
         created_at=datetime.utcnow(),
     ))
@@ -1454,6 +1466,9 @@ async def _run_pre_flight(
     db: Session,
     stream: bool = False,
     trace_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    user_email: Optional[str] = None,
+    user_role: Optional[str] = None,
 ) -> dict:
     """Auth, rate-limit, model resolution, budget/governance checks, PII scan, token count.
 
@@ -1495,7 +1510,8 @@ async def _run_pre_flight(
         _log_blocked_request(
             db=db, request_id=request_id, org_id=org_id, project_id=project_id,
             key_id=key_id, source_ip=source_ip, user_agent=user_agent, trace_id=trace_id,
-            parent_request_id=parent_request_id,
+            parent_request_id=parent_request_id, user_id=user_id,
+            user_email=user_email, user_role=user_role,
             failure_code="rate_limited", failure_reason=str(exc.detail),
         )
         raise
@@ -1508,7 +1524,8 @@ async def _run_pre_flight(
         _log_blocked_request(
             db=db, request_id=request_id, org_id=org_id, project_id=project_id,
             key_id=key_id, source_ip=source_ip, user_agent=user_agent, trace_id=trace_id,
-            parent_request_id=parent_request_id,
+            parent_request_id=parent_request_id, user_id=user_id,
+            user_email=user_email, user_role=user_role,
             failure_code="invalid_request", failure_reason="Invalid JSON body.",
         )
         raise HTTPException(status_code=400, detail="Invalid JSON body.")
@@ -1519,7 +1536,8 @@ async def _run_pre_flight(
         _log_blocked_request(
             db=db, request_id=request_id, org_id=org_id, project_id=project_id,
             key_id=key_id, source_ip=source_ip, user_agent=user_agent, trace_id=trace_id,
-            parent_request_id=parent_request_id,
+            parent_request_id=parent_request_id, user_id=user_id,
+            user_email=user_email, user_role=user_role,
             failure_code="invalid_request", failure_reason=_reason, request_payload=body,
         )
         raise HTTPException(status_code=400, detail=_reason)
@@ -1532,7 +1550,8 @@ async def _run_pre_flight(
         _log_blocked_request(
             db=db, request_id=request_id, org_id=org_id, project_id=project_id,
             key_id=key_id, source_ip=source_ip, user_agent=user_agent, trace_id=trace_id,
-            parent_request_id=parent_request_id,
+            parent_request_id=parent_request_id, user_id=user_id,
+            user_email=user_email, user_role=user_role,
             failure_code="model_not_authorized", failure_reason=_reason, request_payload=body,
         )
         raise HTTPException(status_code=404, detail=_reason)
@@ -1551,7 +1570,8 @@ async def _run_pre_flight(
         _log_blocked_request(
             db=db, request_id=request_id, org_id=org_id, project_id=project_id,
             key_id=key_id, source_ip=source_ip, user_agent=user_agent, trace_id=trace_id,
-            parent_request_id=parent_request_id,
+            parent_request_id=parent_request_id, user_id=user_id,
+            user_email=user_email, user_role=user_role,
             failure_code="budget_exceeded", failure_reason=str(exc.detail), request_payload=body,
         )
         raise
@@ -1583,7 +1603,8 @@ async def _run_pre_flight(
         _log_blocked_request(
             db=db, request_id=request_id, org_id=org_id, project_id=project_id,
             key_id=key_id, source_ip=source_ip, user_agent=user_agent, trace_id=trace_id,
-            parent_request_id=parent_request_id,
+            parent_request_id=parent_request_id, user_id=user_id,
+            user_email=user_email, user_role=user_role,
             failure_code="pii_block",
             failure_reason=exc.detail.get("message") if isinstance(exc.detail, dict) else str(exc.detail),
             request_payload=body,
@@ -1629,6 +1650,9 @@ async def _run_pre_flight(
         trace_id=trace_id,
         parent_request_id=parent_request_id,
         has_tool_definitions=bool(forward_body.get("tools") or forward_body.get("functions")),
+        user_id=user_id,
+        user_email=user_email,
+        user_role=user_role,
     )
     db.commit()
 
@@ -1759,11 +1783,14 @@ async def proxy_chat(
     model: Optional[str] = Query(None, description="AI model name (overrides body 'model' field)"),
     x_governance_key: str = Header(..., alias="X-Governance-Key"),
     x_trace_id: Optional[str] = Header(None, alias="X-Trace-Id"),
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+    x_user_email: Optional[str] = Header(None, alias="X-User-Email"),
+    x_user_role: Optional[str] = Header(None, alias="X-User-Role"),
     db: Session = Depends(get_db),
 ) -> Any:
     ctx = await _run_pre_flight(
         request=request, x_governance_key=x_governance_key, model_override=model, db=db,
-        trace_id=x_trace_id,
+        trace_id=x_trace_id, user_id=x_user_id, user_email=x_user_email, user_role=x_user_role,
     )
     t_start = time.time()
 
@@ -1900,11 +1927,15 @@ async def proxy_chat_openai_compat(
     model: Optional[str] = Query(None, description="AI model name (overrides body 'model' field)"),
     x_governance_key: str = Header(..., alias="X-Governance-Key"),
     x_trace_id: Optional[str] = Header(None, alias="X-Trace-Id"),
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+    x_user_email: Optional[str] = Header(None, alias="X-User-Email"),
+    x_user_role: Optional[str] = Header(None, alias="X-User-Role"),
     db: Session = Depends(get_db),
 ) -> Any:
     return await proxy_chat(
         request=request, background_tasks=background_tasks, model=model,
-        x_governance_key=x_governance_key, x_trace_id=x_trace_id, db=db,
+        x_governance_key=x_governance_key, x_trace_id=x_trace_id, x_user_id=x_user_id,
+        x_user_email=x_user_email, x_user_role=x_user_role, db=db,
     )
 
 
@@ -1918,11 +1949,14 @@ async def proxy_chat_stream(
     model: Optional[str] = Query(None, description="AI model name (overrides body 'model' field)"),
     x_governance_key: str = Header(..., alias="X-Governance-Key"),
     x_trace_id: Optional[str] = Header(None, alias="X-Trace-Id"),
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+    x_user_email: Optional[str] = Header(None, alias="X-User-Email"),
+    x_user_role: Optional[str] = Header(None, alias="X-User-Role"),
     db: Session = Depends(get_db),
 ) -> Any:
     ctx = await _run_pre_flight(
         request=request, x_governance_key=x_governance_key, model_override=model, db=db,
-        stream=True, trace_id=x_trace_id,
+        stream=True, trace_id=x_trace_id, user_id=x_user_id, user_email=x_user_email, user_role=x_user_role,
     )
     t_start = time.time()
 
@@ -2373,6 +2407,7 @@ def list_proxy_requests(
     request_id: Optional[str] = None,
     org_id: Optional[str] = None,
     project_id: Optional[str] = None,
+    user_id: Optional[str] = None,
     request_type: Optional[str] = None,
     status: Optional[str] = None,
     pii_only: Optional[bool] = None,
@@ -2409,6 +2444,10 @@ def list_proxy_requests(
         filters.append("r.project_id = :project_id")
         count_filters.append("project_id = :project_id")
         params["project_id"] = project_id
+    if user_id:
+        filters.append("r.user_id = :user_id")
+        count_filters.append("user_id = :user_id")
+        params["user_id"] = user_id
     if request_type:
         filters.append("r.request_type = :request_type")
         count_filters.append("request_type = :request_type")
@@ -2489,6 +2528,7 @@ def list_proxy_requests(
                     f" r.pii_severity, r.pii_entities_detected, r.pii_entities_masked,"
                     f" r.failure_code, r.failure_reason, r.completed_at, r.request_payload,"
                     f" r.trace_id, gt.request_count,"
+                    f" r.user_id, r.user_email, r.user_role,"
                     f" COUNT(*) OVER() AS total_count"
                     f" FROM ai_requests r"
                     f" LEFT JOIN LATERAL ("
@@ -2532,6 +2572,7 @@ def list_proxy_requests(
                     f" r.pii_severity, r.pii_entities_detected, r.pii_entities_masked,"
                     f" r.failure_code, r.failure_reason, r.completed_at, r.request_payload,"
                     f" r.trace_id, NULL AS request_count, r.parent_request_id,"
+                    f" r.user_id, r.user_email, r.user_role,"
                     f" COUNT(*) OVER() AS total_count"
                     f" FROM ai_requests r"
                     f" LEFT JOIN token_usage tu ON tu.request_id = r.request_id"
@@ -2574,6 +2615,9 @@ def list_proxy_requests(
                 "received_at":      (r[13].isoformat() + "Z") if r[13] else ((r[7].isoformat() + "Z") if r[7] else None),
                 "provider":         r[14],
                 "source_system":    r[15],
+                "user_id":          r.user_id,
+                "user_email":       r.user_email,
+                "user_role":        r.user_role,
                 "total_tokens":     r[16],
                 "total_cost":       float(r[17]) if r[17] is not None else None,
                 "prompt_tokens":    r[18],
@@ -2590,7 +2634,7 @@ def list_proxy_requests(
                 "request_payload":       r[30],
                 "trace_id":              r[31],
                 "request_count":         r[32] or 1,
-                "parent_request_id":     (r[33] if len(r) > 33 else None),
+                "parent_request_id":     getattr(r, "parent_request_id", None),
             }
             for r in rows
         ],

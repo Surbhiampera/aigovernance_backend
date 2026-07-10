@@ -454,6 +454,31 @@ class MonthlyOrgSummary(Base):
     created_at = Column(DateTime, server_default=func.now())
 
 
+class DailyUserUsage(Base):
+    __tablename__ = "daily_user_usage"
+    __table_args__ = (
+        UniqueConstraint("org_id", "project_id", "user_id", "model_name", "date"),
+        {"extend_existing": True},
+    )
+
+    id = Column(BigInteger, primary_key=True)
+    org_id = Column(String(100), nullable=False)
+    project_id = Column(String(100), nullable=True)
+    user_id = Column(String(100), nullable=False)
+    user_email = Column(String(150), nullable=True)
+    user_role = Column(String(50), nullable=True)
+    model_name = Column(String(120), nullable=False)
+    date = Column(Date, nullable=False)
+    total_requests = Column(Integer, default=0)
+    input_tokens = Column(Integer, default=0)
+    output_tokens = Column(Integer, default=0)
+    total_tokens = Column(Integer, default=0)
+    input_cost = Column(Numeric(14, 6), default=0)
+    output_cost = Column(Numeric(14, 6), default=0)
+    total_cost = Column(Numeric(14, 6), default=0)
+    created_at = Column(DateTime, server_default=func.now())
+
+
 class DecoratorRegistration(Base):
     __tablename__ = "decorator_registrations"
     __table_args__ = {"extend_existing": True}
