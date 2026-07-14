@@ -23,38 +23,55 @@ pip install -r requirements.txt
 
 ## Architecture
 
-This is a **FastAPI governance proxy** for AI API traffic. All requests from external teams go through this server, which enforces policies before forwarding to the actual AI provider (Azure OpenAI). The server also provides admin APIs for dashboards.
+This is a **FastAPI governance proxy** for AI API traffic, multi-provider (Azure OpenAI, OpenAI, Anthropic, Google Gemini). All requests from external teams go through this server, which enforces policies before forwarding to the resolved provider deployment. The server also provides admin APIs for dashboards.
 
-### Request lifecycle (proxy.py → Azure OpenAI)
+> For the authoritative, code-verified walkthrough of every pre-flight stage, failure mode, and known gap, see [`GOVERNANCE_WORKFLOW.md`](GOVERNANCE_WORKFLOW.md). For the full external-facing API reference (all endpoints, request/response shapes), see [`How_to_use_proxyserver_REFERENCE.md`](How_to_use_proxyserver_REFERENCE.md). The summary below is a condensed pointer, not a replacement — when the two disagree, trust `GOVERNANCE_WORKFLOW.md` (or re-derive from the code).
+
+### Request lifecycle (`app/routers/proxy.py`, mounted at `/proxy`)
+
+Implemented in `_run_pre_flight()`, shared by `/proxy`, `/proxy/stream`, and the `/proxy/chat/completions` and `/proxy/v1/chat/completions` aliases. Root-level `/chat/completions` and `/v1/chat/completions` also exist in `app/main.py` as aliases for misconfigured SDK clients pointing `base_url` at the bare host.
 
 ```
-X-Governance-Key header
-  → governance_key_service: resolve org_id + project_id
-  → governance_rule_service: model allow/block lists, token limits
-  → budget_service: org & project monthly spend limits
-  → rate_limit_service: per-key & per-project rate limits
-  → pii_engine: mask or block sensitive data
-  → token_counter (tiktoken): estimate input tokens, store AiRequest row
-  → httpx: forward to Azure OpenAI using admin credentials from config.py
-  → cost_engine: calculate cost from token counts + pricing
-  → store AiResponse, TokenUsage, RequestCost, AuditLog
+X-Governance-Key header → verify_governance_key(): resolve org_id + project_id
+  → rate_limit_service: per-key/project/org check (runs BEFORE body parse — fails open)
+  → parse JSON body
+  → deployment_service: resolve candidate provider deployments for the requested model (404 if none)
+  → budget_service: org & project monthly spend limits (fails open)
+  → pii_engine (Presidio): mask/block/alert per entity-type policy (fails open)
+  → store AiRequest row (request_status="pending") — durable before hitting upstream
+  → forward to resolved provider (retry + failover across candidate deployments)
+  → background task (non-stream) / sync at generator end (stream): token_counter,
+    proxy.py's own _calculate_cost(), store AiResponse/TokenUsage/RequestCost/AuditLog/RouteExecution
 ```
 
-All enforcement decisions are logged to `audit_logs`. A 403 from governance rules, 429 from budget/rate limits.
+All enforcement decisions are logged to `audit_logs`. 403 = PII block, 429 = budget/rate-limit, 404 = unresolvable model/deployment, 502/503 = upstream unreachable / circuit breaker / concurrency limiter full.
+
+**Known gap:** `governance_rule_service.py` (model allow/block lists, token ceilings) is fully implemented and administered via its router, but is **not called anywhere in the live proxy path** — it currently has zero effect on traffic. See §6/§14 of `GOVERNANCE_WORKFLOW.md`.
+
+### Multi-provider deployments
+
+`app/services/deployment_service.py` resolves the Azure/OpenAI/Anthropic/Google deployment for a given org/project/model via the `ModelDeployment` table (`app/models.py`), ranked project-specific → org-wide, default → non-default, earliest-registered first. Falls back to synthetic deployments built from `.env` vars (`AZURE_OPENAI_*`, `OPENAI_*`, `AZURE_*`, `TTS_AZURE_OPENAI_*`) when no DB row matches, with a warning logged. Admins register deployments via `POST /deployments` (`app/routers/deployments.py`); `provision_standard_deployments()` seeds org-wide defaults for new orgs from `config.get_standard_model_deployments()`.
+
+### Per-user tracking
+
+Optional `X-User-Id` (plus `X-User-Email`/`X-User-Role`) proxy headers attribute requests to an individual user. Rolled up into `DailyUserUsage` alongside the existing `DailyOrgSummary`, and exposed via `GET /costs/by-user`. Requests without a user header are excluded from per-user tables but still counted org-wide.
 
 ### Key files
 
 | File | Role |
 |------|------|
-| `app/main.py` | App factory, router registration, startup/shutdown lifecycle |
-| `app/routers/proxy.py` | Main enforcement gateway (~35KB) |
-| `app/models.py` | All SQLAlchemy ORM models (~40KB) |
-| `app/services/governance_rule_service.py` | Model allow/block, token ceiling enforcement |
+| `app/main.py` | App factory, router registration, root-level SDK-compat aliases, startup/shutdown lifecycle (incl. daily-summary backfill on boot) |
+| `app/routers/proxy.py` | Main enforcement gateway, mounted at `/proxy` (~35KB) |
+| `app/routers/deployments.py` | CRUD for `ModelDeployment` rows (multi-provider deployment registry) |
+| `app/models.py` | All SQLAlchemy ORM models, incl. `ModelDeployment`, `DailyUserUsage`, `UsageAnomaly` (~40KB) |
+| `app/services/deployment_service.py` | Resolves provider deployment for org/project/model, builds provider-specific request URL/headers |
+| `app/services/governance_rule_service.py` | Model allow/block, token ceiling enforcement — **implemented but not wired into the proxy path** |
 | `app/services/budget_service.py` | Monthly spend limit checks, alert generation |
-| `app/services/rate_limit_service.py` | Per-key and per-project rate limiting |
-| `app/services/cost_engine.py` | Cost calculation from token counts + pricing catalog |
-| `app/services/pii_engine.py` | Regex-based PII detection and masking |
-| `app/scheduler.py` | APScheduler: hourly daily-agg, daily monthly-agg |
+| `app/services/rate_limit_service.py` | Per-key and per-project rate limiting (Redis-backed, Postgres fallback) |
+| `app/services/cost_engine.py` | Cost calc used only by the ingestion pipeline — the live proxy path uses its own `_calculate_cost()` in `proxy.py` instead; the two can drift |
+| `app/services/pii_engine.py` | Presidio-based PII detection and masking (Aadhaar/PAN custom recognizers) |
+| `app/workers/tasks.py` | Aggregation functions called by the scheduler: `_rebuild_daily_summary`, `_rebuild_daily_user_summary`, `_detect_daily_anomalies`, `_rebuild_monthly_summary` |
+| `app/scheduler.py` | APScheduler: hourly daily-agg (summary + user summary + anomaly detection), daily monthly-agg |
 | `app/config.py` | All environment variable accessors |
 
 ### Database
@@ -73,17 +90,23 @@ All data is scoped by `org_id` and `project_id`. API keys (`api_keys` table, has
 
 ### Background jobs
 
-APScheduler runs in-process (not Celery). Two jobs:
-- Every **1 hour**: roll up `AiRequest + RequestCost` → `DailyOrgSummary`
-- Every **24 hours**: roll up `DailyOrgSummary` → `MonthlyOrgSummary`
+APScheduler runs in-process (not Celery), `coalesce=True, max_instances=1`. Two scheduled jobs:
+- Every **1 hour** (`daily_agg`): `_rebuild_daily_summary` (`AiRequest + RequestCost` → `DailyOrgSummary`) → `_rebuild_daily_user_summary` (→ `DailyUserUsage`) → `_detect_daily_anomalies` (compares today vs an N-day baseline → `UsageAnomaly` rows, backfills `DailyOrgSummary.anomaly_count`)
+- Every **24 hours** (`monthly_agg`): roll up `DailyOrgSummary` → `MonthlyOrgSummary`
+
+Both are idempotent (delete-then-reinsert for the current period). Manual re-trigger/backfill: `POST /summary/admin/rebuild-daily?days_back=N`. On app startup, `app/main.py`'s lifespan handler backfills any missing `DailyOrgSummary`/`DailyUserUsage` days for dates that already have `AiRequest` rows.
 
 ### Environment variables
 
 Key variables expected in `.env`:
 - `DATABASE_URL` — PostgreSQL connection string
-- `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_DEPLOYMENT_NAME`, `OPENAI_API_VERSION` — Admin-only credentials used for all proxied calls; never exposed to tenants
+- `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_DEPLOYMENT_NAME`, `OPENAI_API_VERSION` — Admin-only credentials, used as the env-fallback deployment when no `ModelDeployment` DB row matches; never exposed to tenants
+- `OPENAI_API_KEY`, `OPENAI_ENDPOINT`, `OPENAI_DEPLOYMENT_NAME`, `OPENAI_API_VERSION` — env-fallback deployment for a second OpenAI-routed model
+- `AZURE_API_KEY`, `AZURE_ENDPOINT`, `AZURE_DEPLOYMENT`, `AZURE_API_VERSION` — env-fallback deployment (e.g. gpt-4o)
+- `TTS_AZURE_OPENAI_API_KEY`, `TTS_AZURE_OPENAI_ENDPOINT`, `TTS_AZURE_OPENAI_DEPLOYMENT`, `TTS_AZURE_OPENAI_API_VERSION` — env-fallback deployment registered for resolution only; no `/audio/speech` route exists yet
+- `REDIS_URL` — backs `rate_limit_service`; falls back to Postgres counts if unset/unreachable
 - `CORS_ORIGINS` — Comma-separated allowed origins
 - `SCHEDULER_MAX_WORKERS` — APScheduler thread count (default 2)
-- Threshold variables: `ALERT_BUDGET_DEFAULT_THRESHOLD_PCT`, `ANOMALY_SPIKE_RATIO`, etc. (see `app/config.py` for full list)
+- Threshold variables: `ALERT_BUDGET_DEFAULT_THRESHOLD_PCT`, `ANOMALY_SPIKE_RATIO`, `ANOMALY_HIGH_SEVERITY_RATIO`, `ANOMALY_BASELINE_DAYS`, etc. (see `app/config.py` for full list)
 
 `.env` is gitignored. Never commit it. The `.claude/settings.json` explicitly blocks reading `.env` files.
