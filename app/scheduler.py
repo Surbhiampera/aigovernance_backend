@@ -1,10 +1,13 @@
 """APScheduler — runs periodic background jobs inside the FastAPI process.
 
-Two jobs:
-  daily_agg   — every hour: aggregate AiRequest + RequestCost → DailyOrgSummary
-  monthly_agg — every 24 hours: roll up DailyOrgSummary → MonthlyOrgSummary
+Jobs:
+  daily_agg        — every hour: aggregate AiRequest + RequestCost → DailyOrgSummary
+  monthly_agg      — every 24 hours: roll up DailyOrgSummary → MonthlyOrgSummary
+  startup_backfill — once, 5s after boot: fill gaps in the daily rollups
 """
 from __future__ import annotations
+
+import datetime
 
 from apscheduler.executors.pool import ThreadPoolExecutor
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -15,9 +18,10 @@ _scheduler: BackgroundScheduler | None = None
 
 # Last successful run per job, for health-check staleness alerts — a hung
 # scheduler thread fails silently otherwise (no exception, just stops ticking).
-_last_success: dict[str, "datetime.datetime | None"] = {
+_last_success: dict[str, datetime.datetime | None] = {
     "daily_agg": None,
     "monthly_agg": None,
+    "startup_backfill": None,
 }
 
 
@@ -59,6 +63,65 @@ def _job_daily_aggregation() -> None:
         db.close()
 
 
+def _job_startup_backfill() -> None:
+    """One-shot: fill in DailyOrgSummary/DailyUserUsage for past days that have
+    AiRequest rows but no summary.
+
+    Runs on a scheduler thread rather than inline in the FastAPI lifespan — with
+    up to 90 days to rebuild this can take minutes, and Uvicorn does not bind the
+    port until lifespan startup returns.
+    """
+    import datetime
+    import logging
+
+    from sqlalchemy import func
+
+    from app.database import SessionLocal
+    from app.models import AiRequest, DailyOrgSummary, DailyUserUsage
+    from app.workers.tasks import (
+        _detect_daily_anomalies,
+        _rebuild_daily_summary,
+        _rebuild_daily_user_summary,
+    )
+
+    _log = logging.getLogger(__name__)
+    db = SessionLocal()
+    try:
+        dates_with_requests = (
+            db.query(func.date(AiRequest.created_at).label("d"))
+            .filter(AiRequest.created_at >= datetime.datetime.utcnow() - datetime.timedelta(days=90))
+            .distinct()
+            .all()
+        )
+        dates_already_summarised = {r[0] for r in db.query(DailyOrgSummary.date).distinct().all()}
+        dates_already_user_summarised = {r[0] for r in db.query(DailyUserUsage.date).distinct().all()}
+
+        for (d,) in dates_with_requests:
+            if d not in dates_already_summarised:
+                try:
+                    _rebuild_daily_summary(db=db, summary_date=d)
+                    _detect_daily_anomalies(db=db, summary_date=d)
+                    db.commit()
+                    _log.info("Backfilled DailyOrgSummary for %s", d)
+                except Exception:
+                    db.rollback()
+                    _log.exception("Backfill failed for %s", d)
+            if d not in dates_already_user_summarised:
+                try:
+                    _rebuild_daily_user_summary(db=db, summary_date=d)
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    _log.exception("DailyUserUsage backfill failed for %s", d)
+
+        _last_success["startup_backfill"] = datetime.datetime.utcnow()
+    except Exception:
+        db.rollback()
+        _log.exception("Startup backfill failed")
+    finally:
+        db.close()
+
+
 def _job_monthly_aggregation() -> None:
     import datetime
 
@@ -93,6 +156,12 @@ def start_scheduler() -> BackgroundScheduler:
     _scheduler.add_job(
         _job_monthly_aggregation, "interval", hours=24,
         id="monthly_agg", replace_existing=True,
+    )
+    # One-shot backfill, a few seconds after boot so it never delays the port opening.
+    _scheduler.add_job(
+        _job_startup_backfill, "date",
+        run_date=datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=5),
+        id="startup_backfill", replace_existing=True,
     )
     _scheduler.start()
     return _scheduler

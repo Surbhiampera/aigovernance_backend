@@ -669,7 +669,7 @@ class AiRequest(Base):
     pii_entities_masked = Column(Integer, default=0)
     pii_detail = Column(JSON, nullable=True)
     content_policy_flags = Column(JSON, nullable=True)
-    # Proxy-layer provenance columns (added via _SAFE_ALTERS)
+    # Proxy-layer provenance columns (see schema_clean.sql)
     deployment_name = Column(String(255), nullable=True)
     governance_key_id = Column(String(120), nullable=True)
     source_ip = Column(String(60), nullable=True)

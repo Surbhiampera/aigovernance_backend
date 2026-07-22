@@ -1,3 +1,4 @@
+import logging
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -30,106 +31,31 @@ from app.routers.deployments import router as deployments_router
 from app.routers.proxy import router as proxy_router
 from app.routers.proxy import proxy_chat_openai_compat
 
-# Safe schema additions — all use IF NOT EXISTS, safe to re-run on every startup.
-_SAFE_ALTERS = [
-    # Governance keys on api_keys table
-    "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS hashed_key VARCHAR(64)",
-    "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS raw_key_hint VARCHAR(30)",
-    "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS is_proxy_key BOOLEAN DEFAULT FALSE",
-    "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE",
-    "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP",
-    "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMP",
-    "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS role VARCHAR(50)",
-    # Proxy request tables
-    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS governance_key_id VARCHAR(120)",
-    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS source_ip VARCHAR(60)",
-    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS user_agent VARCHAR(500)",
-    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP",
-    # Correlation id so multiple LLM calls from one user turn (e.g. a
-    # classify -> tool-select -> response-generation chatbot pipeline) can
-    # be grouped together via GET /proxy/v1/requests?group_by=trace_id
-    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS trace_id VARCHAR(120)",
-    "CREATE INDEX IF NOT EXISTS ix_ai_requests_trace_id ON ai_requests (trace_id)",
-    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS parent_request_id VARCHAR(120)",
-    "CREATE INDEX IF NOT EXISTS ix_ai_requests_parent_request_id ON ai_requests (parent_request_id)",
-    # Audit log
-    "ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS request_id VARCHAR(120)",
-    "ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS trace_id VARCHAR(120)",
-    "ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS old_value JSONB",
-    "ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS new_value JSONB",
-    "ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS audit_metadata JSONB",
-    # Token usage provenance
-    "ALTER TABLE token_usage ADD COLUMN IF NOT EXISTS input_token_source VARCHAR(30)",
-    "ALTER TABLE token_usage ADD COLUMN IF NOT EXISTS output_token_source VARCHAR(30)",
-    "ALTER TABLE token_usage ADD COLUMN IF NOT EXISTS is_estimated BOOLEAN DEFAULT FALSE",
-    # Rate limit — per-key and per-project granularity
-    "ALTER TABLE rate_limits ADD COLUMN IF NOT EXISTS project_id VARCHAR(100)",
-    "ALTER TABLE rate_limits ADD COLUMN IF NOT EXISTS key_id VARCHAR(120)",
-    # Provenance: deployment tracked per request
-    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS source_system VARCHAR(255)",
-    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS deployment_name VARCHAR(255)",
-    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP",
-    # Provenance: token counts co-located with cost for single-table reporting
-    "ALTER TABLE request_cost ADD COLUMN IF NOT EXISTS input_tokens INTEGER DEFAULT 0",
-    "ALTER TABLE request_cost ADD COLUMN IF NOT EXISTS output_tokens INTEGER DEFAULT 0",
-    "ALTER TABLE request_cost ADD COLUMN IF NOT EXISTS total_tokens INTEGER DEFAULT 0",
-    "ALTER TABLE request_cost ADD COLUMN IF NOT EXISTS cost_model_type VARCHAR(50)",
-    "ALTER TABLE request_cost ADD COLUMN IF NOT EXISTS pricing_snapshot JSONB",
-    "ALTER TABLE request_cost ADD COLUMN IF NOT EXISTS pricing_version VARCHAR(50)",
-    # DB-generated IDs so proxy omitting them never causes NOT NULL violations
-    "ALTER TABLE token_usage ALTER COLUMN token_usage_id SET DEFAULT concat('tu-', replace(gen_random_uuid()::text, '-', ''))",
-    "ALTER TABLE request_cost ALTER COLUMN cost_id SET DEFAULT concat('cu-', replace(gen_random_uuid()::text, '-', ''))",
-    # Audit index for policy-violation dashboard queries
-    (
-        "CREATE INDEX IF NOT EXISTS ix_audit_logs_policy "
-        "ON audit_logs (org_id, audit_action, occurred_at) "
-        "WHERE policy_triggered = TRUE"
-    ),
-    # Multi-deployment routing columns (added to existing model_deployments table)
-    "ALTER TABLE model_deployments ADD COLUMN IF NOT EXISTS api_key TEXT",
-    "ALTER TABLE model_deployments ADD COLUMN IF NOT EXISTS api_version VARCHAR(50)",
-    "ALTER TABLE model_deployments ADD COLUMN IF NOT EXISTS is_default BOOLEAN DEFAULT FALSE",
-    # PII-masked version of the prompt stored alongside the original
-    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS sanitized_prompt_text TEXT",
-    # Structured failure logging — every blocked/errored request gets a code + reason
-    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS failure_code VARCHAR(50)",
-    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS failure_reason TEXT",
-    # PII detection outcome columns
-    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS pii_action_taken VARCHAR(20)",
-    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS pii_types JSONB",
-    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS content_policy_flags JSONB",
-    # Request lifecycle timestamp
-    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS processing_started_at TIMESTAMP",
-    # Request Cost Log query columns (added after initial schema)
-    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS client_ip VARCHAR(50)",
-    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS provider VARCHAR(100)",
-    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS received_at TIMESTAMP DEFAULT NOW()",
-    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS entry_point VARCHAR(100)",
-    # PII detection flags (may be missing on DBs created before presidio integration)
-    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS pii_detected BOOLEAN DEFAULT FALSE",
-    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS pii_masked BOOLEAN DEFAULT FALSE",
-    # PII severity and entity counts for per-request detail view
-    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS pii_severity VARCHAR(10)",
-    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS pii_entities_detected INTEGER DEFAULT 0",
-    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS pii_entities_masked INTEGER DEFAULT 0",
-    "ALTER TABLE ai_requests ADD COLUMN IF NOT EXISTS pii_detail JSONB",
-    # Backfill severity + entity count for existing rows using stored pii_types JSONB.
-    # WHERE pii_severity IS NULL ensures this is a no-op on every subsequent startup.
-    (
-        "UPDATE ai_requests SET"
-        "  pii_entities_detected = COALESCE(jsonb_array_length(pii_types::jsonb), 0),"
-        "  pii_severity = CASE"
-        "    WHEN pii_types::jsonb ?| ARRAY['aadhar','credit_card','passport','ssn','bank_account','national_id'] THEN 'high'"
-        "    WHEN jsonb_array_length(pii_types::jsonb) >= 5 THEN 'high'"
-        "    WHEN jsonb_array_length(pii_types::jsonb) >= 3 THEN 'medium'"
-        "    WHEN jsonb_array_length(pii_types::jsonb) >= 1 THEN 'low'"
-        "    ELSE NULL"
-        "  END"
-        " WHERE pii_detected = TRUE"
-        "   AND pii_severity IS NULL"
-        "   AND pii_types IS NOT NULL"
-    ),
-]
+_log = logging.getLogger(__name__)
+
+# Tables declared in app/models.py that no live code path reads or writes, and
+# that schema_clean.sql therefore does not create. Excluded from the startup
+# schema check so their absence is not treated as an incomplete migration.
+# Keep in sync with the "INTENTIONALLY OMITTED TABLES" footer in schema_clean.sql.
+_UNUSED_TABLES = frozenset({
+    "model_registry",
+    "tool_registry",
+    "tool_connectors",
+    "connector_sync_logs",
+    "providers",
+    "model_versions",
+    "ai_routes",
+    "project_model_usage",
+    "provider_configs",
+    "decorator_registrations",
+    "tool_api_inventory",
+    "telemetry_events",
+    "cost_breakdown",
+    "execution_pipeline",
+    "trace_model_usage",
+    "trace_tool_usage",
+    "request_response_logs",
+})
 
 _ALL_ROUTERS = [
     auth.router,
@@ -151,74 +77,79 @@ _ALL_ROUTERS = [
 ]
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+class SchemaOutOfDateError(RuntimeError):
+    """Raised at startup when the database is missing required tables/columns."""
+
+
+def _verify_schema() -> None:
+    """Read-only check that the database matches app/models.py.
+
+    The application performs no DDL — schema_clean.sql must be applied before the
+    backend starts. This is a single pair of catalogue queries, deliberately
+    read-only: it takes no locks and holds no transaction open, so it can never
+    block on a concurrent ALTER the way the old startup DDL pass did.
+    """
     from sqlalchemy import text
     from app.database import Base, engine
+
+    expected = {
+        t.name: {c.name.lower() for c in t.columns}
+        for t in Base.metadata.sorted_tables
+        if t.name not in _UNUSED_TABLES
+    }
+
+    with engine.connect() as conn:
+        # Belt and braces: if anything unexpected does hold a lock, fail fast
+        # instead of hanging the whole startup indefinitely.
+        conn.execute(text("SET lock_timeout = '5s'"))
+        conn.execute(text("SET statement_timeout = '15s'"))
+        rows = conn.execute(text(
+            "SELECT table_name, column_name FROM information_schema.columns "
+            "WHERE table_schema = current_schema()"
+        )).all()
+
+    actual: dict[str, set[str]] = {}
+    for table_name, column_name in rows:
+        actual.setdefault(table_name, set()).add(column_name.lower())
+
+    missing_tables = sorted(t for t in expected if t not in actual)
+    missing_columns = {
+        t: sorted(cols - actual[t])
+        for t, cols in expected.items()
+        if t in actual and (cols - actual[t])
+    }
+
+    if not missing_tables and not missing_columns:
+        _log.info("Schema check passed (%d tables verified)", len(expected))
+        return
+
+    problems = []
+    if missing_tables:
+        problems.append(f"missing tables: {', '.join(missing_tables)}")
+    for t, cols in sorted(missing_columns.items()):
+        problems.append(f"{t} is missing columns: {', '.join(cols)}")
+
+    detail = "\n  - ".join(problems)
+    raise SchemaOutOfDateError(
+        f"Database schema is incomplete:\n  - {detail}\n\n"
+        f"The application does not create or alter tables. Apply the schema first:\n"
+        f"    psql \"$DATABASE_URL\" -v ON_ERROR_STOP=1 -f schema_clean.sql"
+    )
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    from app.database import engine
     from app.scheduler import start_scheduler, stop_scheduler
 
-    try:
-        Base.metadata.create_all(bind=engine)
-        with engine.connect() as conn:
-            for stmt in _SAFE_ALTERS:
-                try:
-                    conn.execute(text(stmt))
-                except Exception:
-                    pass
-            conn.commit()
-    except Exception:
-        pass
+    # Refuse to serve traffic against a half-migrated database. Raising here
+    # aborts startup, so the port is never opened.
+    _verify_schema()
 
+    # Starts the hourly/daily aggregation jobs plus a one-shot summary backfill.
+    # The backfill runs on a scheduler thread rather than inline, so startup does
+    # not block on up to 90 days of aggregation before binding the port.
     start_scheduler()
-
-    # Backfill DailyOrgSummary for any past days that have AiRequest data but no summary.
-    import datetime as _dt
-    import logging as _logging
-    _bflog = _logging.getLogger(__name__)
-    try:
-        from app.database import SessionLocal
-        from app.workers.tasks import (
-            _detect_daily_anomalies,
-            _rebuild_daily_summary,
-            _rebuild_daily_user_summary,
-        )
-        from app.models import AiRequest as _AiReq, DailyOrgSummary as _Daily, DailyUserUsage as _DailyUser
-        from sqlalchemy import func as _func
-        db = SessionLocal()
-        try:
-            dates_with_requests = (
-                db.query(_func.date(_AiReq.created_at).label("d"))
-                .filter(_AiReq.created_at >= _dt.datetime.utcnow() - _dt.timedelta(days=90))
-                .distinct()
-                .all()
-            )
-            dates_already_summarised = {
-                r[0] for r in db.query(_Daily.date).distinct().all()
-            }
-            dates_already_user_summarised = {
-                r[0] for r in db.query(_DailyUser.date).distinct().all()
-            }
-            for (d,) in dates_with_requests:
-                if d not in dates_already_summarised:
-                    try:
-                        _rebuild_daily_summary(db=db, summary_date=d)
-                        _detect_daily_anomalies(db=db, summary_date=d)
-                        db.commit()
-                        _bflog.info("Backfilled DailyOrgSummary for %s", d)
-                    except Exception:
-                        db.rollback()
-                        _bflog.exception("Backfill failed for %s", d)
-                if d not in dates_already_user_summarised:
-                    try:
-                        _rebuild_daily_user_summary(db=db, summary_date=d)
-                        db.commit()
-                    except Exception:
-                        db.rollback()
-                        _bflog.exception("DailyUserUsage backfill failed for %s", d)
-        finally:
-            db.close()
-    except Exception:
-        _bflog.exception("Startup backfill failed")
 
     try:
         yield

@@ -113,7 +113,7 @@ def get_azure_circuit_reset_seconds() -> float:
 def get_db_pool_size() -> int:
     """Maximum persistent DB connections per API process.
 
-    Default sized for 2 Uvicorn workers against a 50-connection Aiven Postgres
+    Default sized for 2 Uvicorn workers against a 50-connection managed Postgres
     plan: 2 workers * (14 pool + 6 overflow) = 40, leaving headroom for the
     scheduler and external clients. Re-tune if worker count or plan changes.
     """

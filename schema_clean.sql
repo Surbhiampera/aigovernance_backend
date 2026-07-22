@@ -8,9 +8,19 @@
 --   Name : ai_goverance
 --   User : Postgres
 --
--- Run once on a fresh database.
--- All columns that were previously added via runtime _SAFE_ALTERS are already
--- included here; this file is the single source of truth.
+-- THIS FILE IS THE SINGLE SOURCE OF TRUTH FOR THE DATABASE SCHEMA.
+--
+-- The application performs NO DDL at runtime — there is no create_all and no
+-- startup ALTER TABLE pass. This schema must be applied to the database BEFORE
+-- the backend is started:
+--
+--     psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f schema_clean.sql
+--
+-- Every statement is IF NOT EXISTS / idempotent, so it is safe to re-run.
+-- On boot, app/main.py verifies (read-only) that every required table and
+-- column exists and refuses to start if anything is missing.
+--
+-- When you add a column to app/models.py, add it here in the same commit.
 -- =============================================================================
 
 
@@ -232,7 +242,18 @@ CREATE TABLE IF NOT EXISTS ai_requests (
     pii_types               JSONB,
     pii_masked              BOOLEAN DEFAULT FALSE,
     pii_action_taken        VARCHAR(20),
+    pii_severity            VARCHAR(10),
+    pii_entities_detected   INTEGER DEFAULT 0,
+    pii_entities_masked     INTEGER DEFAULT 0,
+    pii_detail              JSONB,
     content_policy_flags    JSONB,
+    -- Structured failure logging — every blocked/errored request gets a code + reason
+    failure_code            VARCHAR(50),
+    failure_reason          TEXT,
+    -- Which route the request arrived on (/proxy, /v1/chat/completions alias, …)
+    entry_point             VARCHAR(100),
+    -- Groups multiple LLM calls from one user turn; plain string, no FK
+    parent_request_id       VARCHAR(120),
     received_at             TIMESTAMP DEFAULT NOW(),
     processing_started_at   TIMESTAMP,
     completed_at            TIMESTAMP,
@@ -443,6 +464,111 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 );
 
 -- ---------------------------------------------------------------------------
+-- Per-user rollup (populated by _rebuild_daily_user_summary; read by GET /costs/by-user)
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS daily_user_usage (
+    id              BIGSERIAL PRIMARY KEY,
+    org_id          VARCHAR(100) NOT NULL,
+    project_id      VARCHAR(100),
+    user_id         VARCHAR(100) NOT NULL,
+    user_email      VARCHAR(150),
+    user_role       VARCHAR(50),
+    model_name      VARCHAR(120) NOT NULL,
+    date            DATE NOT NULL,
+    total_requests  INTEGER DEFAULT 0,
+    input_tokens    INTEGER DEFAULT 0,
+    output_tokens   INTEGER DEFAULT 0,
+    total_tokens    INTEGER DEFAULT 0,
+    input_cost      NUMERIC(14, 6) DEFAULT 0,
+    output_cost     NUMERIC(14, 6) DEFAULT 0,
+    total_cost      NUMERIC(14, 6) DEFAULT 0,
+    created_at      TIMESTAMP DEFAULT NOW(),
+    UNIQUE (org_id, project_id, user_id, model_name, date)
+);
+
+-- ---------------------------------------------------------------------------
+-- Route executions (written per request by proxy.py's _log_route_execution)
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS route_executions (
+    id                      BIGSERIAL PRIMARY KEY,
+    execution_id            VARCHAR(120) UNIQUE NOT NULL,
+    request_id              VARCHAR(120) NOT NULL REFERENCES ai_requests(request_id) ON DELETE CASCADE,
+    -- route_id stored as plain string; ai_routes table removed
+    route_id                VARCHAR(120),
+    org_id                  VARCHAR(100) NOT NULL,
+    project_id              VARCHAR(100),
+    project_ref_id          VARCHAR(100),
+    execution_status        VARCHAR(30),
+    routing_strategy        VARCHAR(50),
+    routing_reason          TEXT,
+    original_model          VARCHAR(120),
+    selected_model          VARCHAR(120),
+    selected_provider       VARCHAR(100),
+    proxy_type              VARCHAR(50),
+    upstream_url            VARCHAR(500),
+    upstream_request_id     VARCHAR(255),
+    pipeline_stages         JSONB,
+    attempt_number          INTEGER,
+    retry_count             INTEGER,
+    retry_reasons           JSONB,
+    last_failure_reason     TEXT,
+    total_latency_ms        INTEGER,
+    routing_latency_ms      INTEGER,
+    proxy_latency_ms        INTEGER,
+    upstream_latency_ms     INTEGER,
+    governance_check_ms     INTEGER,
+    quota_checked           BOOLEAN,
+    quota_remaining         INTEGER,
+    policy_applied          JSONB,
+    blocked_by_policy       BOOLEAN,
+    block_reason            TEXT,
+    started_at              TIMESTAMP,
+    completed_at            TIMESTAMP,
+    created_at              TIMESTAMP DEFAULT NOW()
+);
+
+-- ---------------------------------------------------------------------------
+-- Security / anomaly surfaces (read by the alerts_security router)
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS data_security_logs (
+    id                      BIGSERIAL PRIMARY KEY,
+    -- event_id stored as plain string; telemetry_events table removed
+    event_id                VARCHAR(120) NOT NULL,
+    org_id                  VARCHAR(100),
+    project_id              VARCHAR(100),
+    pii_detected            BOOLEAN DEFAULT FALSE,
+    pii_type                VARCHAR(100),
+    data_out_violation      BOOLEAN DEFAULT FALSE,
+    misuse_pattern_detected BOOLEAN DEFAULT FALSE,
+    abnormal_usage_spike    BOOLEAN DEFAULT FALSE,
+    masking_applied         BOOLEAN DEFAULT FALSE,
+    risk_score              NUMERIC(8, 2),
+    data_in_mb              NUMERIC(12, 4),
+    data_out_mb             NUMERIC(12, 4),
+    created_at              TIMESTAMP DEFAULT NOW()
+);
+
+-- Written hourly by _detect_daily_anomalies; read by the alerts_security router
+CREATE TABLE IF NOT EXISTS usage_anomalies (
+    id              BIGSERIAL PRIMARY KEY,
+    org_id          VARCHAR(100) NOT NULL,
+    project_id      VARCHAR(100),
+    tool_name       VARCHAR(150) NOT NULL,
+    event_id        VARCHAR(120),
+    anomaly_type    VARCHAR(60) NOT NULL,
+    severity        VARCHAR(20) NOT NULL,
+    anomaly_score   NUMERIC(8, 2),
+    baseline_value  NUMERIC(14, 6),
+    observed_value  NUMERIC(14, 6),
+    message         TEXT,
+    status          VARCHAR(20) NOT NULL,
+    created_at      TIMESTAMP DEFAULT NOW()
+);
+
+-- ---------------------------------------------------------------------------
 -- Indexes
 -- ---------------------------------------------------------------------------
 
@@ -463,6 +589,13 @@ CREATE INDEX IF NOT EXISTS ix_ai_requests_governance_key
 
 CREATE INDEX IF NOT EXISTS ix_ai_requests_model
     ON ai_requests (model_name, created_at DESC);
+
+-- Correlation lookups: GET /proxy/v1/requests?group_by=trace_id
+CREATE INDEX IF NOT EXISTS ix_ai_requests_trace_id
+    ON ai_requests (trace_id);
+
+CREATE INDEX IF NOT EXISTS ix_ai_requests_parent_request_id
+    ON ai_requests (parent_request_id);
 
 CREATE INDEX IF NOT EXISTS ix_ai_responses_request
     ON ai_responses (request_id);
@@ -501,27 +634,49 @@ CREATE INDEX IF NOT EXISTS ix_alerts_org_project
 CREATE INDEX IF NOT EXISTS ix_model_pricing_lookup
     ON model_pricing (provider, model_name);
 
+-- Security surfaces
+CREATE INDEX IF NOT EXISTS ix_usage_anomalies_org_created
+    ON usage_anomalies (org_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS ix_data_security_logs_org_created
+    ON data_security_logs (org_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS ix_route_executions_request
+    ON route_executions (request_id);
+
+-- Per-user rollup
+CREATE INDEX IF NOT EXISTS ix_daily_user_usage_org_date
+    ON daily_user_usage (org_id, date DESC);
+
 -- =============================================================================
--- REMOVED TABLES (vs original schema.sql)
+-- INTENTIONALLY OMITTED TABLES
 -- ---------------------------------------------------------------------------
--- model_registry      — only used by /models admin endpoint; not core to proxy
--- tool_registry       — only used by cost_engine tool base-cost lookup; not critical
--- tool_connectors     — ingestion pipeline not active; user confirmed removal
--- connector_sync_logs — FK dependency on tool_connectors; removed with it
--- providers           — zero application references
--- model_versions      — zero application references
--- ai_routes           — zero application references
--- route_executions    — zero application references
--- project_model_usage — zero application references
--- provider_configs    — zero application references
--- usage_anomalies     — zero application references
+-- These are still declared in app/models.py but no live code path reads or
+-- writes them, so they are deliberately absent from this schema. The startup
+-- schema guard in app/main.py excludes them by name via _UNUSED_TABLES — if you
+-- start using one of these models, add its DDL here and drop it from that set.
+--
+-- model_registry          — only used by the /models admin endpoint; not core to proxy
+-- tool_registry           — only used by cost_engine tool base-cost lookup
+-- tool_connectors         — ingestion pipeline has no registered router
+-- connector_sync_logs     — FK dependency on tool_connectors
+-- providers               — zero application references
+-- model_versions          — zero application references
+-- ai_routes               — zero application references
+-- project_model_usage     — zero application references
+-- provider_configs        — zero application references
 -- decorator_registrations — zero application references
--- tool_api_inventory  — zero application references
--- telemetry_events    — no active ingest router
--- cost_breakdown      — child of telemetry_events
--- execution_pipeline  — child of telemetry_events
--- trace_model_usage   — child of telemetry_events
--- trace_tool_usage    — child of telemetry_events
--- data_security_logs  — child of telemetry_events
--- request_response_logs — child of telemetry_events
+-- tool_api_inventory      — zero application references
+-- telemetry_events        — no active ingest router
+-- cost_breakdown          — child of telemetry_events
+-- execution_pipeline      — child of telemetry_events
+-- trace_model_usage       — child of telemetry_events
+-- trace_tool_usage        — child of telemetry_events
+-- request_response_logs   — child of telemetry_events
+--
+-- NOTE: route_executions, data_security_logs and usage_anomalies were previously
+-- listed here as unused. That was wrong — proxy.py writes route_executions on
+-- every request, workers/tasks.py writes usage_anomalies hourly, and the
+-- registered alerts_security router reads both plus data_security_logs. They are
+-- defined above.
 -- =============================================================================

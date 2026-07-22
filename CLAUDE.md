@@ -76,9 +76,21 @@ Optional `X-User-Id` (plus `X-User-Email`/`X-User-Role`) proxy headers attribute
 
 ### Database
 
-PostgreSQL (Aiven cloud). The app runs safe `ALTER TABLE` statements at startup to add missing columns — no separate migration tool. Tests use an in-memory SQLite DB (see `tests/conftest.py`).
+PostgreSQL (Azure Database for PostgreSQL).
 
-Connection pool: conservative defaults (`pool_size=3`, `max_overflow=0`, `pool_recycle=1800`) to handle Aiven's idle connection timeout.
+**The application performs no DDL.** There is no `create_all` and no startup `ALTER TABLE` pass. [`schema_clean.sql`](schema_clean.sql) is the single source of truth and must be applied **before** the backend starts:
+
+```bash
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f schema_clean.sql   # idempotent, safe to re-run
+```
+
+On boot, `_verify_schema()` in `app/main.py` does a read-only `information_schema` check against `Base.metadata` and **refuses to start** if any required table or column is missing, naming exactly what's absent. When you add a column to `app/models.py`, add it to `schema_clean.sql` in the same commit or the next boot will fail.
+
+`app/models.py` still declares 17 tables that no live code path touches (ingestion pipeline, telemetry). These are deliberately absent from the schema and are listed in `_UNUSED_TABLES` in `app/main.py`; the two lists must stay in sync.
+
+Tests run against the real `DATABASE_URL`, each inside a transaction that is rolled back on teardown — no tables are created or dropped (see `tests/conftest.py`).
+
+Connection pool: conservative defaults (`pool_size=3`, `max_overflow=0`, `pool_recycle=1800`) to survive the managed server's idle connection timeout.
 
 ### Multi-tenancy
 

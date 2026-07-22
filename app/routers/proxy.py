@@ -2425,7 +2425,7 @@ def list_proxy_requests(
 ) -> dict:
     # Raw SQL avoids ORM column-mapping failures when proxy-layer columns
     # (governance_key_id, source_ip, deployment_name, completed_at) have not
-    # yet been applied to the deployed DB via _SAFE_ALTERS.
+    # yet been applied to the deployed DB from schema_clean.sql.
     from sqlalchemy import text as _text
 
     filters: list[str] = []
@@ -2512,7 +2512,7 @@ def list_proxy_requests(
             # group — never scanning/aggregating the whole table — all in a
             # single round trip to the DB (cuts a network round trip vs. a
             # separate totals query, which matters most on high-latency
-            # connections like Aiven's managed Postgres).
+            # connections to a managed Postgres instance).
             rows = db.execute(
                 _text(
                     f"SELECT r.request_id, r.org_id, r.project_id, r.request_type, r.model_name,"
