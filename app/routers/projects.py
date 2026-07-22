@@ -15,7 +15,7 @@ from app.schemas import ProjectCreate, ProjectResponse
 router = APIRouter(prefix="/projects", tags=["projects"])
 
 
-@router.get("/", response_model=list[ProjectResponse])
+@router.get("", response_model=list[ProjectResponse])
 def list_projects(*, org_id: Optional[str] = Query(None), db: Session = Depends(get_db)):
     q = db.query(Project)
     if org_id:
