@@ -1,10 +1,11 @@
 """Scheduled task functions called by APScheduler.
 
 All DB sessions are managed by the caller (scheduler.py).
-Three jobs:
-  _rebuild_daily_summary   — aggregates AiRequest + RequestCost → DailyOrgSummary
-  _detect_daily_anomalies  — compares today vs N-day baseline → UsageAnomaly rows
-  _rebuild_monthly_summary — rolls up DailyOrgSummary → MonthlyOrgSummary
+Four jobs:
+  _rebuild_daily_summary      — aggregates AiRequest + RequestCost → DailyOrgSummary
+  _detect_daily_anomalies     — compares today vs N-day baseline → UsageAnomaly rows
+  _rebuild_monthly_summary    — rolls up DailyOrgSummary → MonthlyOrgSummary
+  _generate_optimization_tips — evaluates optimization/rules/* → OptimizationTip rows
 """
 from __future__ import annotations
 
@@ -21,6 +22,7 @@ from app.models import (
     DailyOrgSummary,
     DailyUserUsage,
     MonthlyOrgSummary,
+    OptimizationTip,
     Organization,
     RequestCost,
     UsageAnomaly,
@@ -426,6 +428,86 @@ def _rebuild_monthly_summary(*, db: Session) -> int:
             misuse_count=0,
         ))
         inserted += 1
+
+    db.flush()
+    return inserted
+
+
+# ---------------------------------------------------------------------------
+# Optimization tips — evaluate app/services/optimization/rules/* per active
+# (org, project) pair over a rolling window → OptimizationTip rows.
+# ---------------------------------------------------------------------------
+
+def _generate_optimization_tips(*, db: Session, window_end: date) -> int:
+    """Evaluate every registered optimization-tip rule for every (org, project)
+    pair active in the lookback window, inserting new OptimizationTip rows.
+
+    Dedup on (org_id, project_id, model_name, tip_type): a candidate tip is
+    skipped if an identical one is already 'open', or was 'dismissed' within
+    the last TIP_COOLDOWN_DAYS days — a tip regenerated every run would
+    otherwise become noise, and a dismissed tip must not reappear next run.
+
+    A rule that raises is logged and skipped; it must not block the others.
+    """
+    from app.config import get_tip_cooldown_days, get_tip_window_days
+    from app.services.optimization import tip_registry
+
+    window_days = get_tip_window_days()
+    window_start = window_end - timedelta(days=window_days)
+    cooldown_start = window_end - timedelta(days=get_tip_cooldown_days())
+
+    pairs = (
+        db.query(DailyOrgSummary.org_id, DailyOrgSummary.project_id)
+        .filter(DailyOrgSummary.date >= window_start, DailyOrgSummary.date <= window_end)
+        .distinct()
+        .all()
+    )
+
+    existing = (
+        db.query(
+            OptimizationTip.org_id,
+            OptimizationTip.project_id,
+            OptimizationTip.model_name,
+            OptimizationTip.tip_type,
+        )
+        .filter(
+            (OptimizationTip.status == "open")
+            | (
+                (OptimizationTip.status == "dismissed")
+                & (OptimizationTip.created_at >= cooldown_start)
+            )
+        )
+        .all()
+    )
+    existing_keys: set[tuple] = {(e.org_id, e.project_id, e.model_name, e.tip_type) for e in existing}
+
+    inserted = 0
+    for org_id, project_id in pairs:
+        for rule in tip_registry.all():
+            try:
+                tips = rule.evaluate(
+                    db=db, org_id=org_id, project_id=project_id,
+                    window_start=window_start, window_end=window_end,
+                )
+            except Exception:
+                _log.exception(
+                    "optimization tip rule %s failed for org=%s project=%s",
+                    getattr(rule, "tip_type", rule.__class__.__name__), org_id, project_id,
+                )
+                continue
+
+            for tip in tips:
+                key = (tip["org_id"], tip["project_id"], tip.get("model_name"), tip["tip_type"])
+                if key in existing_keys:
+                    continue
+                db.add(OptimizationTip(**tip))
+                existing_keys.add(key)
+                inserted += 1
+
+    if inserted:
+        _log.info(
+            "optimization_tips: %d new tip rows inserted for window ending %s", inserted, window_end,
+        )
 
     db.flush()
     return inserted

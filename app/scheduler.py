@@ -1,9 +1,10 @@
 """APScheduler — runs periodic background jobs inside the FastAPI process.
 
 Jobs:
-  daily_agg        — every hour: aggregate AiRequest + RequestCost → DailyOrgSummary
-  monthly_agg      — every 24 hours: roll up DailyOrgSummary → MonthlyOrgSummary
-  startup_backfill — once, 5s after boot: fill gaps in the daily rollups
+  daily_agg          — every hour: aggregate AiRequest + RequestCost → DailyOrgSummary
+  monthly_agg        — every 24 hours: roll up DailyOrgSummary → MonthlyOrgSummary
+  optimization_tips  — every 24 hours: evaluate tip rules → OptimizationTip rows
+  startup_backfill   — once, 5s after boot: fill gaps in the daily rollups
 """
 from __future__ import annotations
 
@@ -21,6 +22,7 @@ _scheduler: BackgroundScheduler | None = None
 _last_success: dict[str, datetime.datetime | None] = {
     "daily_agg": None,
     "monthly_agg": None,
+    "optimization_tips": None,
     "startup_backfill": None,
 }
 
@@ -122,6 +124,31 @@ def _job_startup_backfill() -> None:
         db.close()
 
 
+def _job_optimization_tips() -> None:
+    """Rule 5 (cache_opportunity) runs the heaviest query in the system — a
+    sha256 hash-and-group over ai_requests — so this stays a separate daily
+    job rather than riding along with _job_daily_aggregation, which must not
+    be delayed by it. The thread pool is only SCHEDULER_MAX_WORKERS wide.
+    """
+    import datetime
+    import logging
+
+    from app.database import SessionLocal
+    from app.workers.tasks import _generate_optimization_tips
+
+    _log = logging.getLogger(__name__)
+    db = SessionLocal()
+    try:
+        _generate_optimization_tips(db=db, window_end=datetime.date.today())
+        db.commit()
+        _last_success["optimization_tips"] = datetime.datetime.utcnow()
+    except Exception:
+        _log.exception("optimization_tips job failed")
+        db.rollback()
+    finally:
+        db.close()
+
+
 def _job_monthly_aggregation() -> None:
     import datetime
 
@@ -156,6 +183,10 @@ def start_scheduler() -> BackgroundScheduler:
     _scheduler.add_job(
         _job_monthly_aggregation, "interval", hours=24,
         id="monthly_agg", replace_existing=True,
+    )
+    _scheduler.add_job(
+        _job_optimization_tips, "interval", hours=24,
+        id="optimization_tips", replace_existing=True,
     )
     # One-shot backfill, a few seconds after boot so it never delays the port opening.
     _scheduler.add_job(

@@ -568,6 +568,25 @@ CREATE TABLE IF NOT EXISTS usage_anomalies (
     created_at      TIMESTAMP DEFAULT NOW()
 );
 
+-- Written daily by _generate_optimization_tips; read by the optimization_tips router
+CREATE TABLE IF NOT EXISTS optimization_tips (
+    id                          BIGSERIAL PRIMARY KEY,
+    org_id                      VARCHAR(100) NOT NULL,
+    project_id                  VARCHAR(100),
+    model_name                  VARCHAR(120),
+    tip_type                    VARCHAR(60) NOT NULL,
+    severity                    VARCHAR(20) NOT NULL DEFAULT 'medium',
+    title                       VARCHAR(255),
+    message                     TEXT,
+    estimated_monthly_savings   NUMERIC(14, 6) DEFAULT 0,
+    confidence                  VARCHAR(20),
+    evidence_json               JSONB,
+    status                      VARCHAR(20) NOT NULL DEFAULT 'open',
+    period_start                DATE,
+    period_end                  DATE,
+    created_at                  TIMESTAMP DEFAULT NOW()
+);
+
 -- ---------------------------------------------------------------------------
 -- Indexes
 -- ---------------------------------------------------------------------------
@@ -637,6 +656,9 @@ CREATE INDEX IF NOT EXISTS ix_model_pricing_lookup
 -- Security surfaces
 CREATE INDEX IF NOT EXISTS ix_usage_anomalies_org_created
     ON usage_anomalies (org_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS ix_optimization_tips_org_created
+    ON optimization_tips (org_id, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS ix_data_security_logs_org_created
     ON data_security_logs (org_id, created_at DESC);

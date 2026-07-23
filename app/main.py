@@ -21,6 +21,7 @@ from app.routers import (
     governance_keys,
     lookups,
     models,
+    optimization_tips,
     organizations,
     pricing,
     projects,
@@ -74,6 +75,7 @@ _ALL_ROUTERS = [
     lookups.router,
     audit_logs.router,
     rate_limits_router,
+    optimization_tips.router,
 ]
 
 

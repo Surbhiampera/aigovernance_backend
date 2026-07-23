@@ -55,6 +55,7 @@ from app.models import AiRequest, AiResponse, RequestCost, RouteExecution, Token
 from app.services.audit_service import log_event
 from app.services.budget_service import check_budget
 from app.services.circuit_breaker import CircuitBreaker
+from app.services.cost_lookup import calculate_cost as _calculate_cost
 from app.services.deployment_service import build_provider_request, get_deployments_for_org
 from app.services.provider_translation import (
     extract_usage,
@@ -484,6 +485,12 @@ def _store_request(
     user_email: Optional[str] = None,
     user_role: Optional[str] = None,
 ) -> AiRequest:
+    prompt_text_val = _concat_message_text(original_messages) if original_messages else None
+    system_prompt_val = "\n".join(
+        m.get("content", "") for m in (original_messages or [])
+        if isinstance(m, dict) and m.get("role") == "system" and isinstance(m.get("content"), str)
+    ) or None
+
     row = AiRequest(
         request_id=request_id,
         org_id=org_id,
@@ -503,8 +510,12 @@ def _store_request(
         # audit/traceability — `request_payload` only holds the masked body
         # actually forwarded upstream.
         messages=original_messages,
-        prompt_text=_concat_message_text(original_messages) if original_messages else None,
+        prompt_text=prompt_text_val,
         sanitized_prompt_text=_concat_message_text(sanitized_messages) if sanitized_messages else None,
+        num_messages=len(original_messages or []),
+        has_system_prompt=system_prompt_val is not None,
+        prompt_char_count=len(prompt_text_val or ""),
+        system_prompt=system_prompt_val,
         input_token_estimate=input_tokens,
         source_ip=source_ip,
         user_agent=user_agent,
@@ -532,104 +543,62 @@ def _store_request(
 # Steps 9-10: Cost calculation, store response, store audit
 # ---------------------------------------------------------------------------
 
-def _calculate_cost(
+
+def _token_usage_extras(
     *,
-    db: Session,
+    req_row: Optional[AiRequest],
     model: str,
-    provider: str = "",
     input_tokens: int,
     output_tokens: int,
-) -> tuple[Decimal, Decimal, Decimal, str, dict, str]:
-    """Return (input_cost, output_cost, total_cost, pricing_source, pricing_snapshot, pricing_version).
-
-    Lookup order:
-      1. DB model_pricing filtered by provider+model (admin overrides, most recent wins)
-      2. DB model_pricing filtered by model only (provider-agnostic DB entry)
-      3. PROVIDER_PRICING catalogue (provider-specific static rates)
-      4. MODEL_PRICING catalogue (generic static rates)
-      5. Default rate from config
+    response_payload: Optional[dict] = None,
+) -> dict:
+    """Best-effort enrichment for TokenUsage rows — system/tool-definition token
+    counts, context-window utilization, and cache stats. Feeds the optimization
+    tips engine (app/services/optimization/). Never raises: a token-count or
+    pricing-catalogue failure here must not fail request accounting.
     """
-    from app.models import ModelPricing as ModelPricingRow
-    from app.services.ai_model_pricing import (
-        get_model_pricing_for_provider,
-        normalize_model_name,
-        normalize_provider,
-    )
+    extras = {
+        "prompt_tokens": input_tokens,
+        "completion_tokens": output_tokens,
+        "system_tokens": 0,
+        "tool_definition_tokens": 0,
+        "cached_tokens": 0,
+        "uncached_tokens": input_tokens,
+        "context_window_limit": None,
+        "context_utilization_pct": None,
+    }
+    try:
+        from app.services.ai_model_pricing import get_model_pricing
+        from app.services.token_counter import count_tokens
 
-    canonical = normalize_model_name(model)
-    prov = normalize_provider(provider)
+        if req_row is not None:
+            if req_row.system_prompt:
+                extras["system_tokens"] = count_tokens(req_row.system_prompt, model)
+            if req_row.has_tool_definitions and isinstance(req_row.request_payload, dict):
+                tools = req_row.request_payload.get("tools")
+                if tools:
+                    extras["tool_definition_tokens"] = count_tokens(json.dumps(tools), model)
 
-    # 1. DB lookup: provider+model specific (highest priority — admin can override any rate)
-    db_price = None
-    if prov:
-        db_price = (
-            db.query(ModelPricingRow)
-            .filter(
-                ModelPricingRow.model_name == canonical,
-                ModelPricingRow.provider == prov,
-                ModelPricingRow.effective_from <= datetime.utcnow(),
-            )
-            .order_by(ModelPricingRow.effective_from.desc())
-            .first()
-        )
-    # 2. DB lookup: model only (provider-agnostic fallback)
-    if not db_price:
-        db_price = (
-            db.query(ModelPricingRow)
-            .filter(
-                ModelPricingRow.model_name == canonical,
-                ModelPricingRow.effective_from <= datetime.utcnow(),
-            )
-            .order_by(ModelPricingRow.effective_from.desc())
-            .first()
-        )
+        if isinstance(response_payload, dict):
+            usage = response_payload.get("usage") or {}
+            cached = 0
+            details = usage.get("prompt_tokens_details")
+            if isinstance(details, dict):
+                cached = int(details.get("cached_tokens", 0) or 0)
+            elif "cache_read_input_tokens" in usage:
+                cached = int(usage.get("cache_read_input_tokens", 0) or 0)
+            extras["cached_tokens"] = cached
+            extras["uncached_tokens"] = max(input_tokens - cached, 0)
 
-    if db_price:
-        in_rate = Decimal(str(db_price.input_cost_per_1k))
-        out_rate = Decimal(str(db_price.output_cost_per_1k))
-        input_cost = (Decimal(str(input_tokens)) / Decimal("1000") * in_rate).quantize(Decimal("0.000001"))
-        output_cost = (Decimal(str(output_tokens)) / Decimal("1000") * out_rate).quantize(Decimal("0.000001"))
-        eff_date = db_price.effective_from.date().isoformat() if db_price.effective_from else "unknown"
-        pricing_source = "database"
-        pricing_snapshot = {
-            "input_cost_per_1k": float(in_rate),
-            "output_cost_per_1k": float(out_rate),
-            "provider": db_price.provider or prov,
-            "currency": db_price.currency or "USD",
-            "effective_from": eff_date,
-            "source": "database",
-        }
-        pricing_version = f"{canonical}@{eff_date}"
-    else:
-        # 3+4. Provider-specific catalogue, then generic catalogue
-        catalogue_entry = get_model_pricing_for_provider(canonical, prov)
-        if catalogue_entry:
-            input_cost = Decimal(str(round((input_tokens / 1_000_000) * catalogue_entry.input_per_1m, 6)))
-            output_cost = Decimal(str(round((output_tokens / 1_000_000) * catalogue_entry.output_per_1m, 6)))
-            pricing_source = "catalogue"
-            pricing_snapshot = {
-                "input_cost_per_1k": catalogue_entry.input_per_1m / 1000,
-                "output_cost_per_1k": catalogue_entry.output_per_1m / 1000,
-                "provider": catalogue_entry.provider,
-                "currency": "USD",
-                "effective_from": None,
-                "source": "catalogue",
-            }
-            pricing_version = f"catalogue:{catalogue_entry.provider}"
-        else:
-            input_cost = Decimal("0")
-            output_cost = Decimal("0")
-            pricing_source = "unknown"
-            pricing_snapshot = {}
-            pricing_version = "catalogue"
-            _log.warning(
-                "No pricing entry for model %r — cost recorded as $0 "
-                "(add alias in ai_model_pricing.py or a row to model_pricing table)",
-                model,
-            )
+        pricing = get_model_pricing(model)
+        if pricing and pricing.context_window:
+            extras["context_window_limit"] = pricing.context_window
+            total = input_tokens + output_tokens
+            extras["context_utilization_pct"] = round(min(total / pricing.context_window, 1) * 100, 3)
+    except Exception:
+        _log.warning("token_usage enrichment failed for model=%s", model, exc_info=True)
 
-    total_cost = (input_cost + output_cost).quantize(Decimal("0.000001"))
-    return input_cost, output_cost, total_cost, pricing_source, pricing_snapshot, pricing_version
+    return extras
 
 
 def _store_response_and_cost(
@@ -665,6 +634,8 @@ def _store_response_and_cost(
     )
     num_tool_calls = len(tool_calls) if tool_calls else 0
 
+    req_row = db.query(AiRequest).filter(AiRequest.request_id == request_id).first()
+
     db.add(AiResponse(
         response_id=_new_response_id(),
         request_id=request_id,
@@ -680,6 +651,10 @@ def _store_response_and_cost(
         created_at=datetime.utcnow(),
     ))
 
+    token_usage_extras = _token_usage_extras(
+        req_row=req_row, model=model, input_tokens=input_tokens,
+        output_tokens=output_tokens, response_payload=response_payload,
+    )
     db.add(TokenUsage(
         request_id=request_id,
         org_id=org_id,
@@ -692,6 +667,7 @@ def _store_response_and_cost(
         output_token_source=output_token_source,
         is_estimated=(input_token_source != "azure" or output_token_source != "azure"),
         created_at=datetime.utcnow(),
+        **token_usage_extras,
     ))
 
     db.add(RequestCost(
@@ -716,7 +692,6 @@ def _store_response_and_cost(
 
     record_tokens_used(org_id=org_id, project_id=project_id, tokens=input_tokens + output_tokens)
 
-    req_row = db.query(AiRequest).filter(AiRequest.request_id == request_id).first()
     if req_row:
         req_row.request_status = status
         req_row.completed_at = datetime.utcnow()
@@ -955,6 +930,9 @@ def _mark_request_failed_with_cost(
         output_tokens=output_tokens,
     )
 
+    token_usage_extras = _token_usage_extras(
+        req_row=req_row, model=model, input_tokens=input_tokens, output_tokens=output_tokens,
+    )
     db.add(TokenUsage(
         request_id=request_id,
         org_id=org_id,
@@ -967,6 +945,7 @@ def _mark_request_failed_with_cost(
         output_token_source=output_token_source,
         is_estimated=(input_token_source != "azure" or output_token_source != "azure"),
         created_at=datetime.utcnow(),
+        **token_usage_extras,
     ))
 
     db.add(RequestCost(
