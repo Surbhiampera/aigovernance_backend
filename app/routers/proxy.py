@@ -42,13 +42,16 @@ from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, 
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import Integer, cast, func
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app.config import (
     get_azure_circuit_failure_threshold,
     get_azure_circuit_reset_seconds,
     get_azure_max_concurrent_requests,
+    get_azure_read_timeout_seconds,
     get_azure_retry_backoff_seconds,
     get_azure_retry_max_attempts,
+    get_azure_total_deadline_seconds,
 )
 from app.core.deps import get_db
 from app.models import AiRequest, AiResponse, RequestCost, RouteExecution, TokenUsage
@@ -134,13 +137,27 @@ def _get_circuit_breaker(key: str) -> CircuitBreaker:
     return cb
 
 
+def _azure_httpx_timeout() -> httpx.Timeout:
+    """Shared timeout config for every outbound call to a provider.
+
+    read is configurable (AZURE_READ_TIMEOUT_SECONDS) — see
+    get_azure_read_timeout_seconds for why it bounds worst-case latency.
+    """
+    return httpx.Timeout(connect=10.0, read=get_azure_read_timeout_seconds(), write=30.0, pool=5.0)
+
+
 async def _post_to_azure_with_retry(
-    client: httpx.AsyncClient, *, url: str, headers: dict, json_body: dict,
+    client: httpx.AsyncClient, *, url: str, headers: dict, json_body: dict, deadline: float,
 ) -> httpx.Response:
     """POST to Azure, retrying transient failures (timeouts, connection
     errors, 5xx) with exponential backoff. Does not retry 4xx — those are
     deterministic (bad request, rate limited, content filtered) and retrying
     them would just waste the budget without changing the outcome.
+
+    `deadline` is an absolute time.time() value shared across every retry AND
+    every failover candidate (see get_azure_total_deadline_seconds) — once
+    passed, no further retry is attempted here even if max_attempts hasn't
+    been reached, so this can't itself blow the overall budget.
     """
     max_attempts = get_azure_retry_max_attempts()
     backoff = get_azure_retry_backoff_seconds()
@@ -156,8 +173,13 @@ async def _post_to_azure_with_retry(
             last_exc = exc
         except httpx.RequestError as exc:
             last_exc = exc
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
         if attempt < max_attempts - 1:
-            await asyncio.sleep(backoff * (2 ** attempt))
+            await asyncio.sleep(min(backoff * (2 ** attempt), remaining))
+        if time.time() >= deadline:
+            break
     raise last_exc
 
 
@@ -1074,7 +1096,7 @@ async def _stream_azure(
 
         try:
             async with httpx.AsyncClient(
-                timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=5.0)
+                timeout=_azure_httpx_timeout()
             ) as client:
                 async with client.stream("POST", url=url, headers=headers, json=body) as resp:
                     resp.raise_for_status()
@@ -1298,7 +1320,7 @@ async def _stream_provider_native(
 
         try:
             async with httpx.AsyncClient(
-                timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=5.0)
+                timeout=_azure_httpx_timeout()
             ) as client:
                 async with client.stream("POST", url=url, headers=headers, json=body) as resp:
                     resp.raise_for_status()
@@ -1588,8 +1610,13 @@ async def _run_pre_flight(
     pii_entities_masked: int = 0
     pii_detail: Optional[list] = None
     try:
-        clean_messages, pii_result = _scan_messages(
-            messages=messages, org_id=org_id, project_id=project_id, db=db,
+        # _scan_messages runs Presidio/spaCy NER (CPU-bound) plus a sync DB
+        # policy lookup. Both are blocking calls; running them inline on this
+        # async def's event loop thread would stall every other coroutine on
+        # this worker — including unrelated dashboard endpoints — for the
+        # duration of the scan. Thread-offloading keeps the loop free.
+        clean_messages, pii_result = await run_in_threadpool(
+            _scan_messages, messages=messages, org_id=org_id, project_id=project_id, db=db,
         )
         pii_detected = pii_result.pii_detected
         pii_types = pii_result.pii_types
@@ -1718,13 +1745,30 @@ async def _call_with_failover(*, ctx: dict) -> httpx.Response:
     (or was the last one tried, on total failure), so all downstream cost/
     token/audit logging — none of which changes — reflects what really
     happened.
+
+    A hard wall-clock deadline (get_azure_total_deadline_seconds) spans every
+    retry across every candidate here. Without it, retries-per-candidate ×
+    candidates can exceed platform-level gateway timeouts this app doesn't
+    control (e.g. Azure App Service's fixed 230s front-end timeout) — if that
+    fires first, our own except blocks below never run and the caller gets
+    an opaque platform error instead of our own audited 502/503.
     """
     attempts: list[dict] = ctx["attempts"]
     last_exc: Optional[Exception] = None
+    deadline = time.time() + get_azure_total_deadline_seconds()
 
     for i, attempt in enumerate(attempts):
         is_last = (i == len(attempts) - 1)
         circuit = _get_circuit_breaker(_circuit_key(attempt["provider"], attempt["deployment"]))
+
+        if time.time() >= deadline:
+            ctx.update(attempt)
+            if last_exc:
+                raise last_exc
+            raise HTTPException(
+                status_code=502,
+                detail="Azure OpenAI unreachable: exceeded internal retry deadline.",
+            )
 
         if not await circuit.allow_request():
             if is_last:
@@ -1740,11 +1784,11 @@ async def _call_with_failover(*, ctx: dict) -> httpx.Response:
 
         try:
             async with httpx.AsyncClient(
-                timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=5.0)
+                timeout=_azure_httpx_timeout()
             ) as client:
                 resp = await _post_to_azure_with_retry(
                     client, url=attempt["url"], headers=attempt["azure_hdrs"],
-                    json_body=attempt["outbound_body"],
+                    json_body=attempt["outbound_body"], deadline=deadline,
                 )
             await circuit.record_success()
             ctx.update(attempt)

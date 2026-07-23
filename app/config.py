@@ -86,13 +86,54 @@ def get_azure_max_concurrent_requests() -> int:
     Backpressure valve: once this many requests are already waiting on Azure,
     new ones get a fast 503 instead of piling up and exhausting the DB pool
     or httpx connection limits while waiting on a slow/saturated upstream.
+
+    Each in-flight proxy request holds its DB session open for the whole
+    Azure call (including retries/failover, which can run to several
+    minutes if Azure is slow or unreachable), so this valve only protects
+    the DB pool if its cap stays at or below DB_POOL_SIZE + DB_MAX_OVERFLOW
+    (default 14 + 6 = 20 per worker). A higher default here previously let
+    proxy traffic alone exhaust every pooled connection — including those
+    needed by unrelated admin/scheduler queries in the same process —
+    before this limiter ever kicked in.
     """
-    return _int("AZURE_MAX_CONCURRENT_REQUESTS", "40")
+    return _int("AZURE_MAX_CONCURRENT_REQUESTS", "15")
+
+
+def get_azure_read_timeout_seconds() -> float:
+    """Per-attempt wait for an Azure/provider response body once connected.
+
+    Previously hardcoded to 120s in three places in proxy.py. That let a
+    single slow/hung attempt run for up to 120s, and — multiplied by
+    AZURE_RETRY_MAX_ATTEMPTS retries — could keep a request (and its held
+    DB connection, see get_db_pool_size) in flight for several minutes.
+    Most reverse proxies / API gateways time out well before that, so the
+    caller's own gateway would return a 502 while we were still retrying
+    in the background — a slow eventual success or failure on our side
+    still reads as "governance is down" to them. 60s keeps each attempt
+    within common gateway timeout windows while still giving normal
+    completions room to finish.
+    """
+    return float(os.getenv("AZURE_READ_TIMEOUT_SECONDS", "60"))
 
 
 def get_azure_retry_max_attempts() -> int:
     """Total attempts (including the first) for transient Azure failures."""
     return _int("AZURE_RETRY_MAX_ATTEMPTS", "3")
+
+
+def get_azure_total_deadline_seconds() -> float:
+    """Hard wall-clock budget for the whole outbound call: every retry across
+    every failover candidate deployment combined.
+
+    Per-attempt timeouts (AZURE_READ_TIMEOUT_SECONDS) bound a single try, but
+    retries × failover candidates can still stack up past a platform-level
+    gateway timeout that this app has no control over — e.g. Azure App
+    Service's front end ('Microsoft.Web') kills the connection at a fixed
+    230s with no app-level override. If that fires first, our own except
+    blocks never run: no clean 502 body, no audit/AiRequest failure row.
+    Kept well under 230s so our own handling always wins that race.
+    """
+    return float(os.getenv("AZURE_TOTAL_DEADLINE_SECONDS", "90"))
 
 
 def get_azure_retry_backoff_seconds() -> float:

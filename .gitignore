@@ -17,12 +17,12 @@ settings.json
 .env
 .env.local
 *.local
-
+/home/ampara/Documents/aigovernance_backend/.env
 # Node
 node_modules/
 .next/
 out/
-
+/home/ampara/Documents/aigovernance_backend/settings.json
 # IDE
 .vscode/
 .idea/
