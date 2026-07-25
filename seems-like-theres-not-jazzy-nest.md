@@ -25,13 +25,13 @@ Before writing anything, the script prints the resolved DB host/name from `DATAB
 
 For each synthetic request, insert `AiRequest` + `TokenUsage` + `RequestCost` + `AiResponse` together (mirrors `_seed_request`), varying `created_at` across the window. Within that set, deliberately construct:
 
-| Rule | How it's satisfied |
-|---|---|
-| `response_length` | Across the ~70 rows, average `completion_tokens / prompt_tokens > 3.0`, with total request count ≥ 50 for the model. |
-| `oversized_prompt` | ~8 rows get `input_tokens` 5–10x the median of the rest, so p95 > 3x median; also set `system_tokens`/`tool_definition_tokens` on those rows so cause-attribution resolves to something concrete instead of falling through to `conversation_history`. |
-| `response_truncated` | ~12 rows (>15%) get `finish_reason="length"` on `AiResponse`. |
-| `cache_opportunity` | ~15 rows reuse one of 2–3 fixed `sanitized_prompt_text` strings (≥5 duplicates each), rest get unique text. |
-| `model_substitution` | All 70 rows costed against real `gpt-4o` pricing via the existing `calculate_cost()` helper (not hand-computed) so the rule's own recost-against-`gpt-4o-mini` comparison finds genuine savings ≥ $5/mo. |
+| Rule                 | How it's satisfied                                                                                                                                                                                                                                     |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `response_length`    | Across the ~70 rows, average `completion_tokens / prompt_tokens > 3.0`, with total request count ≥ 50 for the model.                                                                                                                                   |
+| `oversized_prompt`   | ~8 rows get `input_tokens` 5–10x the median of the rest, so p95 > 3x median; also set `system_tokens`/`tool_definition_tokens` on those rows so cause-attribution resolves to something concrete instead of falling through to `conversation_history`. |
+| `response_truncated` | ~12 rows (>15%) get `finish_reason="length"` on `AiResponse`.                                                                                                                                                                                          |
+| `cache_opportunity`  | ~15 rows reuse one of 2–3 fixed `sanitized_prompt_text` strings (≥5 duplicates each), rest get unique text.                                                                                                                                            |
+| `model_substitution` | All 70 rows costed against real `gpt-4o` pricing via the existing `calculate_cost()` helper (not hand-computed) so the rule's own recost-against-`gpt-4o-mini` comparison finds genuine savings ≥ $5/mo.                                               |
 
 Token/cost numbers are randomized within realistic bands (not identical rows) so p50/p95 percentile math and averages look organic rather than suspiciously uniform.
 
@@ -41,7 +41,7 @@ After inserting the raw rows, call the existing `_rebuild_daily_summary(db, org_
 
 ### What the script does NOT do
 
-- Does not call `_generate_optimization_tips` itself (per your choice) — it only seeds inputs.
+- Does not call `_generate_optimization_tips` itself — it only seeds inputs.
 - Does not modify any file under `app/services/optimization/`, `app/workers/tasks.py`'s rule logic, or `app/config.py` thresholds.
 - Does not touch `daily_user_usage` (no rule reads it).
 
@@ -51,7 +51,3 @@ After inserting the raw rows, call the existing `_rebuild_daily_summary(db, org_
 2. `curl -X POST "http://localhost:8000/optimization-tips/admin/rebuild?window_end=<today>"` (server pointed at the same clone) — should return `{"inserted": N}` with N ≥ 1, ideally 5 (one per rule).
 3. `GET /optimization-tips/?org_id=org-mock-optztips` — confirm all 5 `tip_type`s appear with sane `estimated_monthly_savings` and `evidence_json`.
 4. `pytest tests/test_optimization_tips.py` — confirm the existing test suite still passes untouched (proves we didn't alter rule code).
-
-## Cleanup
-
-Since this only ever runs against a disposable clone, cleanup is just dropping/discarding that clone DB when done — no cleanup needed in production. The script's docstring will still note the `DELETE ... WHERE org_id = 'org-mock-optztips'` cascade path in case you want to reuse the same clone for other testing afterward.
