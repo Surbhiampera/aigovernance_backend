@@ -238,7 +238,7 @@ def get_alert_anomaly_batch_limit() -> int:
 # ── Optimization tips thresholds ───────────────────────────────────────────
 def get_tip_window_days() -> int:
     """Lookback window the optimization-tips job evaluates each run."""
-    return _int("TIP_WINDOW_DAYS", "7")
+    return _int("TIP_WINDOW_DAYS", "30")
 
 
 def get_tip_output_input_ratio() -> Decimal:
