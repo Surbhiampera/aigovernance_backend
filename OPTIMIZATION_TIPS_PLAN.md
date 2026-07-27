@@ -3,8 +3,8 @@
 ## Context
 
 The platform records every AI request's tokens, cost, model, and prompt text, but nothing
-turns that data into advice. Orgs can see _that_ they spent money; nothing tells them _how
-to spend less_. PRD §5.2 asks for a tips engine; this plan implements it.
+turns that data into advice. Orgs can see *that* they spent money; nothing tells them *how
+to spend less*. PRD §5.2 asks for a tips engine; this plan implements it.
 
 **Intended outcome:** a scheduled job that samples outlier requests/responses and emits
 concrete, evidence-backed suggestions — swap to a cheaper deployed model, cap response
@@ -13,15 +13,15 @@ IDs that triggered it so an engineer can drill in and see the offending prompt.
 
 **Two PRD blockers turned out not to exist** (verified in code):
 
-1. _"Rule 2 depends on `governance_rule_service` being wired live."_ It does not.
+1. *"Rule 2 depends on `governance_rule_service` being wired live."* It does not.
    `governance_rule_service` is still uncalled from `proxy.py` (grep confirms), but the
    tips job can read `GovernanceRule` rows itself via
    [`_load_rules()`](app/services/governance_rule_service.py#L106) and intersect with
    [`get_deployments_for_org()`](app/services/deployment_service.py#L83). Suggesting only
-   models the org has actually deployed _and_ isn't block-listing is a stricter filter than
+   models the org has actually deployed *and* isn't block-listing is a stricter filter than
    the block-list alone. Rule 2 ships in v1.
 
-2. _"Duplicate detection blocked on a prompt-retention decision."_ Prompt text is already
+2. *"Duplicate detection blocked on a prompt-retention decision."* Prompt text is already
    retained. [models.py:650-653](app/models.py#L650-L653) declares `prompt_text`,
    `sanitized_prompt_text`, `messages`, `system_prompt`; [proxy.py:505-507](app/routers/proxy.py#L505-L507)
    populates them. Hash `sanitized_prompt_text` (post-PII-mask) — the safe choice is already
@@ -139,12 +139,12 @@ LLM-generation pass consumes.
 ```json
 {
   "rule": "model_substitution",
-  "observed": { "metric": "blended_cost_per_1k", "value": 4.25, "unit": "USD" },
-  "baseline": { "metric": "blended_cost_per_1k", "value": 0.3, "unit": "USD" },
+  "observed":  {"metric": "blended_cost_per_1k", "value": 4.25, "unit": "USD"},
+  "baseline":  {"metric": "blended_cost_per_1k", "value": 0.30, "unit": "USD"},
   "sample_request_ids": ["req-...", "req-..."],
   "sample_size": 1284,
   "window_days": 7,
-  "params": { "from_model": "gpt-4o", "to_model": "gpt-4o-mini" }
+  "params": {"from_model": "gpt-4o", "to_model": "gpt-4o-mini"}
 }
 ```
 
@@ -184,7 +184,6 @@ Thresholds go in [app/config.py](app/config.py) using the existing `_dec` / `_in
 pattern ([config.py:192-209](app/config.py#L192)), named `TIP_*`.
 
 ### Rule 1 — output/input ratio (`response_length`)
-
 Aggregate `DailyOrgSummary.total_completion_tokens / total_prompt_tokens` per
 (org, project, tool_name) over the window. Flag above `TIP_OUTPUT_INPUT_RATIO` (default 3.0),
 minimum `TIP_MIN_REQUESTS` (default 50) requests. Tip: set a `max_tokens` cap.
@@ -194,7 +193,6 @@ Note: `DailyOrgSummary.tool_name` holds the **model name** — see
 [tasks.py:108](app/workers/tasks.py#L108). Confusing but correct.
 
 ### Rule 2 — model substitution (`model_substitution`)
-
 1. Per (org, project, model), sum `RequestCost.total_cost`, `input_tokens`, `output_tokens`.
 2. Candidate set = `get_deployments_for_org(db, org_id=…, project_id=…)`
    ([deployment_service.py:83](app/services/deployment_service.py#L83)) — only models the org
@@ -218,14 +216,12 @@ Confidence is `"medium"` — mark it explicitly, since equivalent-category is a 
 a quality guarantee.
 
 ### Rule 3 — oversized prompt (`oversized_prompt`)
-
 Percentile query over `TokenUsage.input_tokens` joined to `AiRequest` per project.
 Flag when p95 exceeds `TIP_PROMPT_OUTLIER_RATIO` (default 3.0) × the project median.
 **No tiktoken re-tokenization** — the counts are already stored.
 
 With Step 1 in place, split the cause using `system_tokens` and `tool_definition_tokens`, and
 pick the template accordingly:
-
 - tool defs dominate → "trim unused tool definitions"
 - system prompt dominates → "the system prompt is resent every turn; shorten or cache it"
 - neither → "conversation history is growing unbounded; truncate or summarize older turns"
@@ -233,21 +229,18 @@ pick the template accordingly:
 This is the rule that produces the prompt/context-engineering coaching.
 
 ### Rule 4 — truncation (`response_truncated`)
-
 Ratio of `AiResponse.finish_reason == "length"` per (org, project, model) over the window.
 Flag above `TIP_TRUNCATION_RATE` (default 0.15) with ≥ `TIP_MIN_REQUESTS`. Cheapest rule —
 the column is already populated. Tip: raise `max_tokens` or shorten the ask; truncated
 responses are paid for and discarded.
 
 ### Rule 5 — duplicate / cache opportunity (`cache_opportunity`)
-
 `SHA-256` over `AiRequest.sanitized_prompt_text` (the **masked** field — never `prompt_text`).
 Group by hash per (org, project, model) over the window; flag hashes with ≥
 `TIP_DUPLICATE_MIN_HITS` (default 5) repeats. Savings = (repeats − 1) × that prompt's input
 cost. Tip: prompt caching or a response cache.
 
 Two safeguards:
-
 - Compute the hash in SQL (`encode(sha256(convert_to(sanitized_prompt_text,'UTF8')),'hex')`)
   and `GROUP BY` it — do not pull prompt bodies into Python.
 - Store only the **hash prefix** in `evidence_json`, never prompt text. Drill-down goes
@@ -285,13 +278,13 @@ Copy the structure of [app/routers/alerts.py](app/routers/alerts.py) verbatim �
 `_serialize` / `_enrich` org+project name-joining, same query-param filters, same
 `{"total", "offset", "items"}` envelope.
 
-| Endpoint                                | Purpose                                                                             |
-| --------------------------------------- | ----------------------------------------------------------------------------------- |
-| `GET /optimization-tips`                | filters: `status`, `org_id`, `project_id`, `tip_type`, `severity`; `limit`/`offset` |
-| `GET /optimization-tips/summary`        | counts by `tip_type` + total `estimated_monthly_savings` — dashboard header         |
-| `PATCH /optimization-tips/{id}/dismiss` | sets `status="dismissed"`, feeds the cooldown                                       |
-| `PATCH /optimization-tips/{id}/apply`   | sets `status="applied"` — tracks which advice was acted on                          |
-| `POST /optimization-tips/admin/rebuild` | manual re-trigger, mirrors `POST /summary/admin/rebuild-daily`                      |
+| Endpoint | Purpose |
+|---|---|
+| `GET /optimization-tips` | filters: `status`, `org_id`, `project_id`, `tip_type`, `severity`; `limit`/`offset` |
+| `GET /optimization-tips/summary` | counts by `tip_type` + total `estimated_monthly_savings` — dashboard header |
+| `PATCH /optimization-tips/{id}/dismiss` | sets `status="dismissed"`, feeds the cooldown |
+| `PATCH /optimization-tips/{id}/apply` | sets `status="applied"` — tracks which advice was acted on |
+| `POST /optimization-tips/admin/rebuild` | manual re-trigger, mirrors `POST /summary/admin/rebuild-daily` |
 
 Register in `_ALL_ROUTERS` ([main.py:60](app/main.py#L60)) and add the import to the
 `app.routers` import block at [main.py:12](app/main.py#L12).
@@ -301,12 +294,11 @@ Register in `_ALL_ROUTERS` ([main.py:60](app/main.py#L60)) and add the import to
 ## Verification
 
 1. **Schema first** — `psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f schema_clean.sql`, then
-   `uvicorn app.main:app --reload`. Boot succeeding _is_ the schema check: `_verify_schema()`
+   `uvicorn app.main:app --reload`. Boot succeeding *is* the schema check: `_verify_schema()`
    fails loudly and names the missing column otherwise.
 
 2. **Step 1 columns** — send a request through `/proxy` with a system message and a `tools`
    array, then confirm the new columns are non-zero:
-
    ```sql
    SELECT r.num_messages, r.has_system_prompt, r.prompt_char_count,
           t.system_tokens, t.tool_definition_tokens, t.context_utilization_pct
@@ -335,3 +327,8 @@ Register in `_ALL_ROUTERS` ([main.py:60](app/main.py#L60)) and add the import to
 
 7. `pytest tests/` — full suite green, confirming Step 1's proxy changes broke nothing
    (`test_token_storage.py` and `test_pii_detection.py` are the ones at risk).
+
+## Estimate
+
+About 5-6 days. Steps 1-2 are half a day each; Steps 3-4 (five rules + the `_calculate_cost`
+extraction) are ~3 days; Steps 5-6 are a day; tests roughly a day.
