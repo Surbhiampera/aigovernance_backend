@@ -6,6 +6,7 @@ python-dotenv
 pydantic
 apscheduler
 python-jose[cryptography]
+PyJWT[crypto]
 httpx
 openpyxl
 python-multipart

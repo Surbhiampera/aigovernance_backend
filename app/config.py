@@ -274,3 +274,36 @@ def get_alert_dedup_days() -> int:
 def get_alert_anomaly_batch_limit() -> int:
     """Max open anomalies converted to alerts per scheduler run."""
     return _int("ALERT_ANOMALY_BATCH_LIMIT", "20")
+
+
+# ── Licensed, expiring downloadable package ────────────────────────────────
+# Opt-in: only packaged/licensed deployments (e.g. a consulting arm's
+# per-client install) set LICENSE_ENFORCEMENT_ENABLED=true. The main
+# platform deployment leaves this off and none of the below applies.
+def get_license_enforcement_enabled() -> bool:
+    return os.getenv("LICENSE_ENFORCEMENT_ENABLED", "false").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def get_license_file_path() -> str:
+    """Path to the signed license token (JWT) installed alongside the package."""
+    return os.getenv("LICENSE_FILE_PATH", "license.lic")
+
+
+def get_license_public_key_path() -> str:
+    """Path to the RSA public key (PEM) baked into the package image, used to
+    verify the license signature offline — the matching private key never
+    ships and stays with whoever issues licenses.
+    """
+    return os.getenv("LICENSE_PUBLIC_KEY_PATH", "license_public_key.pem")
+
+
+def get_license_check_interval_seconds() -> int:
+    """How often the background job re-reads and re-verifies the license file."""
+    return _int("LICENSE_CHECK_INTERVAL_SECONDS", "3600")
+
+
+def get_license_renewal_warning_days() -> int:
+    """Days before expiry at which the admin dashboard shows a renewal banner."""
+    return _int("LICENSE_RENEWAL_WARNING_DAYS", "15")

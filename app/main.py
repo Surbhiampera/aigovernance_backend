@@ -27,6 +27,8 @@ from app.routers import (
 )
 from app.routers.rate_limits import router as rate_limits_router
 from app.routers.deployments import router as deployments_router
+from app.routers.license import router as license_router
+from app.routers.license import enforce_license
 from app.routers.proxy import router as proxy_router
 from app.routers.proxy import proxy_chat_openai_compat
 
@@ -169,6 +171,11 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
 
+    from app.services.license_service import refresh_license_status
+    from app.config import get_license_enforcement_enabled
+    if get_license_enforcement_enabled():
+        refresh_license_status()
+
     start_scheduler()
 
     # Backfill DailyOrgSummary for any past days that have AiRequest data but no summary.
@@ -258,13 +265,20 @@ async def http_exception_handler(request: Request, exc: HTTPException) -> JSONRe
     content = detail if isinstance(detail, dict) else {"detail": detail}
     return JSONResponse(status_code=exc.status_code, content=content, headers=headers)
 
+# Gated by enforce_license: a no-op unless LICENSE_ENFORCEMENT_ENABLED=true
+# (packaged/per-client deployments only). A lapsed license freezes this
+# admin/analytics API surface — never the proxy path below.
+_license_gate = [Depends(enforce_license)]
 for _router in _ALL_ROUTERS:
-    app.include_router(_router)
+    app.include_router(_router, dependencies=_license_gate)
+app.include_router(deployments_router, dependencies=_license_gate)
+app.include_router(license_router)  # never gated — must explain a freeze even while frozen
 
 # All proxy endpoints live under /proxy (see router prefix in app/routers/proxy.py).
 # External teams must set their SDK base_url to "https://<host>/proxy".
+# Never license-gated: AI traffic keeps flowing under existing governance
+# rules even with a lapsed license — only the dashboard above freezes.
 app.include_router(proxy_router)
-app.include_router(deployments_router)
 
 
 # Root-level aliases for misconfigured OpenAI SDK clients that set base_url to

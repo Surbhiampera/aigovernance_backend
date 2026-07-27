@@ -9,7 +9,11 @@ from __future__ import annotations
 from apscheduler.executors.pool import ThreadPoolExecutor
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from app.config import get_scheduler_max_workers
+from app.config import (
+    get_license_check_interval_seconds,
+    get_license_enforcement_enabled,
+    get_scheduler_max_workers,
+)
 
 _scheduler: BackgroundScheduler | None = None
 
@@ -18,6 +22,7 @@ _scheduler: BackgroundScheduler | None = None
 _last_success: dict[str, "datetime.datetime | None"] = {
     "daily_agg": None,
     "monthly_agg": None,
+    "license_check": None,
 }
 
 
@@ -59,6 +64,16 @@ def _job_daily_aggregation() -> None:
         db.close()
 
 
+def _job_license_check() -> None:
+    """Re-verify the license file so expiry/renewal is caught without a restart."""
+    import datetime
+
+    from app.services.license_service import refresh_license_status
+
+    refresh_license_status()
+    _last_success["license_check"] = datetime.datetime.utcnow()
+
+
 def _job_monthly_aggregation() -> None:
     import datetime
 
@@ -94,6 +109,11 @@ def start_scheduler() -> BackgroundScheduler:
         _job_monthly_aggregation, "interval", hours=24,
         id="monthly_agg", replace_existing=True,
     )
+    if get_license_enforcement_enabled():
+        _scheduler.add_job(
+            _job_license_check, "interval", seconds=get_license_check_interval_seconds(),
+            id="license_check", replace_existing=True,
+        )
     _scheduler.start()
     return _scheduler
 
