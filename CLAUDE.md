@@ -56,6 +56,10 @@ All enforcement decisions are logged to `audit_logs`. 403 = PII block, 429 = bud
 
 Optional `X-User-Id` (plus `X-User-Email`/`X-User-Role`) proxy headers attribute requests to an individual user. Rolled up into `DailyUserUsage` alongside the existing `DailyOrgSummary`, and exposed via `GET /costs/by-user`. Requests without a user header are excluded from per-user tables but still counted org-wide.
 
+### Optimization tips engine
+
+`app/services/optimization/` evaluates cost/prompt-shape advice on a daily schedule (`optimization_tips` job in `app/scheduler.py`, 24h interval → `_generate_optimization_tips()` in `app/workers/tasks.py`), scanning a rolling 30-day window and writing `OptimizationTip` rows exposed via `app/routers/optimization_tips.py`. Rules are pluggable, following the same self-registration pattern as the ingestion adapters: each rule in `app/services/optimization/rules/` subclasses `TipRule` and self-registers with `@tip_registry.register` (`app/services/optimization/registry.py`); the scheduled job catches exceptions per-rule so one broken rule can't block the others. Current rules: cache-opportunity (repeated/duplicate prompts), model-substitution (cheaper deployed model would suffice), oversized-prompt, response-length, and response-truncated (finish_reason == "length"). Notably, this job reads `GovernanceRule` rows directly to filter suggestions to models the org has deployed and hasn't block-listed — it's a second, independent consumer of governance rules despite the live proxy path not calling `governance_rule_service` at all (see the known gap above).
+
 ### Key files
 
 | File | Role |
@@ -70,7 +74,9 @@ Optional `X-User-Id` (plus `X-User-Email`/`X-User-Role`) proxy headers attribute
 | `app/services/rate_limit_service.py` | Per-key and per-project rate limiting (Redis-backed, Postgres fallback) |
 | `app/services/cost_engine.py` | Cost calc used only by the ingestion pipeline — the live proxy path uses its own `_calculate_cost()` in `proxy.py` instead; the two can drift |
 | `app/services/pii_engine.py` | Presidio-based PII detection and masking (Aadhaar/PAN custom recognizers) |
-| `app/workers/tasks.py` | Aggregation functions called by the scheduler: `_rebuild_daily_summary`, `_rebuild_daily_user_summary`, `_detect_daily_anomalies`, `_rebuild_monthly_summary` |
+| `app/core/deps.py` | `get_db`, `require_api_key`/`require_role(...)` — admin-API auth (distinct from the proxy's `X-Governance-Key`) |
+| `app/services/optimization/registry.py`, `app/services/optimization/rules/*` | Pluggable optimization-tip rules (self-register via `@tip_registry.register`) |
+| `app/workers/tasks.py` | Aggregation functions called by the scheduler: `_rebuild_daily_summary`, `_rebuild_daily_user_summary`, `_detect_daily_anomalies`, `_rebuild_monthly_summary`, `_generate_optimization_tips` |
 | `app/scheduler.py` | APScheduler: hourly daily-agg (summary + user summary + anomaly detection), daily monthly-agg |
 | `app/config.py` | All environment variable accessors |
 
@@ -95,6 +101,13 @@ Connection pool: conservative defaults (`pool_size=3`, `max_overflow=0`, `pool_r
 ### Multi-tenancy
 
 All data is scoped by `org_id` and `project_id`. API keys (`api_keys` table, hashed) resolve to an org+project pair. The governance rules, budgets, and rate limits can be set at both org and project scope.
+
+### Two separate auth mechanisms — don't confuse them
+
+- **`X-Governance-Key`** (tenant traffic): consumed only by `/proxy/*` and the root-level SDK-compat aliases in `app/main.py`. `verify_governance_key()` resolves it to an org+project pair; this is what external teams put in their SDK client config.
+- **`X-API-Key`** (admin/dashboard APIs): consumed by every other router (deployments, budgets, costs, optimization-tips, etc.) via `require_api_key`/`require_role(...)` in `app/core/deps.py`. Checked against the `api_keys` table, or against `GOVERNANCE_MASTER_KEY` (env var) for bootstrap access before any per-org keys exist. Roles are `viewer` < `security_reviewer` < `admin`; a key with no role defaults to `viewer`, and the master key is always treated as `admin`.
+
+These two header/key spaces are unrelated — a valid governance key does not grant access to admin endpoints and vice versa.
 
 ### Vendor adapters (ingestion)
 
