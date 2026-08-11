@@ -42,7 +42,7 @@ def main() -> None:
         ))
 
     print(f"Wrote private key: {args.private_key_out}  (KEEP SECRET — never ship)")
-    print(f"Wrote public key:  {args.public_key_out}  (bake into the package image)")
+    print(f"Wrote public key:  {args.public_key_out}  (ships to every client's ./license mount dir)")
 
 
 if __name__ == "__main__":
