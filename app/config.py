@@ -299,6 +299,16 @@ def get_license_public_key_path() -> str:
     return os.getenv("LICENSE_PUBLIC_KEY_PATH", "license_public_key.pem")
 
 
+def get_license_public_key_extra_paths() -> list[str]:
+    """Additional public keys to accept, comma-separated — used during a
+    signing-key rotation so licenses already issued under the old key keep
+    verifying while new ones are issued under the new key. Empty normally;
+    see LICENSING_PACKAGING.md's key rotation section.
+    """
+    raw = os.getenv("LICENSE_PUBLIC_KEY_EXTRA_PATHS", "")
+    return [p.strip() for p in raw.split(",") if p.strip()]
+
+
 def get_license_check_interval_seconds() -> int:
     """How often the background job re-reads and re-verifies the license file."""
     return _int("LICENSE_CHECK_INTERVAL_SECONDS", "3600")

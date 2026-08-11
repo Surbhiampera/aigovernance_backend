@@ -60,6 +60,24 @@ services:
       # Required to call POST /license/upload for renewal on this deployment.
       # Set a real, unique-per-client value in .env — never commit it.
       GOVERNANCE_MASTER_KEY: ${GOVERNANCE_MASTER_KEY:?set a real admin key in .env}
+
+      # Optional: alerts for THIS deployment only (license renewal/expiry,
+      # DB health — see OPERATIONS.md) go to whoever you configure here.
+      # Nothing is sent anywhere, ever, unless you fill these in — no data
+      # about this client leaves their own deployment either way.
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM_EMAIL: ${SMTP_FROM_EMAIL:-}
+      NOTIFICATION_EMAIL: ${NOTIFICATION_EMAIL:-}
+      TEAMS_WEBHOOK_URLS: ${TEAMS_WEBHOOK_URLS:-}
+
+      # Opt-in DB reachability + size check (see OPERATIONS.md — does not
+      # cover host disk space or backup freshness).
+      DB_HEALTH_CHECK_ENABLED: ${DB_HEALTH_CHECK_ENABLED:-false}
+      DB_HEALTH_CHECK_INTERVAL_SECONDS: ${DB_HEALTH_CHECK_INTERVAL_SECONDS:-3600}
+      DB_SIZE_WARNING_GB: ${DB_SIZE_WARNING_GB:-20}
     depends_on:
       db:
         condition: service_healthy

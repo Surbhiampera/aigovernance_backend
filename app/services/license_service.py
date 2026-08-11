@@ -23,6 +23,7 @@ from app.config import (
     get_license_check_interval_seconds,
     get_license_denylist_path,
     get_license_file_path,
+    get_license_public_key_extra_paths,
     get_license_public_key_path,
     get_license_renewal_warning_days,
 )
@@ -72,6 +73,38 @@ def _read_license_token(path: str) -> str:
 def _read_public_key(path: str) -> str:
     with open(path, "r") as f:
         return f.read()
+
+
+def _public_key_paths() -> list[str]:
+    """Primary key first, then any extras configured for a key rotation in
+    progress (LICENSE_PUBLIC_KEY_EXTRA_PATHS) — see LICENSING_PACKAGING.md."""
+    return [get_license_public_key_path()] + get_license_public_key_extra_paths()
+
+
+def _read_public_keys(paths: list[str]) -> list[str]:
+    keys = []
+    for path in paths:
+        try:
+            keys.append(_read_public_key(path))
+        except OSError:
+            continue
+    if not keys:
+        raise FileNotFoundError(2, "No such file or directory", paths[0])
+    return keys
+
+
+def verify_license_any_key(token: str, public_key_pems: list[str]) -> LicenseStatus:
+    """Try each configured public key in turn — the one that verifies wins.
+    Supports rotating the signing key without invalidating licenses already
+    issued under the old one: keep both keys configured during the rotation
+    window, reissue active licenses under the new key, then drop the old one.
+    """
+    status = LicenseStatus(configured=True, valid=False, error="no public key available")
+    for pem in public_key_pems:
+        status = verify_license(token, pem)
+        if status.valid:
+            return status
+    return status
 
 
 def _license_file_mtime() -> float | None:

@@ -8,6 +8,13 @@ client's data (see the "client self-hosts everything" model).
 
 ## Backups
 
+**Hand the client `scripts/db_backup.sh` and `scripts/db_restore.sh` along
+with `docker-compose.yml` and `.env`.** They aren't baked into the image
+(the image only contains `app/`) and there's no source checkout on the
+client's side to find them in otherwise — these two plain shell scripts are
+the one extra thing beyond what `LICENSING_PACKAGING.md` lists as the
+handoff. They only need Docker to run, nothing else.
+
 ```
 ./scripts/db_backup.sh ./backups
 ```
@@ -36,6 +43,42 @@ This is entirely the client's responsibility to actually run and monitor —
 nothing in this repo schedules it automatically today (see
 `Licensing_Packaging_Status.docx` / the open-items list — automatic backup
 scheduling and off-box copies aren't built).
+
+## Alerting (license renewal + database health)
+
+Off by default — every environment variable below is opt-in, and nothing
+about a client's data ever leaves their own deployment. Set these in that
+deployment's `.env` (`docker-compose.client.yml.example` already has the
+env var lines, just fill in real values) to get email or Microsoft Teams
+alerts sent to *that client's own* configured recipients:
+
+```
+SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASSWORD / SMTP_FROM_EMAIL
+NOTIFICATION_EMAIL         # comma-separated recipients
+TEAMS_WEBHOOK_URLS         # comma-separated Incoming Webhook URLs
+```
+
+With those set:
+
+- **License renewal / expiry** — the existing hourly license check
+  (`app/scheduler.py: _job_license_check`) now also emails/Teams-notifies
+  once a day while the license is within its renewal window (`high`), and
+  once a day while it's expired or revoked (`critical`). Previously this
+  only showed up as a banner on `GET /license/status` — easy to miss if
+  nobody's actively looking at the dashboard.
+- **Database health** — opt-in separately via `DB_HEALTH_CHECK_ENABLED=true`
+  (`_job_db_health_check`, default hourly via `DB_HEALTH_CHECK_INTERVAL_SECONDS`).
+  Checks the database is reachable and alerts `critical` if not; checks its
+  logical size against `DB_SIZE_WARNING_GB` (default 20) and alerts `high`
+  if over. **Does not check host disk space or backup freshness** — those
+  aren't visible from inside the app container. A database can still fill
+  the underlying disk without this catching it; that's still on the
+  client to monitor at the host level.
+
+Both dedup to at most once per day per condition so an ongoing outage or a
+15-day renewal window doesn't spam — verified with a dedicated test suite
+(`tests/test_scheduler_notifications.py`) covering every alert path and the
+dedup behavior itself.
 
 ## Updating the application
 
