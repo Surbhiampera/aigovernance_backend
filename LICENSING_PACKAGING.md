@@ -117,15 +117,31 @@ touches any other client's image, container, or database.
 ## Revocation
 
 See the `Key Challenges` section in `Licensing_Packaging_Status.docx` — an
-issued license otherwise runs to its natural expiry. `app/services/license_service.py`
-supports a per-client denylist of revoked `license_id`s
-(`LICENSE_DENYLIST_PATH`), checked the same way as expiry, distinguished as
-a `license_revoked` 402. Because verification is fully offline by design
-(no phone-home to any vendor service), revoking only works for as long as
-you retain filesystem/API access to that one client's own deployment — the
-same access renewal already assumes. If a client has cut off that access
-too, no code-level fix restores it; that's an inherent boundary of an
-offline-verified system, not something specific to this implementation.
+issued license otherwise runs to its natural expiry.
+
+```
+python scripts/license_revoke.py \
+    --host https://acme.clients.example.com \
+    --admin-key <acme's admin API key> \
+    --license-id acme-2026 \
+    --reason "contract ended 2026-08-01"
+```
+
+This calls that client's own `POST /license/revoke` — the same admin API
+key renewal already requires is all that's needed; no filesystem or docker
+access to their box, no rebuild. It writes the `license_id` to a local
+denylist (`LICENSE_DENYLIST_PATH`) and re-verifies immediately, visible to
+every worker on its next request (same mechanism as renewal). The freeze
+this produces is distinguished from an ordinary expiry as a `license_revoked`
+402, and `/license/upload` refuses to re-install an already-revoked license.
+Only ever affects the one deployment you point it at.
+
+Because verification is fully offline by design (no phone-home to any
+vendor service), this only works for as long as you retain admin API
+access to that one client's own deployment. If a client has revoked or
+firewalled off your admin key too, no code-level fix restores access;
+that's an inherent boundary of an offline-verified system, not something
+specific to this implementation.
 
 ## What's still open
 

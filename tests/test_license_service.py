@@ -1,4 +1,5 @@
 """Licensed, expiring downloadable package (proposal §2.5)."""
+import dataclasses
 import datetime
 
 import jwt
@@ -124,6 +125,91 @@ def test_refresh_license_status_reads_valid_file(monkeypatch, tmp_path, keypair)
 
     assert status.valid is True
     assert status.analytics_frozen is False
+
+
+def test_refresh_license_status_detects_revoked_license(monkeypatch, tmp_path, keypair):
+    private_pem, public_pem = keypair
+    license_path = tmp_path / "license.lic"
+    public_key_path = tmp_path / "public.pem"
+    denylist_path = tmp_path / "denylist.txt"
+    license_path.write_text(_issue(private_pem, days=365, license_id="revoked-id"))
+    public_key_path.write_text(public_pem)
+    denylist_path.write_text("revoked-id  # revoked for testing\n")
+
+    monkeypatch.setattr(license_service, "get_license_file_path", lambda: str(license_path))
+    monkeypatch.setattr(license_service, "get_license_public_key_path", lambda: str(public_key_path))
+    monkeypatch.setattr(license_service, "get_license_denylist_path", lambda: str(denylist_path))
+
+    status = license_service.refresh_license_status()
+
+    assert status.valid is True
+    assert status.revoked is True
+    assert status.analytics_frozen is True
+
+
+def test_refresh_license_status_unrelated_denylist_entry_is_ignored(monkeypatch, tmp_path, keypair):
+    """A denylist with OTHER clients' revoked ids must not affect this one."""
+    private_pem, public_pem = keypair
+    license_path = tmp_path / "license.lic"
+    public_key_path = tmp_path / "public.pem"
+    denylist_path = tmp_path / "denylist.txt"
+    license_path.write_text(_issue(private_pem, days=365, license_id="still-good"))
+    public_key_path.write_text(public_pem)
+    denylist_path.write_text("someone-elses-license\nanother-one\n")
+
+    monkeypatch.setattr(license_service, "get_license_file_path", lambda: str(license_path))
+    monkeypatch.setattr(license_service, "get_license_public_key_path", lambda: str(public_key_path))
+    monkeypatch.setattr(license_service, "get_license_denylist_path", lambda: str(denylist_path))
+
+    status = license_service.refresh_license_status()
+
+    assert status.revoked is False
+    assert status.analytics_frozen is False
+
+
+def test_enforce_license_raises_402_when_revoked(monkeypatch, keypair):
+    from fastapi import HTTPException
+
+    private_pem, public_pem = keypair
+    base_status = license_service.verify_license(_issue(private_pem, days=365, license_id="rev-1"), public_pem)
+    revoked_status = dataclasses.replace(base_status, revoked=True)
+
+    monkeypatch.setattr("app.routers.license.get_license_enforcement_enabled", lambda: True)
+    monkeypatch.setattr(license_service, "get_cached_license_status", lambda: revoked_status)
+
+    with pytest.raises(HTTPException) as exc_info:
+        enforce_license()
+
+    assert exc_info.value.status_code == 402
+    assert exc_info.value.detail["error"] == "license_revoked"
+
+
+def test_revoke_endpoint_freezes_only_this_deployment(monkeypatch, tmp_path, keypair, client):
+    private_pem, public_pem = keypair
+    license_path = tmp_path / "license.lic"
+    public_key_path = tmp_path / "public.pem"
+    denylist_path = tmp_path / "denylist.txt"
+    license_path.write_text(_issue(private_pem, days=365, license_id="to-revoke"))
+    public_key_path.write_text(public_pem)
+
+    monkeypatch.setattr(license_service, "get_license_file_path", lambda: str(license_path))
+    monkeypatch.setattr(license_service, "get_license_public_key_path", lambda: str(public_key_path))
+    monkeypatch.setattr(license_service, "get_license_denylist_path", lambda: str(denylist_path))
+    monkeypatch.setattr("app.routers.license.get_license_denylist_path", lambda: str(denylist_path))
+    monkeypatch.setattr("app.routers.license.get_license_enforcement_enabled", lambda: True)
+    monkeypatch.setenv("GOVERNANCE_MASTER_KEY", "test-master-key")
+
+    response = client.post(
+        "/license/revoke",
+        json={"license_id": "to-revoke", "reason": "test"},
+        headers={"X-API-Key": "test-master-key"},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["revoked"] is True
+    assert data["analytics_frozen"] is True
+    assert "to-revoke" in denylist_path.read_text()
 
 
 def test_enforce_license_noop_when_enforcement_disabled(monkeypatch):
