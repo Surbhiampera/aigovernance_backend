@@ -1,0 +1,68 @@
+# Per-client deployment — copy this file (as docker-compose.yml) to the
+# infrastructure you're standing up for ONE client. It only needs this file,
+# a .env with real secrets, and the image tag scripts/license_build_image.py
+# built for that client — no source checkout required on their side.
+#
+# Nothing here is shared with any other client: its own image (license baked
+# in), its own database, its own volume, its own containers. Two clients
+# never touch the same running stack, so there's no way for one client's
+# renewal, revocation, or data to affect another's.
+#
+# Usage:
+#   cp docker-compose.client.yml.example docker-compose.yml
+#   # edit the image: line below to this client's tag
+#   docker compose up -d
+
+services:
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: aigovernance
+      POSTGRES_USER: aigovuser
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set a real password in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aigovuser -d aigovernance"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    # Built once per client via scripts/license_build_image.py — replace with
+    # this client's actual tag, e.g. aigovernance-backend:acme-2026.
+    image: aigovernance-backend:REPLACE_WITH_THIS_CLIENTS_TAG
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://aigovuser:${POSTGRES_PASSWORD:?set a real password in .env}@db:5432/aigovernance
+
+      AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY:-}
+      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT:-}
+      AZURE_OPENAI_DEPLOYMENT_NAME: ${AZURE_OPENAI_DEPLOYMENT_NAME:-}
+      AZURE_OPENAI_API_VERSION: ${AZURE_OPENAI_API_VERSION:-2024-02-01}
+
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+      SCHEDULER_MAX_WORKERS: ${SCHEDULER_MAX_WORKERS:-2}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+      ALERT_BUDGET_DEFAULT_THRESHOLD_PCT: ${ALERT_BUDGET_DEFAULT_THRESHOLD_PCT:-80}
+      ANOMALY_SPIKE_RATIO: ${ANOMALY_SPIKE_RATIO:-1.8}
+
+      # LICENSE_ENFORCEMENT_ENABLED is baked into this client's image
+      # (Dockerfile.client) — not set here.
+      LICENSE_CHECK_INTERVAL_SECONDS: ${LICENSE_CHECK_INTERVAL_SECONDS:-3600}
+      LICENSE_RENEWAL_WARNING_DAYS: ${LICENSE_RENEWAL_WARNING_DAYS:-15}
+
+      # Required to call POST /license/upload for renewal on this deployment.
+      # Set a real, unique-per-client value in .env — never commit it.
+      GOVERNANCE_MASTER_KEY: ${GOVERNANCE_MASTER_KEY:?set a real admin key in .env}
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  postgres_data:

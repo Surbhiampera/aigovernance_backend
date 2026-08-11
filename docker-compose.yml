@@ -16,11 +16,15 @@ services:
       timeout: 5s
       retries: 5
 
-  # ── AI Governance Backend ─────────────────────────────────────────────────────
+  # ── AI Governance Backend (shared/base image — unlicensed) ────────────────────
+  # A specific client's own image (license baked in, see LICENSING_PACKAGING.md
+  # and docker-compose.client.yml.example) is built FROM this one via
+  # Dockerfile.client / scripts/license_build_image.py — hence the fixed tag.
   backend:
     build:
       context: .
       dockerfile: Dockerfile
+    image: aigovernance-backend:base
     restart: unless-stopped
     ports:
       - "8000:8000"
@@ -42,10 +46,9 @@ services:
       ALERT_BUDGET_DEFAULT_THRESHOLD_PCT: ${ALERT_BUDGET_DEFAULT_THRESHOLD_PCT:-80}
       ANOMALY_SPIKE_RATIO: ${ANOMALY_SPIKE_RATIO:-1.8}
 
-      # Licensed/packaged per-client deployments only (see LICENSING_PACKAGING.md).
-      # Off by default: the shared platform deployment never sets this and the
-      # ./license mount below stays empty and unused.
-      LICENSE_ENFORCEMENT_ENABLED: ${LICENSE_ENFORCEMENT_ENABLED:-false}
+      # This is the shared/base image — never licensed. A client's own image
+      # (built via scripts/license_build_image.py) hardcodes
+      # LICENSE_ENFORCEMENT_ENABLED=true itself; nothing to set here.
       LICENSE_CHECK_INTERVAL_SECONDS: ${LICENSE_CHECK_INTERVAL_SECONDS:-3600}
       LICENSE_RENEWAL_WARNING_DAYS: ${LICENSE_RENEWAL_WARNING_DAYS:-15}
 
@@ -53,10 +56,6 @@ services:
       # at all on a fresh deployment (no per-org API keys exist yet). Set per
       # deployment in .env; never commit a real value.
       GOVERNANCE_MASTER_KEY: ${GOVERNANCE_MASTER_KEY:-}
-    volumes:
-      # Per-client license material lives here, outside the image, so the
-      # same built image works for every client — see LICENSING_PACKAGING.md.
-      - ./license:/app/license
     depends_on:
       db:
         condition: service_healthy

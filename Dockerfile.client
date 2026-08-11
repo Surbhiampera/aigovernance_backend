@@ -1,0 +1,20 @@
+# Builds ONE client's own dedicated image — never a shared image with a
+# runtime-mounted license. The client's license.lic and the (non-secret)
+# signing public key are baked in at build time, so each client's image is
+# fully self-contained and cannot be started against another client's
+# license by accident. See LICENSING_PACKAGING.md and
+# scripts/license_build_image.py, which drives this build.
+#
+# Requires the base image already built:
+#   docker build -t aigovernance-backend:base .
+ARG BASE_IMAGE=aigovernance-backend:base
+FROM ${BASE_IMAGE}
+
+# Build context is a per-client staging dir containing exactly these two
+# files (and optionally a denylist) — see scripts/license_build_image.py.
+COPY --chown=appuser:appuser license_public_key.pem /app/license/license_public_key.pem
+COPY --chown=appuser:appuser license.lic /app/license/license.lic
+
+# Enforcement is only ever turned on for a client's own image — the base
+# image and docker-compose.yml (shared platform / dev) leave this false.
+ENV LICENSE_ENFORCEMENT_ENABLED=true
