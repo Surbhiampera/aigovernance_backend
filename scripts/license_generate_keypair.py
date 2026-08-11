@@ -2,14 +2,16 @@
 
 Run this ONCE, ever (per signing identity) — not per customer, not per
 license. Keep the private key on the machine that issues licenses; it is
-never shipped to a customer. The public key ships inside every packaged
-image so it can verify licenses fully offline.
+never shipped to a customer. The public key is mounted alongside each
+deployment's license.lic (see LICENSING_PACKAGING.md / scripts/license_deploy.py)
+— it is never baked into the image, so rotating the signing key later never
+requires rebuilding or re-shipping the image itself.
 
     python scripts/license_generate_keypair.py
 
 Writes:
     license_private_key.pem  — KEEP SECRET. Never commit, never ship.
-    license_public_key.pem   — bake into the packaged container image.
+    license_public_key.pem   — ships to every client's ./license mount dir.
 """
 import argparse
 

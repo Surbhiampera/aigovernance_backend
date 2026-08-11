@@ -35,6 +35,14 @@ Thumbs.db
 # Docker volumes (local state)
 pgdata/
 
+# Licensing key/license material — never commit signing keys or client licenses
+*.pem
+*.lic
+license_private_key.pem
+license_public_key.pem
+license.lic
+/license/
+
 # Logs
 *.log
 governance-platform

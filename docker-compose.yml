@@ -41,6 +41,17 @@ services:
       # Alert / anomaly thresholds (all have defaults in config.py)
       ALERT_BUDGET_DEFAULT_THRESHOLD_PCT: ${ALERT_BUDGET_DEFAULT_THRESHOLD_PCT:-80}
       ANOMALY_SPIKE_RATIO: ${ANOMALY_SPIKE_RATIO:-1.8}
+
+      # Licensed/packaged per-client deployments only (see LICENSING_PACKAGING.md).
+      # Off by default: the shared platform deployment never sets this and the
+      # ./license mount below stays empty and unused.
+      LICENSE_ENFORCEMENT_ENABLED: ${LICENSE_ENFORCEMENT_ENABLED:-false}
+      LICENSE_CHECK_INTERVAL_SECONDS: ${LICENSE_CHECK_INTERVAL_SECONDS:-3600}
+      LICENSE_RENEWAL_WARNING_DAYS: ${LICENSE_RENEWAL_WARNING_DAYS:-15}
+    volumes:
+      # Per-client license material lives here, outside the image, so the
+      # same built image works for every client — see LICENSING_PACKAGING.md.
+      - ./license:/app/license
     depends_on:
       db:
         condition: service_healthy
