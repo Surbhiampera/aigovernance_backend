@@ -32,10 +32,11 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 
 COPY app/ ./app/
 
-# Mount point for per-client licensing (see LICENSING_PACKAGING.md). Same
-# image ships to every client — only what's mounted here differs. Created
-# and chowned up front so a bind-mounted host dir or a fresh named volume
-# is writable by appuser without extra setup on the deploying side.
+# Destination for a specific client's license material, baked in by
+# Dockerfile.client (see LICENSING_PACKAGING.md) — this base image is never
+# shipped to a client directly. Created and chowned up front so appuser can
+# both read the baked-in files and write renewals/revocations at runtime
+# without extra setup.
 RUN mkdir -p /app/license
 
 RUN adduser --disabled-password --no-create-home appuser \
@@ -49,7 +50,8 @@ ENV PORT=8000
 # false (see app/config.py) unless a per-client deployment turns it on, so
 # these path defaults are inert for the standard shared-platform image.
 ENV LICENSE_FILE_PATH=/app/license/license.lic \
-    LICENSE_PUBLIC_KEY_PATH=/app/license/license_public_key.pem
+    LICENSE_PUBLIC_KEY_PATH=/app/license/license_public_key.pem \
+    LICENSE_DENYLIST_PATH=/app/license/license_denylist.txt
 
 EXPOSE 8000
 
