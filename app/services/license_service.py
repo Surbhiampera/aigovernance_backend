@@ -21,6 +21,7 @@ import jwt
 
 from app.config import (
     get_license_check_interval_seconds,
+    get_license_denylist_path,
     get_license_file_path,
     get_license_public_key_path,
     get_license_renewal_warning_days,
@@ -36,6 +37,7 @@ class LicenseStatus:
     configured: bool = False  # a license file + public key were found and parsed
     valid: bool = False       # signature verified (may still be expired)
     expired: bool = False
+    revoked: bool = False     # license_id appears on the local denylist — see scripts/license_revoke.py
     license_id: str | None = None
     customer: str | None = None
     features: list[str] = dataclasses.field(default_factory=list)

@@ -307,3 +307,12 @@ def get_license_check_interval_seconds() -> int:
 def get_license_renewal_warning_days() -> int:
     """Days before expiry at which the admin dashboard shows a renewal banner."""
     return _int("LICENSE_RENEWAL_WARNING_DAYS", "15")
+
+
+def get_license_denylist_path() -> str:
+    """Path to a newline-separated list of revoked license_ids, if any.
+
+    Missing file is normal (nothing revoked) — only used to cut a client off
+    before their license's natural expiry. See scripts/license_revoke.py.
+    """
+    return os.getenv("LICENSE_DENYLIST_PATH", "license_denylist.txt")
