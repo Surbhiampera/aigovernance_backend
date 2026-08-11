@@ -1,19 +1,28 @@
-"""License status + renewal for packaged/licensed deployments (proposal §2.5).
+"""License status, renewal, and revocation for one client's own deployment.
 
-Two things live here:
+Three things live here:
   - GET  /license/status  — always reachable, even when the license has
     lapsed, so the admin UI can render the renewal banner / frozen state.
   - POST /license/upload  — lets an admin install a renewed license file
     without shell access to the box the package runs on.
+  - POST /license/revoke  — lets an admin cut this deployment's own license
+    off early, before its natural expiry, using nothing but the same admin
+    API key renewal already requires — no filesystem/docker access needed.
+
+This all operates on exactly one client's own container. There is nothing
+shared between deployments (see LICENSING_PACKAGING.md) — revoking or
+renewing here never touches any other client.
 
 `enforce_license` is the dependency other routers are gated behind (wired up
 in app/main.py) — it never applies to the proxy router.
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+import datetime
 
-from app.config import get_license_enforcement_enabled, get_license_file_path
+from fastapi import APIRouter, Body, Depends, HTTPException, UploadFile, File
+
+from app.config import get_license_denylist_path, get_license_enforcement_enabled, get_license_file_path
 from app.core.deps import require_role
 from app.services import license_service
 
@@ -89,4 +98,23 @@ async def upload_license(
         raise HTTPException(status_code=400, detail=f"Uploaded file is not a valid license: {status.error}")
     if status.revoked:
         raise HTTPException(status_code=400, detail=f"Uploaded license '{status.license_id}' is on the revocation list")
+    return _status_payload()
+
+
+@router.post("/revoke")
+async def revoke_license(
+    license_id: str = Body(..., embed=True),
+    reason: str = Body("", embed=True),
+    _key=Depends(require_role("admin")),
+):
+    """Revoke a license_id on this deployment — cuts this client off before
+    their license's natural expiry. Takes effect immediately (this endpoint
+    itself refreshes the cache; every other worker picks it up on its next
+    request, same as /upload). Only ever affects this one container.
+    """
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    comment = f"  # revoked {now}" + (f" — {reason}" if reason else "")
+    with open(get_license_denylist_path(), "a") as f:
+        f.write(f"{license_id}{comment}\n")
+    license_service.refresh_license_status()
     return _status_payload()

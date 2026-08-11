@@ -22,6 +22,10 @@ running container at /license/upload (admin API key) — takes effect
 immediately, no downtime. Re-run this script with the renewed .lic at your
 next release so a freshly (re)started container also starts already-renewed
 instead of reverting to the license baked in at the last build.
+
+Revoking a client early (before their license's natural expiry) doesn't
+need a rebuild at all — see scripts/license_revoke.py, which calls that
+client's own POST /license/revoke.
 """
 import argparse
 import shutil
@@ -39,7 +43,6 @@ def main() -> None:
     parser.add_argument("--public-key", required=True, help="license_public_key.pem (same for every client)")
     parser.add_argument("--image-tag", required=True, help="e.g. aigovernance-backend:acme-2026")
     parser.add_argument("--base-image", default="aigovernance-backend:base")
-    parser.add_argument("--denylist", default=None, help="Optional revoked-license-ids file for this client (see license_revoke.py)")
     parser.add_argument("--customer", default=None, help="Display name, printed only")
     args = parser.parse_args()
 
@@ -49,14 +52,6 @@ def main() -> None:
         shutil.copyfile(args.license_file, tmp_path / "license.lic")
 
         dockerfile = REPO_ROOT / "Dockerfile.client"
-        if args.denylist:
-            shutil.copyfile(args.denylist, tmp_path / "license_denylist.txt")
-            dockerfile_text = dockerfile.read_text()
-            dockerfile_text += (
-                "\nCOPY --chown=appuser:appuser license_denylist.txt /app/license/license_denylist.txt\n"
-            )
-            dockerfile = tmp_path / "Dockerfile.client.with_denylist"
-            dockerfile.write_text(dockerfile_text)
 
         cmd = [
             "docker", "build",
