@@ -188,8 +188,8 @@ def refresh_license_status() -> LicenseStatus:
     global _cached_status, _cached_mtime, _cached_denylist_mtime, _cache_populated
     try:
         token = _read_license_token(get_license_file_path())
-        public_key_pem = _read_public_key(get_license_public_key_path())
-        status = verify_license(token, public_key_pem)
+        public_key_pems = _read_public_keys(_public_key_paths())
+        status = verify_license_any_key(token, public_key_pems)
     except FileNotFoundError as exc:
         status = LicenseStatus(configured=False, error=f"license not installed: {exc.filename}")
     except OSError as exc:
