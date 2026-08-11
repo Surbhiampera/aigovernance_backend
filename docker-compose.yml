@@ -23,7 +23,7 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "8801:8000"
     environment:
       DATABASE_URL: postgresql://aigovuser:aigovpass@db:5432/aigovernance
 
@@ -48,6 +48,11 @@ services:
       LICENSE_ENFORCEMENT_ENABLED: ${LICENSE_ENFORCEMENT_ENABLED:-false}
       LICENSE_CHECK_INTERVAL_SECONDS: ${LICENSE_CHECK_INTERVAL_SECONDS:-3600}
       LICENSE_RENEWAL_WARNING_DAYS: ${LICENSE_RENEWAL_WARNING_DAYS:-15}
+
+      # Admin bootstrap key — required for POST /license/upload to be callable
+      # at all on a fresh deployment (no per-org API keys exist yet). Set per
+      # deployment in .env; never commit a real value.
+      GOVERNANCE_MASTER_KEY: ${GOVERNANCE_MASTER_KEY:-}
     volumes:
       # Per-client license material lives here, outside the image, so the
       # same built image works for every client — see LICENSING_PACKAGING.md.

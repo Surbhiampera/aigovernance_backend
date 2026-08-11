@@ -14,6 +14,7 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import logging
+import os
 import threading
 
 import jwt
@@ -55,6 +56,8 @@ class LicenseStatus:
 
 _lock = threading.Lock()
 _cached_status = LicenseStatus(error="not checked yet")
+_cache_populated = False
+_cached_mtime: float | None = None  # mtime of the license file as of the last refresh
 
 
 def _read_license_token(path: str) -> str:
