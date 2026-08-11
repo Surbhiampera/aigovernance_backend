@@ -316,3 +316,27 @@ def get_license_denylist_path() -> str:
     before their license's natural expiry. See scripts/license_revoke.py.
     """
     return os.getenv("LICENSE_DENYLIST_PATH", "license_denylist.txt")
+
+
+# ── Self-hosted DB health check (opt-in) ────────────────────────────────────
+# For a client's own self-hosted deployment (see OPERATIONS.md) — checks
+# that the database is reachable and hasn't grown past a sanity threshold,
+# and alerts via app.services.notification_service using that deployment's
+# own SMTP/Teams credentials. Does NOT check host disk space or backup
+# freshness — those aren't visible from inside the app container; see
+# OPERATIONS.md for what's still manual.
+def get_db_health_check_enabled() -> bool:
+    return os.getenv("DB_HEALTH_CHECK_ENABLED", "false").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def get_db_health_check_interval_seconds() -> int:
+    return _int("DB_HEALTH_CHECK_INTERVAL_SECONDS", "3600")
+
+
+def get_db_size_warning_gb() -> float:
+    """Logical database size (pg_database_size) above which to warn — a rough
+    proxy for "might be approaching disk limits soon", not a direct disk
+    check."""
+    return float(os.getenv("DB_SIZE_WARNING_GB", "20"))

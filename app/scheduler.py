@@ -10,6 +10,9 @@ from apscheduler.executors.pool import ThreadPoolExecutor
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from app.config import (
+    get_db_health_check_enabled,
+    get_db_health_check_interval_seconds,
+    get_db_size_warning_gb,
     get_license_check_interval_seconds,
     get_license_enforcement_enabled,
     get_scheduler_max_workers,
@@ -23,7 +26,32 @@ _last_success: dict[str, "datetime.datetime | None"] = {
     "daily_agg": None,
     "monthly_agg": None,
     "license_check": None,
+    "db_health_check": None,
 }
+
+# Per-process, once-a-day dedup so a 15-day renewal window or an ongoing
+# outage doesn't send a notification every single scheduler tick — each
+# uvicorn worker tracks this independently, so a duplicate at most once per
+# worker per day is possible; accepted as a minor tradeoff over adding
+# cross-worker coordination for a low-volume alert.
+_last_notified_date: dict[str, "datetime.date | None"] = {
+    "license_renewal": None,
+    "license_expired": None,
+    "db_unreachable": None,
+    "db_size_warning": None,
+}
+
+
+def _notify_once_per_day(key: str, alert_type: str, severity: str, message: str) -> None:
+    import datetime
+
+    from app.services.notification_service import notification_service
+
+    today = datetime.date.today()
+    if _last_notified_date.get(key) == today:
+        return
+    notification_service.notify(alert_type, severity, message)
+    _last_notified_date[key] = today
 
 
 def get_scheduler_heartbeat() -> dict:
@@ -65,13 +93,62 @@ def _job_daily_aggregation() -> None:
 
 
 def _job_license_check() -> None:
-    """Re-verify the license file so expiry/renewal is caught without a restart."""
+    """Re-verify the license file so expiry/renewal is caught without a restart,
+    and notify (email/Teams) once a day while it's expired or in the renewal
+    window — this deployment's own SMTP/Teams credentials, nobody else's."""
     import datetime
 
     from app.services.license_service import refresh_license_status
 
-    refresh_license_status()
+    status = refresh_license_status()
+
+    if status.expired or status.revoked:
+        reason = "revoked" if status.revoked else "expired"
+        _notify_once_per_day(
+            "license_expired", "license_expired", "critical",
+            f"License for customer={status.customer} (license_id={status.license_id}) is {reason}. "
+            "The admin dashboard is frozen until a new license is installed; AI traffic is unaffected.",
+        )
+    elif status.show_renewal_banner:
+        _notify_once_per_day(
+            "license_renewal", "license_renewal", "high",
+            f"License for customer={status.customer} (license_id={status.license_id}) expires in "
+            f"{status.days_until_expiry} day(s). Renew via POST /license/upload before it lapses.",
+        )
+
     _last_success["license_check"] = datetime.datetime.utcnow()
+
+
+def _job_db_health_check() -> None:
+    """Check the database is reachable and hasn't grown past a sanity
+    threshold; notify on failure. Does not (cannot, from in here) check host
+    disk space or backup freshness — see OPERATIONS.md."""
+    import datetime
+
+    from sqlalchemy import text
+
+    from app.database import SessionLocal
+
+    db = SessionLocal()
+    try:
+        size_bytes = db.execute(text("SELECT pg_database_size(current_database())")).scalar()
+        _last_success["db_health_check"] = datetime.datetime.utcnow()
+
+        size_gb = size_bytes / (1024 ** 3)
+        warning_gb = get_db_size_warning_gb()
+        if size_gb >= warning_gb:
+            _notify_once_per_day(
+                "db_size_warning", "db_size_warning", "high",
+                f"Database size is {size_gb:.1f} GB, at or above the {warning_gb:.0f} GB warning "
+                "threshold (DB_SIZE_WARNING_GB). Check disk space on this host.",
+            )
+    except Exception as exc:
+        _notify_once_per_day(
+            "db_unreachable", "db_unreachable", "critical",
+            f"Database health check failed: {exc}",
+        )
+    finally:
+        db.close()
 
 
 def _job_monthly_aggregation() -> None:
@@ -113,6 +190,11 @@ def start_scheduler() -> BackgroundScheduler:
         _scheduler.add_job(
             _job_license_check, "interval", seconds=get_license_check_interval_seconds(),
             id="license_check", replace_existing=True,
+        )
+    if get_db_health_check_enabled():
+        _scheduler.add_job(
+            _job_db_health_check, "interval", seconds=get_db_health_check_interval_seconds(),
+            id="db_health_check", replace_existing=True,
         )
     _scheduler.start()
     return _scheduler
