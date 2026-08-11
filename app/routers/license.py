@@ -31,19 +31,22 @@ def enforce_license() -> None:
         return
     status = license_service.get_cached_license_status()
     if status.analytics_frozen:
-        raise HTTPException(
-            status_code=402,
-            detail={
-                "error": "license_expired" if status.expired else "license_invalid",
-                "message": (
-                    "This license has expired. AI traffic is unaffected, but the "
-                    "admin dashboard is frozen until it's renewed."
-                    if status.expired else
-                    "No valid license is installed. The admin dashboard is frozen "
-                    "until a valid license is installed."
-                ),
-            },
-        )
+        if status.revoked:
+            error, message = "license_revoked", (
+                "This license has been revoked. AI traffic is unaffected, but the "
+                "admin dashboard is frozen until a new license is installed."
+            )
+        elif status.expired:
+            error, message = "license_expired", (
+                "This license has expired. AI traffic is unaffected, but the "
+                "admin dashboard is frozen until it's renewed."
+            )
+        else:
+            error, message = "license_invalid", (
+                "No valid license is installed. The admin dashboard is frozen "
+                "until a valid license is installed."
+            )
+        raise HTTPException(status_code=402, detail={"error": error, "message": message})
 
 
 def _status_payload() -> dict:
@@ -53,6 +56,7 @@ def _status_payload() -> dict:
         "configured": s.configured,
         "valid": s.valid,
         "expired": s.expired,
+        "revoked": s.revoked,
         "analytics_frozen": s.analytics_frozen if get_license_enforcement_enabled() else False,
         "license_id": s.license_id,
         "customer": s.customer,
@@ -83,4 +87,6 @@ async def upload_license(
     status = license_service.refresh_license_status()
     if not status.valid:
         raise HTTPException(status_code=400, detail=f"Uploaded file is not a valid license: {status.error}")
+    if status.revoked:
+        raise HTTPException(status_code=400, detail=f"Uploaded license '{status.license_id}' is on the revocation list")
     return _status_payload()
