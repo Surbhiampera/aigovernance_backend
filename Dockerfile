@@ -32,11 +32,24 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 
 COPY app/ ./app/
 
-RUN adduser --disabled-password --no-create-home appuser
+# Mount point for per-client licensing (see LICENSING_PACKAGING.md). Same
+# image ships to every client — only what's mounted here differs. Created
+# and chowned up front so a bind-mounted host dir or a fresh named volume
+# is writable by appuser without extra setup on the deploying side.
+RUN mkdir -p /app/license
+
+RUN adduser --disabled-password --no-create-home appuser \
+    && chown appuser:appuser /app/license
 USER appuser
 
 # Azure App Service injects PORT at runtime; default to 8000 for local runs
 ENV PORT=8000
+
+# Licensed/packaged deployments only: LICENSE_ENFORCEMENT_ENABLED stays
+# false (see app/config.py) unless a per-client deployment turns it on, so
+# these path defaults are inert for the standard shared-platform image.
+ENV LICENSE_FILE_PATH=/app/license/license.lic \
+    LICENSE_PUBLIC_KEY_PATH=/app/license/license_public_key.pem
 
 EXPOSE 8000
 
