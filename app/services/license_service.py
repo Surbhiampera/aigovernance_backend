@@ -70,6 +70,13 @@ def _read_public_key(path: str) -> str:
         return f.read()
 
 
+def _license_file_mtime() -> float | None:
+    try:
+        return os.stat(get_license_file_path()).st_mtime
+    except OSError:
+        return None
+
+
 def verify_license(token: str, public_key_pem: str) -> LicenseStatus:
     """Verify a license JWT's signature and expiry against *public_key_pem*.
 
@@ -116,7 +123,7 @@ def refresh_license_status() -> LicenseStatus:
     license file freezes the dashboard (via analytics_frozen) but must never
     crash the process or touch the proxy path.
     """
-    global _cached_status
+    global _cached_status, _cached_mtime, _cache_populated
     try:
         token = _read_license_token(get_license_file_path())
         public_key_pem = _read_public_key(get_license_public_key_path())
@@ -128,6 +135,8 @@ def refresh_license_status() -> LicenseStatus:
 
     with _lock:
         _cached_status = status
+        _cached_mtime = _license_file_mtime()
+        _cache_populated = True
 
     if not status.valid:
         _log.warning("License check: %s", status.error)
@@ -147,5 +156,20 @@ def now_minus(expires_at: datetime.datetime | None) -> str:
 
 
 def get_cached_license_status() -> LicenseStatus:
+    """Return the cached status, transparently refreshing first if the license
+    file on disk has changed since it was last read.
+
+    Each uvicorn worker holds its own in-memory cache — with no cross-worker
+    signal when one worker handles a POST /license/upload, the others would
+    otherwise keep serving a stale (possibly frozen) status until their own
+    hourly scheduler tick. Comparing mtime is a cheap stat() on every call in
+    the common case, and only triggers a full re-verify when the file has
+    actually changed, so a renewal is visible to every worker on its next
+    request rather than up to an hour later.
+    """
     with _lock:
-        return _cached_status
+        populated, known_mtime = _cache_populated, _cached_mtime
+    if populated and _license_file_mtime() == known_mtime:
+        with _lock:
+            return _cached_status
+    return refresh_license_status()

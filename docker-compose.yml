@@ -23,7 +23,7 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     ports:
-      - "8801:8000"
+      - "8000:8000"
     environment:
       DATABASE_URL: postgresql://aigovuser:aigovpass@db:5432/aigovernance
 
