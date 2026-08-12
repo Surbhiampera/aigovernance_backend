@@ -1,0 +1,4 @@
+// Enables apt's daily package list update + unattended-upgrades run.
+// Copy alongside 50unattended-upgrades to /etc/apt/apt.conf.d/.
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";

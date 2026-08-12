@@ -1,0 +1,26 @@
+// Starter config for Debian/Ubuntu's own "unattended-upgrades" package —
+// this is Canonical/Debian's maintained tool, not something built by us.
+// We're only providing a conservative starting point. Review before use.
+//
+// Install: sudo apt-get install unattended-upgrades
+// Copy this file to: /etc/apt/apt.conf.d/50unattended-upgrades
+// Also copy 20auto-upgrades (same directory) to actually enable it.
+//
+// See scripts/os_patch_check.sh for an alert-only alternative that
+// doesn't apply anything automatically, if you'd rather review manually.
+
+Unattended-Upgrade::Origins-Pattern {
+    "origin=Debian,codename=${distro_codename}-security";
+    "origin=Ubuntu,codename=${distro_codename}-security";
+};
+
+// Never reboot automatically — a production box rebooting itself
+// unattended is exactly the risk this whole approach exists to avoid.
+// Kernel updates still apply; you just choose when to reboot into them.
+Unattended-Upgrade::Automatic-Reboot "false";
+
+// Keep disk tidy after upgrades.
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+
+// Log what happened so it's auditable.
+Unattended-Upgrade::SyslogEnable "true";
