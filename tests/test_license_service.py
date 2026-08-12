@@ -127,6 +127,65 @@ def test_refresh_license_status_reads_valid_file(monkeypatch, tmp_path, keypair)
     assert status.analytics_frozen is False
 
 
+def _keypair():
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private_pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+    public_pem = key.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode()
+    return private_pem, public_pem
+
+
+def test_verify_license_any_key_tries_each_key_in_turn():
+    old_private, old_public = _keypair()
+    new_private, new_public = _keypair()
+
+    token_signed_by_old_key = _issue(old_private, days=365)
+
+    # Only the new key configured — old-key license must NOT verify.
+    status = license_service.verify_license_any_key(token_signed_by_old_key, [new_public])
+    assert status.valid is False
+
+    # Rotation window: both keys configured — old-key license still verifies.
+    status = license_service.verify_license_any_key(token_signed_by_old_key, [new_public, old_public])
+    assert status.valid is True
+
+    # A license freshly issued under the new key also verifies against the
+    # same [new, old] list — order doesn't matter, first match wins.
+    token_signed_by_new_key = _issue(new_private, days=365, license_id="new-key-license")
+    status = license_service.verify_license_any_key(token_signed_by_new_key, [new_public, old_public])
+    assert status.valid is True
+    assert status.license_id == "new-key-license"
+
+
+def test_refresh_license_status_honors_extra_public_key_paths(monkeypatch, tmp_path):
+    old_private, old_public = _keypair()
+    new_private, new_public = _keypair()
+
+    license_path = tmp_path / "license.lic"
+    primary_key_path = tmp_path / "new_public.pem"   # primary = the NEW key
+    extra_key_path = tmp_path / "old_public.pem"     # extra = the OLD key, still valid during rotation
+
+    # A license issued under the OLD key, before rotation — must still work.
+    license_path.write_text(_issue(old_private, days=365, license_id="pre-rotation-license"))
+    primary_key_path.write_text(new_public)
+    extra_key_path.write_text(old_public)
+
+    monkeypatch.setattr(license_service, "get_license_file_path", lambda: str(license_path))
+    monkeypatch.setattr(license_service, "get_license_public_key_path", lambda: str(primary_key_path))
+    monkeypatch.setattr(license_service, "get_license_public_key_extra_paths", lambda: [str(extra_key_path)])
+
+    status = license_service.refresh_license_status()
+
+    assert status.valid is True
+    assert status.license_id == "pre-rotation-license"
+
+
 def test_refresh_license_status_detects_revoked_license(monkeypatch, tmp_path, keypair):
     private_pem, public_pem = keypair
     license_path = tmp_path / "license.lic"
