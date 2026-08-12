@@ -143,17 +143,61 @@ firewalled off your admin key too, no code-level fix restores access;
 that's an inherent boundary of an offline-verified system, not something
 specific to this implementation.
 
-## What's still open
+## Renewal & DB health alerting
 
-- **Renewal alerting:** the 15-day warning currently only shows on
-  `GET /license/status` — nothing emails or pings the team/client
-  automatically yet.
-- **Signing-key custody & rotation:** the private key lives wherever
-  `license_generate_keypair.py` was run, indefinitely, with no rotation
-  process. Who holds it long-term is a business decision, not just a code
-  change.
-- **Dashboard banner:** the admin UI isn't in this repo; this backend only
-  returns the raw JSON `GET /license/status` needs.
+See `OPERATIONS.md`. Set `SMTP_*`/`TEAMS_WEBHOOK_URLS` in a deployment's
+`.env` and the 15-day renewal warning (and expiry, and revocation) email or
+Teams-notify that one deployment's own configured recipients once a day —
+no longer just a banner on `GET /license/status`. Off by default; nothing
+is sent anywhere unless explicitly configured, and nothing about a client
+ever reaches you through this — it only notifies whoever *that client's*
+`.env` points at.
 
-These are tracked separately; this runbook covers what's needed to issue,
-build, ship, install, and renew one client's license today.
+## Key custody & rotation
+
+**Proposed policy** (for business sign-off — this is a recommendation, not
+a decision made on your behalf):
+
+- Store `license_private_key.pem` in a secrets manager (e.g. a cloud KMS or
+  vault product), not as a bare file on someone's laptop — it's the one
+  artifact that, if leaked, lets anyone forge a valid license for any
+  customer.
+- Restrict who can invoke `license_issue.py` (i.e., who can reach the
+  private key) to a small, named set of people — issuing a license is a
+  business action, not something every engineer needs routine access to.
+- Rotate on a fixed schedule (a reasonable starting point: yearly, or
+  immediately if the key is ever suspected compromised) rather than never.
+
+**Rotation is technically supported today**, independent of when the
+policy above gets adopted. `verify_license_any_key()`
+(`app/services/license_service.py`) tries every configured public key in
+turn, and `LICENSE_PUBLIC_KEY_EXTRA_PATHS` (comma-separated, alongside the
+primary `LICENSE_PUBLIC_KEY_PATH`) lets a deployment accept licenses signed
+by more than one key at once. A rotation looks like:
+
+1. Generate a new keypair (`license_generate_keypair.py` — use different
+   `--private-key-out`/`--public-key-out` names so the old ones aren't
+   overwritten).
+2. For each active client: add the new public key alongside the old one
+   (`LICENSE_PUBLIC_KEY_EXTRA_PATHS`) — their currently-installed,
+   old-key-signed license keeps verifying, no interruption.
+3. Reissue that client's license under the new key at your convenience
+   (`license_issue.py --private-key <new-private-key>`), install it the
+   normal way (`/license/upload` or a rebuild).
+4. Once every active client has been reissued under the new key, drop the
+   old key from `LICENSE_PUBLIC_KEY_EXTRA_PATHS` (and from where the old
+   private key is stored) on your own schedule.
+
+Tested end-to-end: `tests/test_license_service.py::test_verify_license_any_key_tries_each_key_in_turn`
+and `test_refresh_license_status_honors_extra_public_key_paths` cover a
+pre-rotation license verifying against `[new_key, old_key]` exactly as
+above.
+
+## Dashboard banner
+
+Still open. The admin UI isn't in this repo — this backend only returns
+the raw JSON `GET /license/status` needs (`analytics_frozen`,
+`show_renewal_banner`, `days_until_expiry`, etc.). Deliberately left as-is
+per an earlier decision not to build cross-deployment visibility that
+would require phone-home reporting, which conflicts with the fully-offline
+design everything else here follows.

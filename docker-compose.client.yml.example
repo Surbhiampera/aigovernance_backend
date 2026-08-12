@@ -57,6 +57,12 @@ services:
       LICENSE_CHECK_INTERVAL_SECONDS: ${LICENSE_CHECK_INTERVAL_SECONDS:-3600}
       LICENSE_RENEWAL_WARNING_DAYS: ${LICENSE_RENEWAL_WARNING_DAYS:-15}
 
+      # Only set during a signing-key rotation (see LICENSING_PACKAGING.md) —
+      # comma-separated paths to additional accepted public keys, so this
+      # client's currently-installed license keeps verifying while you
+      # reissue it under a new key. Empty normally.
+      LICENSE_PUBLIC_KEY_EXTRA_PATHS: ${LICENSE_PUBLIC_KEY_EXTRA_PATHS:-}
+
       # Required to call POST /license/upload for renewal on this deployment.
       # Set a real, unique-per-client value in .env — never commit it.
       GOVERNANCE_MASTER_KEY: ${GOVERNANCE_MASTER_KEY:?set a real admin key in .env}
