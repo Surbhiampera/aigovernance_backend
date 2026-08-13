@@ -8,12 +8,15 @@ client's data (see the "client self-hosts everything" model).
 
 ## Backups
 
-**Hand the client `scripts/db_backup.sh` and `scripts/db_restore.sh` along
-with `docker-compose.yml` and `.env`.** They aren't baked into the image
+**Hand the client `scripts/db_backup.sh`, `scripts/db_restore.sh`,
+`scripts/uptime_watchdog.sh`, `scripts/os_patch_check.sh`, and
+`scripts/lib/` (a shared helper the last two depend on) along with
+`docker-compose.yml` and `.env`.** None of these are baked into the image
 (the image only contains `app/`) and there's no source checkout on the
-client's side to find them in otherwise — these two plain shell scripts are
-the one extra thing beyond what `LICENSING_PACKAGING.md` lists as the
-handoff. They only need Docker to run, nothing else.
+client's side to find them in otherwise — these are the extra files beyond
+what `LICENSING_PACKAGING.md` lists as the handoff. They only need Docker
+and `curl` to run — no Python, no dependencies beyond what's already on any
+Linux server.
 
 ```
 ./scripts/db_backup.sh ./backups
@@ -80,6 +83,32 @@ Both dedup to at most once per day per condition so an ongoing outage or a
 (`tests/test_scheduler_notifications.py`) covering every alert path and the
 dedup behavior itself.
 
+## Uptime monitoring
+
+```
+./scripts/uptime_watchdog.sh http://localhost:8000/health 3
+```
+
+Runs **outside** the container deliberately — if the container or the host
+itself is down, nothing inside it can alert about it. Checks `/health`,
+alerts once after 3 consecutive failed checks (default; avoids alerting on
+a single blip), stays silent through the rest of an ongoing outage (no
+spam), and alerts once more on recovery. Reuses the same `SMTP_*`/
+`TEAMS_WEBHOOK_URLS` already configured in `.env` — via `curl`'s built-in
+SMTP support, not Python, since this has to work even when the app
+container (and its Python environment) is the thing that's down.
+
+Schedule it, e.g. every 5 minutes via cron on the client's host:
+
+```
+*/5 * * * * cd /path/to/this/deployment && ./scripts/uptime_watchdog.sh
+```
+
+Tested end-to-end against a real container: stopped it, confirmed silence
+below threshold, confirmed exactly one alert at threshold, confirmed
+silence through continued downtime, restarted it, confirmed exactly one
+recovery alert.
+
 ## Updating the application
 
 When the core product changes, rebuild that one client's image and
@@ -117,19 +146,39 @@ upgrade notes before doing this on a production client.
 
 ## Host OS patching
 
-**Deliberately not automated by us.** The client's server, its OS, and its
-security patches are the client's own infrastructure — we have no access to
-it by default (see `LICENSING_PACKAGING.md`), and unattended OS-level
-patching is genuinely risky to script blindly (a bad kernel or Docker
-engine update can take a production box down with no one watching). This
-is a recommendation to pass along to whoever operates the client's server,
-not something shipped in this repo:
+**Two tools, both deliberately alert-only — neither applies anything to a
+client's server automatically.** Unattended OS-level patching is genuinely
+risky to script blindly (a bad kernel or Docker engine update can take a
+production box down with no one watching), so nothing here bypasses a
+human making that call.
 
-- Keep Docker Engine itself reasonably current.
-- Enable your distro's unattended security updates (e.g. `unattended-upgrades`
-  on Debian/Ubuntu) for OS-level patches specifically, not full-system
-  auto-upgrades.
-- Reboot on your own schedule after kernel updates, not automatically.
+```
+./scripts/os_patch_check.sh
+```
+
+Checks for pending updates (Debian/Ubuntu `apt` only — reports
+"unsupported" on anything else rather than guessing at a package manager),
+and alerts (same `SMTP_*`/`TEAMS_WEBHOOK_URLS` mechanism as the uptime
+watchdog) if any are from a security pocket. Applies nothing. Schedule it
+weekly, e.g.:
+
+```
+0 6 * * 1 cd /path/to/this/deployment && ./scripts/os_patch_check.sh
+```
+
+If a client wants actual hands-off patching rather than just an alert,
+`scripts/templates/50unattended-upgrades` and `20auto-upgrades` are a
+conservative starting config for Debian/Ubuntu's own `unattended-upgrades`
+package (Canonical/Debian's maintained tool, not something we built) —
+security updates only, no automatic reboot. Copy both to
+`/etc/apt/apt.conf.d/` on their host after reviewing them; this is
+something the client opts into themselves, not something either of our
+scripts enables on its own.
+
+- Keep Docker Engine itself reasonably current (not covered by either tool
+  above — Docker's own package, not a distro security pocket).
+- Reboot on your own schedule after kernel updates, not automatically —
+  `Automatic-Reboot "false"` in the template reflects this.
 
 If you want us to manage this for a specific client, that's a different
 deployment model (us hosting their infrastructure) than what's built here —
