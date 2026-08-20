@@ -69,6 +69,7 @@ from app.services.provider_translation import (
     translate_outbound_body,
 )
 from app.services.governance_key_service import verify_governance_key
+from app.services.governance_rule_service import check_governance_rules, check_max_input_tokens
 
 from app.services.pii_engine import scan_and_mask
 from app.services.rate_limit_service import check_rate_limit, record_tokens_used
@@ -1563,6 +1564,27 @@ async def _run_pre_flight(
     t_routing_done = time.time()
 
     try:
+        check_governance_rules(
+            db=db, org_id=org_id, project_id=project_id, model=model,
+            max_output_tokens_requested=body.get("max_tokens"),
+            request_id=request_id, source_ip=source_ip,
+        )
+    except HTTPException as exc:
+        _log_blocked_request(
+            db=db, request_id=request_id, org_id=org_id, project_id=project_id,
+            key_id=key_id, source_ip=source_ip, user_agent=user_agent, trace_id=trace_id,
+            parent_request_id=parent_request_id, user_id=user_id,
+            user_email=user_email, user_role=user_role,
+            failure_code=(exc.detail.get("rule") if isinstance(exc.detail, dict) else None)
+            or "governance_rule_violation",
+            failure_reason=exc.detail.get("detail") if isinstance(exc.detail, dict) else str(exc.detail),
+            request_payload=body,
+        )
+        raise
+    except Exception as _e:
+        _log.warning("Governance rule check skipped: %s", _e)
+
+    try:
         check_budget(
             db=db, org_id=org_id, project_id=project_id,
             request_id=request_id, source_ip=source_ip, key_id=key_id,
@@ -1623,6 +1645,27 @@ async def _run_pre_flight(
     forward_body = {k: v for k, v in body.items() if k != "stream"}
     forward_body["messages"] = clean_messages
     forward_body["model"] = model
+
+    try:
+        check_max_input_tokens(
+            db=db, org_id=org_id, project_id=project_id, model=model,
+            input_tokens=_estimate_input_tokens(clean_messages, model),
+            request_id=request_id, source_ip=source_ip,
+        )
+    except HTTPException as exc:
+        _log_blocked_request(
+            db=db, request_id=request_id, org_id=org_id, project_id=project_id,
+            key_id=key_id, source_ip=source_ip, user_agent=user_agent, trace_id=trace_id,
+            parent_request_id=parent_request_id, user_id=user_id,
+            user_email=user_email, user_role=user_role,
+            failure_code=(exc.detail.get("rule") if isinstance(exc.detail, dict) else None)
+            or "governance_rule_violation",
+            failure_reason=exc.detail.get("detail") if isinstance(exc.detail, dict) else str(exc.detail),
+            request_payload=body,
+        )
+        raise
+    except Exception as _e:
+        _log.warning("Max input token check skipped: %s", _e)
 
     input_tokens = 0  # real counts come from Azure usage after response
 
