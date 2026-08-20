@@ -8,6 +8,8 @@ Authentication varies by endpoint:
 - **Proxy requests** — `X-Governance-Key: gov-xxxx` header (issued by admin)
 - **Admin endpoints** — API key via `Authorization: Bearer <token>` or session cookie
 
+> **Licensed/packaged deployments only:** on a per-client packaged install (`LICENSE_ENFORCEMENT_ENABLED=true`), every admin endpoint in this doc — sections 1(stats)–20 below, i.e. everything except `POST /proxy*` — additionally returns **`402`** once that deployment's license has lapsed (expired, revoked, or never installed). AI traffic through `/proxy*` is never affected, only the admin/analytics surface freezes. See [§22 Licensing](#22-licensing-packaged-deployments-only). The shared platform deployment leaves this off, so it never applies there.
+
 ---
 
 ## Table of Contents
@@ -32,6 +34,8 @@ Authentication varies by endpoint:
 18. [Health](#18-health)
 19. [Rate Limits](#19-rate-limits)
 20. [Alerts — Security & Anomalies](#20-alerts--security--anomalies)
+21. [Optimization Tips](#21-optimization-tips)
+22. [Licensing (Packaged Deployments Only)](#22-licensing-packaged-deployments-only)
 
 ---
 
@@ -1135,6 +1139,129 @@ Mark an alert as resolved.
 
 ---
 
+## 21. Optimization Tips
+
+Cost/prompt-shape advice generated daily by a scheduled job — evaluates request patterns per org/project against a set of rules (caching opportunities, oversized prompts, cheaper-model substitution, truncated responses, response-length outliers) and surfaces actionable tips with an estimated $/month saving.
+
+### `GET /optimization-tips/`
+
+List tips.
+
+| Query param  | Type   | Description                                    |
+| ------------ | ------ | ----------------------------------------------- |
+| `status`     | string | `open` (default), `dismissed`, `applied`        |
+| `org_id`     | string | Filter by organisation                          |
+| `project_id` | string | Filter by project                               |
+| `tip_type`   | string | e.g. `cache_opportunity`, `model_substitution`  |
+| `severity`   | string | `low`, `medium`, `high`, `critical`              |
+| `limit`      | int    | Page size (default 100, max 500)                |
+| `offset`     | int    | Pagination offset                                |
+
+**Response**
+
+```json
+{
+  "total": 1,
+  "offset": 0,
+  "items": [
+    {
+      "id": 42,
+      "org_id": "reckit_1780983190087",
+      "org_name": "Reckit",
+      "project_id": "reckit_marketplace_1780983215793",
+      "project_name": "Reckit Marketplace",
+      "model_name": "gpt-4o",
+      "tip_type": "model_substitution",
+      "severity": "medium",
+      "title": "Switch to gpt-4o-mini for this workload",
+      "message": "...",
+      "estimated_monthly_savings": 42.5,
+      "confidence": "high",
+      "evidence_json": {},
+      "status": "open",
+      "period_start": "2026-07-21",
+      "period_end": "2026-08-20",
+      "created_at": "2026-08-20T06:00:00"
+    }
+  ]
+}
+```
+
+### `GET /optimization-tips/summary`
+
+Counts and total estimated savings grouped by `tip_type`, for a dashboard header.
+
+| Query param  | Type   | Description             |
+| ------------ | ------ | ------------------------ |
+| `org_id`     | string | Filter by organisation   |
+| `project_id` | string | Filter by project        |
+
+### `PATCH /optimization-tips/{tip_id}/dismiss`
+
+Mark a tip dismissed. Suppressed from reappearing for `TIP_COOLDOWN_DAYS` (default 14).
+
+### `PATCH /optimization-tips/{tip_id}/apply`
+
+Mark a tip applied (acted on).
+
+### `POST /optimization-tips/admin/rebuild`
+
+Force an evaluation run immediately instead of waiting for the next scheduled run (every 24h).
+
+| Query param  | Type | Description                          |
+| ------------ | ---- | ------------------------------------- |
+| `window_end` | date | Lookback window end (default: today)  |
+
+---
+
+## 22. Licensing (Packaged Deployments Only)
+
+Only relevant when a deployment sets `LICENSE_ENFORCEMENT_ENABLED=true` — a per-client packaged install verifying a signed, expiring license file offline. The shared platform deployment leaves this off and none of the below applies. **A lapsed license only freezes this admin/analytics API** (returns `402` on every endpoint in §1–§21 above except `POST /proxy*`) — AI traffic through the proxy is never blocked by license state.
+
+### `GET /license/status`
+
+Current license state — always reachable, even while frozen, so the admin UI can explain why and show a renewal banner.
+
+**Response**
+
+```json
+{
+  "enforcement_enabled": true,
+  "configured": true,
+  "valid": true,
+  "expired": false,
+  "revoked": false,
+  "analytics_frozen": false,
+  "license_id": "acme-2026",
+  "customer": "Acme Retail Co.",
+  "features": ["analytics", "budgets", "pii_masking"],
+  "issued_at": "2026-01-01T00:00:00+00:00",
+  "expires_at": "2027-01-01T00:00:00+00:00",
+  "days_until_expiry": 134,
+  "show_renewal_banner": false,
+  "error": null
+}
+```
+
+### `POST /license/upload`
+
+Install a renewed license file (`multipart/form-data`, field `file`). Requires `admin` role. Re-verifies immediately — every worker picks up the change on its next request.
+
+### `POST /license/revoke`
+
+Revoke a `license_id` on this deployment before its natural expiry. Requires `admin` role.
+
+**Request body**
+
+```json
+{
+  "license_id": "acme-2026",
+  "reason": "contract terminated"
+}
+```
+
+---
+
 ## Quick Reference — All Routes
 
 | Method   | Path                            | Description                     |
@@ -1223,3 +1350,11 @@ Mark an alert as resolved.
 | `PATCH`  | `/alerts-security/anomalies/{id}/resolve` | Resolve anomaly         |
 | `GET`    | `/alerts-security/alerts`      | List security alerts             |
 | `PATCH`  | `/alerts-security/alerts/{id}/resolve` | Resolve security alert   |
+| `GET`    | `/optimization-tips/`          | List optimization tips           |
+| `GET`    | `/optimization-tips/summary`   | Tip counts + savings by type     |
+| `PATCH`  | `/optimization-tips/{id}/dismiss` | Dismiss a tip                 |
+| `PATCH`  | `/optimization-tips/{id}/apply`   | Mark a tip applied            |
+| `POST`   | `/optimization-tips/admin/rebuild` | Force tip evaluation now     |
+| `GET`    | `/license/status`              | Current license state (never gated) |
+| `POST`   | `/license/upload`              | Install a renewed license file   |
+| `POST`   | `/license/revoke`              | Revoke a license_id (admin only) |
