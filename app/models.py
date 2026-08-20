@@ -320,6 +320,29 @@ class UsageAnomaly(Base):
     created_at = Column(DateTime, server_default=func.now())
 
 
+class OptimizationTip(Base):
+    """Cost/prompt-shape advice emitted by the optimization-tips scheduled job
+    (app/services/optimization/). See evidence_json shape in OPTIMIZATION_TIPS_PLAN.md."""
+    __tablename__ = "optimization_tips"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(BigInteger, primary_key=True)
+    org_id = Column(String(100), nullable=False)
+    project_id = Column(String(100), nullable=True)
+    model_name = Column(String(120), nullable=True)
+    tip_type = Column(String(60), nullable=False)
+    severity = Column(String(20), nullable=False, default="medium")
+    title = Column(String(255), nullable=True)
+    message = Column(Text, nullable=True)
+    estimated_monthly_savings = Column(Numeric(14, 6), default=0)
+    confidence = Column(String(20), nullable=True)   # low | medium | high
+    evidence_json = Column(JSON, nullable=True)
+    status = Column(String(20), nullable=False, default="open")
+    period_start = Column(Date, nullable=True)
+    period_end = Column(Date, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+
 class GovernanceRule(Base):
     __tablename__ = "governance_rules"
     __table_args__ = {"extend_existing": True}
@@ -669,7 +692,7 @@ class AiRequest(Base):
     pii_entities_masked = Column(Integer, default=0)
     pii_detail = Column(JSON, nullable=True)
     content_policy_flags = Column(JSON, nullable=True)
-    # Proxy-layer provenance columns (added via _SAFE_ALTERS)
+    # Proxy-layer provenance columns (see schema_clean.sql)
     deployment_name = Column(String(255), nullable=True)
     governance_key_id = Column(String(120), nullable=True)
     source_ip = Column(String(60), nullable=True)

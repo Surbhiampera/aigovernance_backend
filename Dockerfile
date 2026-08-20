@@ -57,4 +57,4 @@ EXPOSE 8000
 
 # Shell form allows $PORT expansion (Azure overrides PORT at runtime); exec
 # replaces the shell with uvicorn so it becomes PID 1 and receives signals directly
-CMD exec uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 2
+CMD exec uvicorn app.main:app --host 0.0.0.0 --port $PORT

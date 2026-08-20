@@ -154,7 +154,7 @@ def get_azure_circuit_reset_seconds() -> float:
 def get_db_pool_size() -> int:
     """Maximum persistent DB connections per API process.
 
-    Default sized for 2 Uvicorn workers against a 50-connection Aiven Postgres
+    Default sized for 2 Uvicorn workers against a 50-connection managed Postgres
     plan: 2 workers * (14 pool + 6 overflow) = 40, leaving headroom for the
     scheduler and external clients. Re-tune if worker count or plan changes.
     """
@@ -350,3 +350,44 @@ def get_db_size_warning_gb() -> float:
     proxy for "might be approaching disk limits soon", not a direct disk
     check."""
     return float(os.getenv("DB_SIZE_WARNING_GB", "20"))
+
+
+# ── Optimization tips thresholds ───────────────────────────────────────────
+def get_tip_window_days() -> int:
+    """Lookback window the optimization-tips job evaluates each run."""
+    return _int("TIP_WINDOW_DAYS", "30")
+
+
+def get_tip_output_input_ratio() -> Decimal:
+    """Rule 1 (response_length): completion/prompt token ratio above which a tip fires."""
+    return _dec("TIP_OUTPUT_INPUT_RATIO", "3.0")
+
+
+def get_tip_min_requests() -> int:
+    """Minimum request volume required before a rule is allowed to fire."""
+    return _int("TIP_MIN_REQUESTS", "50")
+
+
+def get_tip_min_monthly_savings() -> Decimal:
+    """Minimum projected monthly saving (USD) required for a cost-based tip to fire."""
+    return _dec("TIP_MIN_MONTHLY_SAVINGS", "5")
+
+
+def get_tip_prompt_outlier_ratio() -> Decimal:
+    """Rule 3 (oversized_prompt): p95/median input-token ratio above which a tip fires."""
+    return _dec("TIP_PROMPT_OUTLIER_RATIO", "3.0")
+
+
+def get_tip_truncation_rate() -> Decimal:
+    """Rule 4 (response_truncated): finish_reason='length' ratio above which a tip fires."""
+    return _dec("TIP_TRUNCATION_RATE", "0.15")
+
+
+def get_tip_duplicate_min_hits() -> int:
+    """Rule 5 (cache_opportunity): minimum repeat count for a duplicate prompt hash to fire."""
+    return _int("TIP_DUPLICATE_MIN_HITS", "5")
+
+
+def get_tip_cooldown_days() -> int:
+    """Days a dismissed tip is suppressed from reappearing."""
+    return _int("TIP_COOLDOWN_DAYS", "14")
