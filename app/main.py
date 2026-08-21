@@ -245,7 +245,7 @@ def health_check_detailed():
     make the platform think the instance itself is dead and kill it).
     """
     from app.database import engine
-    from app.routers.proxy import _azure_circuit, _azure_limiter
+    from app.routers.proxy import _azure_limiter, _circuit_breakers
     from app.scheduler import get_scheduler_heartbeat
 
     pool = engine.pool
@@ -261,7 +261,7 @@ def health_check_detailed():
         "azure": {
             "concurrent_in_flight": _azure_limiter.in_flight,
             "concurrent_max": _azure_limiter.max_concurrent,
-            "circuit_open": _azure_circuit.is_open,
+            "circuits_open": [key for key, cb in _circuit_breakers.items() if cb.is_open],
         },
         "scheduler": get_scheduler_heartbeat(),
     }
