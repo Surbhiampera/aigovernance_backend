@@ -116,6 +116,48 @@ _national_id_recognizer = PatternRecognizer(
 )
 
 
+def _is_proper_noun_span(doc, start: int, end: int) -> bool:
+    """True unless every alphabetic token in [start, end) is POS-tagged as a common
+    noun/adjective rather than a proper noun.
+
+    Presidio's spaCy PERSON recognizer has no confidence gradient (fixed 0.85 score)
+    and frequently mislabels short, capitalized, context-free spans — typically
+    document headings like "Deliverables" or "Key Deliverables" — as person names.
+    spaCy's POS tagger, run over the same text, correctly tags these as NOUN/ADJ
+    rather than PROPN even when the NER layer gets it wrong. Cross-checking against
+    POS catches the false positive without hardcoding any specific word, so it
+    generalizes to any heading/label text rather than just one document's wording.
+    """
+    span = doc.char_span(start, end, alignment_mode="expand")
+    if span is None:
+        return True  # can't verify alignment — don't suppress a real detection
+    tokens = [t for t in span if t.is_alpha]
+    if not tokens:
+        return True
+    return any(t.pos_ == "PROPN" for t in tokens)
+
+
+def _filter_person_false_positives(results: list, text: str, analyzer: AnalyzerEngine) -> list:
+    if not any(r.entity_type == "PERSON" for r in results):
+        return results
+    try:
+        doc = analyzer.nlp_engine.nlp["en"](text)
+    except Exception as e:
+        _log.debug("POS cross-check unavailable, skipping PERSON false-positive filter: %s", e)
+        return results
+
+    filtered = []
+    for r in results:
+        if r.entity_type == "PERSON" and not _is_proper_noun_span(doc, r.start, r.end):
+            _log.debug(
+                "Suppressing PERSON false positive %r (POS-tagged as common noun, not a proper noun)",
+                text[r.start:r.end],
+            )
+            continue
+        filtered.append(r)
+    return filtered
+
+
 # ---------------------------------------------------------------------------
 # Lazy-initialised engines — loaded once, reused across all requests
 # ---------------------------------------------------------------------------
@@ -216,6 +258,8 @@ def scan_and_mask(
     except Exception as e:
         _log.warning("Presidio analyze failed: %s", e)
         return PiiScanResult(sanitized_text=text)
+
+    analyzer_results = _filter_person_false_positives(analyzer_results, text, analyzer)
 
     if not analyzer_results:
         return PiiScanResult(sanitized_text=text)
