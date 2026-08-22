@@ -60,6 +60,7 @@ from app.services.budget_service import check_budget
 from app.services.circuit_breaker import CircuitBreaker
 from app.services.cost_lookup import calculate_cost as _calculate_cost
 from app.services.deployment_service import build_provider_request, get_deployments_for_org
+from app.services.model_selection_service import get_default_model
 from app.services.provider_translation import (
     extract_usage,
     needs_translation,
@@ -1532,7 +1533,9 @@ async def _run_pre_flight(
         )
         raise HTTPException(status_code=400, detail="Invalid JSON body.")
 
-    model_name = model_override or body.get("model")
+    model_name = model_override or body.get("model") or get_default_model(
+        db, org_id=org_id, project_id=project_id,
+    )
     if not model_name:
         _reason = "Model must be specified via ?model= query param or 'model' in the request body."
         _log_blocked_request(
