@@ -104,13 +104,21 @@ def check_max_input_tokens(
 # ---------------------------------------------------------------------------
 
 def _load_rules(*, db: Session, org_id: str, project_id: Optional[str]) -> list:
+    from sqlalchemy import or_
+
     from app.models import GovernanceRule
 
+    # Org-wide rules (project_id IS NULL) apply to every project; project-scoped
+    # rules apply only when this request's project_id matches.
     return (
         db.query(GovernanceRule)
         .filter(
             GovernanceRule.is_active.is_(True),
             GovernanceRule.org_id == org_id,
+            or_(
+                GovernanceRule.project_id.is_(None),
+                GovernanceRule.project_id == project_id,
+            ),
         )
         .all()
     )
@@ -197,7 +205,16 @@ def _enforce_allow_list(
     *, rules: list, model: str, org_id: str, project_id: Optional[str],
     request_id: str, source_ip: Optional[str], db: Session,
 ) -> None:
-    allow_rules = [r for r in rules if r.metric_name == "allowed_model"]
+    # A project-specific allow-list, if one exists, is authoritative for that
+    # project. Otherwise fall back to the org-wide allow-list (project_id NULL).
+    project_allow_rules = [
+        r for r in rules
+        if r.metric_name == "allowed_model" and project_id is not None and r.project_id == project_id
+    ]
+    org_allow_rules = [
+        r for r in rules if r.metric_name == "allowed_model" and r.project_id is None
+    ]
+    allow_rules = project_allow_rules or org_allow_rules
     if not allow_rules:
         return  # no allow-list configured — all models permitted
 
