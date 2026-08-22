@@ -1,4 +1,7 @@
+from typing import List, Optional
+
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -42,9 +45,41 @@ def create_organization(*, data: OrganizationCreate, db: Session = Depends(get_d
     # in config.py) so every org gets all configured models without a manual
     # POST /deployments call per model.
     provision_standard_deployments(db, org_id=org.id)
+    # Model selection chosen at creation time (allow-list + default), enforced
+    # by the proxy on every request for this org's projects.
+    set_allowed_models(
+        db, org_id=org.id, project_id=None,
+        allowed_models=data.allowed_models, default_model=data.default_model,
+    )
     db.commit()
     db.refresh(org)
     return org
+
+
+class ModelSelectionUpdate(BaseModel):
+    allowed_models: Optional[List[str]] = None
+    default_model: Optional[str] = None
+
+
+@router.get("/{org_id}/models")
+def get_organization_models(*, org_id: str, db: Session = Depends(get_db)):
+    org = db.query(Organization).filter(Organization.id == org_id).first()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    return get_model_selection(db, org_id=org_id, project_id=None)
+
+
+@router.put("/{org_id}/models")
+def update_organization_models(*, org_id: str, data: ModelSelectionUpdate, db: Session = Depends(get_db)):
+    org = db.query(Organization).filter(Organization.id == org_id).first()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    set_allowed_models(
+        db, org_id=org_id, project_id=None,
+        allowed_models=data.allowed_models, default_model=data.default_model,
+    )
+    db.commit()
+    return get_model_selection(db, org_id=org_id, project_id=None)
 
 
 @router.post("/{org_id}/provision-deployments")

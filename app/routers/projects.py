@@ -1,6 +1,7 @@
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -11,6 +12,7 @@ from app.models import (
     Project, RequestCost, TokenUsage,
 )
 from app.schemas import ProjectCreate, ProjectResponse
+from app.services.model_selection_service import get_model_selection, set_allowed_models
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -40,6 +42,12 @@ def create_project(*, data: ProjectCreate, db: Session = Depends(get_db)):
         environment=data.environment,
     )
     db.add(project)
+    # Model selection chosen at creation time (allow-list + default). If
+    # omitted, the project inherits the org's selection at request time.
+    set_allowed_models(
+        db, org_id=data.org_id, project_id=project.id,
+        allowed_models=data.allowed_models, default_model=data.default_model,
+    )
     db.commit()
     db.refresh(project)
     return project
@@ -53,9 +61,39 @@ def update_project(*, project_id: str, data: ProjectCreate, db: Session = Depend
     project.org_id = data.org_id
     project.project_name = data.project_name
     project.environment = data.environment
+    set_allowed_models(
+        db, org_id=data.org_id, project_id=project.id,
+        allowed_models=data.allowed_models, default_model=data.default_model,
+    )
     db.commit()
     db.refresh(project)
     return project
+
+
+class ModelSelectionUpdate(BaseModel):
+    allowed_models: Optional[List[str]] = None
+    default_model: Optional[str] = None
+
+
+@router.get("/{project_id}/models")
+def get_project_models(*, project_id: str, db: Session = Depends(get_db)):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return get_model_selection(db, org_id=project.org_id, project_id=project_id)
+
+
+@router.put("/{project_id}/models")
+def update_project_models(*, project_id: str, data: ModelSelectionUpdate, db: Session = Depends(get_db)):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    set_allowed_models(
+        db, org_id=project.org_id, project_id=project_id,
+        allowed_models=data.allowed_models, default_model=data.default_model,
+    )
+    db.commit()
+    return get_model_selection(db, org_id=project.org_id, project_id=project_id)
 
 
 @router.delete("/{project_id}")
