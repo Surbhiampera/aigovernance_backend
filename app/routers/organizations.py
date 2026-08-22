@@ -10,6 +10,7 @@ from app.models import (
 )
 from app.schemas import OrganizationCreate, OrganizationResponse, OrganizationUpdate
 from app.services.deployment_service import provision_standard_deployments
+from app.services.model_selection_service import get_model_selection, set_allowed_models
 
 router = APIRouter(prefix="/organizations", tags=["organizations"])
 

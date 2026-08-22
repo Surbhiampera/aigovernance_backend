@@ -1,6 +1,6 @@
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -454,6 +454,11 @@ class OrganizationCreate(BaseModel):
     id: str
     org_name: str
     plan_type: Optional[str] = None
+    # Models this org is allowed to use (governance allow-list) and the one
+    # used automatically when a proxy request omits "model". Every project
+    # under the org inherits these unless it sets its own.
+    allowed_models: Optional[List[str]] = None
+    default_model: Optional[str] = None
 
 
 class OrganizationUpdate(BaseModel):
@@ -477,6 +482,11 @@ class ProjectCreate(BaseModel):
     org_id: str
     project_name: Optional[str] = None
     environment: Optional[str] = None
+    # Models this project is allowed to use (overrides the org allow-list for
+    # this project) and the one used automatically when a proxy request omits
+    # "model". Omit both to inherit the org's selection.
+    allowed_models: Optional[List[str]] = None
+    default_model: Optional[str] = None
 
 
 class ProjectResponse(BaseModel):
