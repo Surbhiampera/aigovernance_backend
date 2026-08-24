@@ -182,6 +182,9 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # Lets the frontend read the generated filename off a fetch()'d report
+    # export (report.pdf/.xlsx/.docx) before saving it as a blob.
+    expose_headers=["Content-Disposition"],
 )
 
 

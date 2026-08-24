@@ -69,7 +69,7 @@ def export_excel(report: dict) -> bytes:
     ws["A6"] = f"Generated: {_fmt_dt(report['generated_at'])} UTC"
 
     s = report["summary"]
-    row = write_table(ws, 8, ["Metric", "Value"], [
+    write_table(ws, 8, ["Metric", "Value"], [
         ["Total requests", s["total_requests"]],
         ["Input tokens", s["input_tokens"]],
         ["Output tokens", s["output_tokens"]],
