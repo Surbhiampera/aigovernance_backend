@@ -20,12 +20,9 @@ from sqlalchemy.orm import Session
 
 
 def _model_catalog_names(db: Session) -> set[str]:
-    from app.services.ai_model_pricing import MODEL_PRICING
-    from app.models import ModelPricing
+    from app.services.deployment_service import get_credentialed_model_names
 
-    names = set(MODEL_PRICING.keys())
-    names.update(r.model_name for r in db.query(ModelPricing.model_name).all())
-    return names
+    return set(get_credentialed_model_names(db).keys())
 
 
 def validate_models(db: Session, model_names: list[str]) -> None:
