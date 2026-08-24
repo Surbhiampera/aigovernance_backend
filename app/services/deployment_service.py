@@ -136,14 +136,34 @@ def _has_credentials(d) -> bool:
     return bool(getattr(d, "api_key", None) and getattr(d, "endpoint_url", None))
 
 
+def _env_fallback_model_names() -> dict[str, str]:
+    """Model names resolvable via the env-var fallback credentials in
+    _env_fallbacks(), without that function's object-building/warning-log
+    side effects (those are meant for the "no DB deployment, had to fall
+    back" case at actual request time — not relevant when just reporting
+    which models currently have real credentials for the catalog).
+    """
+    names: dict[str, str] = {}
+    if os.getenv("AZURE_OPENAI_API_KEY") and os.getenv("AZURE_OPENAI_ENDPOINT") and os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"):
+        names[os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")] = "azure_openai"
+    if os.getenv("OPENAI_API_KEY") and os.getenv("OPENAI_ENDPOINT") and os.getenv("OPENAI_DEPLOYMENT_NAME"):
+        names[os.getenv("OPENAI_DEPLOYMENT_NAME")] = "azure_openai"
+    if os.getenv("AZURE_API_KEY") and os.getenv("AZURE_ENDPOINT") and os.getenv("AZURE_DEPLOYMENT"):
+        names[os.getenv("AZURE_DEPLOYMENT")] = "azure_openai"
+    if os.getenv("TTS_AZURE_OPENAI_API_KEY") and os.getenv("TTS_AZURE_OPENAI_ENDPOINT") and os.getenv("TTS_AZURE_OPENAI_DEPLOYMENT"):
+        names[os.getenv("TTS_AZURE_OPENAI_DEPLOYMENT")] = "azure_openai"
+    return names
+
+
 def get_credentialed_model_names(db: Session) -> dict[str, str]:
     """Return {model_name: provider} for every model an admin has actually
-    configured an API key for — either via a STANDARD_MODEL_DEPLOYMENTS
-    template with api_key set, or an active ModelDeployment DB row with
-    api_key set. endpoint_url is deliberately not required here: public
-    providers (OpenAI, Anthropic, Google) work with just an api_key and no
-    explicit endpoint (see build_provider_request), unlike the stricter
-    _has_credentials() check used for proxy routing.
+    configured an API key for — via a STANDARD_MODEL_DEPLOYMENTS template
+    with api_key set, an active ModelDeployment DB row with api_key set, or
+    one of the env-var fallback credential sets in _env_fallbacks().
+    endpoint_url is deliberately not required for the first two sources:
+    public providers (OpenAI, Anthropic, Google) work with just an api_key
+    and no explicit endpoint (see build_provider_request), unlike the
+    stricter _has_credentials() check used for proxy routing.
 
     Used to populate the model-selection dropdown (GET /models/catalog) and
     to validate allowed_model/default_model selections, so an org/project
@@ -161,6 +181,9 @@ def get_credentialed_model_names(db: Session) -> dict[str, str]:
     for row in db.query(ModelDeployment).filter(ModelDeployment.is_active.is_(True)):
         if row.api_key:
             deployed.setdefault(row.model_name, row.provider)
+
+    for model_name, provider in _env_fallback_model_names().items():
+        deployed.setdefault(model_name, provider)
 
     return deployed
 
