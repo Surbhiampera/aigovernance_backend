@@ -24,30 +24,19 @@ def list_models(db: Session = Depends(get_db)):
 
 @router.get("/catalog")
 def list_model_catalog(db: Session = Depends(get_db)):
-    """Only the models we actually have a deployment for, for populating a
-    model-selection dropdown (Proxy Setup deployment form, Organization/Project
-    creation). Sourced from STANDARD_MODEL_DEPLOYMENTS (what every new org gets
-    auto-provisioned with) plus any model already registered as a
-    ModelDeployment row — deliberately excludes every other model in
-    MODEL_PRICING that we have no deployment for. Pricing/context metadata is
-    filled in from MODEL_PRICING where the name matches.
+    """Only the models we actually have an admin-configured API key for, for
+    populating a model-selection dropdown (Proxy Setup deployment form,
+    Organization/Project creation). Sourced from STANDARD_MODEL_DEPLOYMENTS
+    entries with an api_key set plus any ModelDeployment row with an api_key
+    set — deliberately excludes every other model in MODEL_PRICING (and any
+    deployment row with no credentials) since nothing could actually serve
+    those requests. Pricing/context metadata is filled in from MODEL_PRICING
+    where the name matches.
     """
-    from app.config import get_standard_model_deployments
-    from app.models import ModelDeployment
     from app.services.ai_model_pricing import MODEL_PRICING
+    from app.services.deployment_service import get_credentialed_model_names
 
-    deployed = {}
-    for tpl in get_standard_model_deployments():
-        model_name = tpl.get("model_name")
-        if model_name:
-            deployed[model_name] = tpl.get("provider")
-
-    for row in (
-        db.query(ModelDeployment.model_name, ModelDeployment.provider)
-        .filter(ModelDeployment.is_active.is_(True))
-        .distinct()
-    ):
-        deployed.setdefault(row.model_name, row.provider)
+    deployed = get_credentialed_model_names(db)
 
     catalog = []
     for name, fallback_provider in deployed.items():

@@ -136,6 +136,35 @@ def _has_credentials(d) -> bool:
     return bool(getattr(d, "api_key", None) and getattr(d, "endpoint_url", None))
 
 
+def get_credentialed_model_names(db: Session) -> dict[str, str]:
+    """Return {model_name: provider} for every model an admin has actually
+    configured an API key for — either via a STANDARD_MODEL_DEPLOYMENTS
+    template with api_key set, or an active ModelDeployment DB row with
+    api_key set. endpoint_url is deliberately not required here: public
+    providers (OpenAI, Anthropic, Google) work with just an api_key and no
+    explicit endpoint (see build_provider_request), unlike the stricter
+    _has_credentials() check used for proxy routing.
+
+    Used to populate the model-selection dropdown (GET /models/catalog) and
+    to validate allowed_model/default_model selections, so an org/project
+    can never be pointed at a model nobody can actually call.
+    """
+    from app.config import get_standard_model_deployments
+    from app.models import ModelDeployment
+
+    deployed: dict[str, str] = {}
+    for tpl in get_standard_model_deployments():
+        model_name = tpl.get("model_name")
+        if model_name and tpl.get("api_key"):
+            deployed[model_name] = tpl.get("provider")
+
+    for row in db.query(ModelDeployment).filter(ModelDeployment.is_active.is_(True)):
+        if row.api_key:
+            deployed.setdefault(row.model_name, row.provider)
+
+    return deployed
+
+
 _CONTENT_TYPE_JSON = "application/json"
 
 
