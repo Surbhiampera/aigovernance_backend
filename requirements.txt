@@ -9,6 +9,8 @@ python-jose[cryptography]
 PyJWT[crypto]
 httpx
 openpyxl
+python-docx
+reportlab
 python-multipart
 twilio
 tiktoken

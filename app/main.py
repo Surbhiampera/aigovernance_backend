@@ -25,6 +25,7 @@ from app.routers import (
     organizations,
     pricing,
     projects,
+    reports,
     summary,
 )
 from app.routers.rate_limits import router as rate_limits_router
@@ -78,6 +79,7 @@ _ALL_ROUTERS = [
     audit_logs.router,
     rate_limits_router,
     optimization_tips.router,
+    reports.router,
 ]
 
 
