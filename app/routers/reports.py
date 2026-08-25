@@ -74,5 +74,8 @@ def export_project_report(
     return StreamingResponse(
         BytesIO(file_bytes),
         media_type=media_type,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
     )
