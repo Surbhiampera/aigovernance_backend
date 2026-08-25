@@ -84,8 +84,8 @@ def export_excel(report: dict) -> bytes:
     ws.title = "Overview"
     ws["A1"] = _report_title(report)
     ws["A1"].font = title_font
-    ws["A2"] = f"Organization: {report['project']['org_name']} ({report['project']['org_id']})"
-    ws["A3"] = f"Project: {report['project']['name']} ({report['project']['id']})"
+    ws["A2"] = f"Organization: {report['project']['org_name']}"
+    ws["A3"] = f"Project: {report['project']['name']}"
     ws["A4"] = f"Environment: {report['project']['environment'] or '—'}"
     ws["A5"] = f"Period: {_period_label(report)}"
     ws["A6"] = f"Generated: {_fmt_dt(report['generated_at'])} UTC"
@@ -177,8 +177,8 @@ def export_docx(report: dict) -> bytes:
 
     meta = doc.add_paragraph()
     meta.add_run(
-        f"Organization: {report['project']['org_name']} ({report['project']['org_id']})\n"
-        f"Project: {report['project']['name']} ({report['project']['id']})\n"
+        f"Organization: {report['project']['org_name']}\n"
+        f"Project: {report['project']['name']}\n"
         f"Environment: {report['project']['environment'] or '—'}\n"
         f"Period: {_period_label(report)}\n"
         f"Generated: {_fmt_dt(report['generated_at'])} UTC"
@@ -327,8 +327,8 @@ def export_pdf(report: dict) -> bytes:
         Paragraph(_report_title(report), title_style),
         Spacer(1, 6),
         Paragraph(
-            f"Organization: {report['project']['org_name']} ({report['project']['org_id']})<br/>"
-            f"Project: {report['project']['name']} ({report['project']['id']})<br/>"
+            f"Organization: {report['project']['org_name']}<br/>"
+            f"Project: {report['project']['name']}<br/>"
             f"Environment: {report['project']['environment'] or '—'}<br/>"
             f"Period: {_period_label(report)}<br/>"
             f"Generated: {_fmt_dt(report['generated_at'])} UTC",
