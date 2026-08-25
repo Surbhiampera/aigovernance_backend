@@ -7,7 +7,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import func, or_
+from sqlalchemy import case, func, or_
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -15,6 +15,7 @@ from app.models import (
     AiRequest,
     AuditLog,
     Budget,
+    DataSecurityLog,
     GovernanceRule,
     Organization,
     Project,
@@ -130,17 +131,58 @@ def build_project_report(
     alert_q = _date_filter(alert_q, Alert, start=start, end=end)
     alerts = alert_q.order_by(Alert.created_at.desc()).limit(50).all()
 
-    # ---- audit trail (non-PII only — this report is not a compliance/security
-    # artifact; see app/routers/audit_logs.py for the PII-gated equivalent) ----
-    audit_q = db.query(AuditLog).filter(
+    # ---- audit trail summary (non-PII only — this report is not a
+    # compliance/security artifact; see app/routers/audit_logs.py for the
+    # PII-gated equivalent). A per-project audit trail can run into the
+    # thousands of rows (e.g. one entry per proxied request), so the report
+    # surfaces counts rather than a raw dump. ----
+    audit_filters = [
         AuditLog.project_id == project_id,
         AuditLog.compliance_relevant.is_(False),
-    )
+    ]
     if start:
-        audit_q = audit_q.filter(func.date(AuditLog.occurred_at) >= start)
+        audit_filters.append(func.date(AuditLog.occurred_at) >= start)
     if end:
-        audit_q = audit_q.filter(func.date(AuditLog.occurred_at) <= end)
-    audit_entries = audit_q.order_by(AuditLog.occurred_at.desc()).limit(50).all()
+        audit_filters.append(func.date(AuditLog.occurred_at) <= end)
+
+    total_audit_events = db.query(func.count(AuditLog.id)).filter(*audit_filters).scalar() or 0
+
+    by_action_rows = (
+        db.query(AuditLog.audit_action, func.count(AuditLog.id).label("cnt"))
+        .filter(*audit_filters)
+        .group_by(AuditLog.audit_action)
+        .order_by(func.count(AuditLog.id).desc())
+        .limit(8)
+        .all()
+    )
+    by_status_rows = (
+        db.query(AuditLog.audit_status, func.count(AuditLog.id).label("cnt"))
+        .filter(*audit_filters)
+        .group_by(AuditLog.audit_status)
+        .all()
+    )
+    first_event_at, last_event_at = (
+        db.query(func.min(AuditLog.occurred_at), func.max(AuditLog.occurred_at))
+        .filter(*audit_filters)
+        .first()
+        or (None, None)
+    )
+
+    # ---- security summary (PII / misuse / data-out signals for the period) --
+    security_filters = [DataSecurityLog.project_id == project_id]
+    if start:
+        security_filters.append(func.date(DataSecurityLog.created_at) >= start)
+    if end:
+        security_filters.append(func.date(DataSecurityLog.created_at) <= end)
+
+    security_totals = db.query(
+        func.count(DataSecurityLog.id).label("total_events"),
+        func.sum(case((DataSecurityLog.pii_detected.is_(True), 1), else_=0)).label("pii_detections"),
+        func.sum(case((DataSecurityLog.data_out_violation.is_(True), 1), else_=0)).label("data_out_violations"),
+        func.sum(case((DataSecurityLog.misuse_pattern_detected.is_(True), 1), else_=0)).label("misuse_flags"),
+        func.sum(case((DataSecurityLog.abnormal_usage_spike.is_(True), 1), else_=0)).label("usage_spikes"),
+        func.avg(DataSecurityLog.risk_score).label("avg_risk_score"),
+    ).filter(*security_filters).first()
 
     return {
         "generated_at": datetime.utcnow(),
@@ -197,16 +239,19 @@ def build_project_report(
             }
             for a in alerts
         ],
-        "audit_entries": [
-            {
-                "audit_action": e.audit_action,
-                "audit_category": e.audit_category,
-                "audit_status": e.audit_status,
-                "actor_id": e.actor_id,
-                "entity_type": e.entity_type,
-                "change_summary": e.change_summary,
-                "occurred_at": e.occurred_at,
-            }
-            for e in audit_entries
-        ],
+        "audit_summary": {
+            "total_events": total_audit_events,
+            "by_action": [{"action": a or "unknown", "count": c} for a, c in by_action_rows],
+            "by_status": [{"status": s or "unknown", "count": c} for s, c in by_status_rows],
+            "first_event_at": first_event_at,
+            "last_event_at": last_event_at,
+        },
+        "security_summary": {
+            "total_events": security_totals.total_events or 0,
+            "pii_detections": int(security_totals.pii_detections or 0),
+            "data_out_violations": int(security_totals.data_out_violations or 0),
+            "misuse_flags": int(security_totals.misuse_flags or 0),
+            "usage_spikes": int(security_totals.usage_spikes or 0),
+            "avg_risk_score": round(float(security_totals.avg_risk_score or 0), 1),
+        },
     }

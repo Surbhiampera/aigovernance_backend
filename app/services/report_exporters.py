@@ -31,6 +31,28 @@ def _report_title(report: dict) -> str:
     return f"Governance Report — {report['project']['name']}"
 
 
+def _audit_security_rows(report: dict) -> list[list]:
+    """Compact audit/security key figures for the period — counts, not a raw
+    per-event dump, since a project's audit trail can run into the thousands
+    of rows (e.g. one entry per proxied request)."""
+    audit = report["audit_summary"]
+    security = report["security_summary"]
+    top_actions = ", ".join(f"{a['action']} ({a['count']})" for a in audit["by_action"][:5]) or "—"
+    by_status = ", ".join(f"{s['status']}: {s['count']}" for s in audit["by_status"]) or "—"
+    return [
+        ["Total audit events", audit["total_events"]],
+        ["Events by status", by_status],
+        ["Top actions", top_actions],
+        ["First event", _fmt_dt(audit["first_event_at"])],
+        ["Last event", _fmt_dt(audit["last_event_at"])],
+        ["PII detections", security["pii_detections"]],
+        ["Data-out violations", security["data_out_violations"]],
+        ["Misuse flags", security["misuse_flags"]],
+        ["Usage spikes", security["usage_spikes"]],
+        ["Avg risk score", security["avg_risk_score"]],
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Excel (.xlsx) — openpyxl, already a project dependency
 # ---------------------------------------------------------------------------
@@ -126,16 +148,12 @@ def export_excel(report: dict) -> bytes:
         ] or [["No alerts in this period", "", "", "", ""]],
     )
 
-    # ---- Audit trail sheet ----
-    ws6 = wb.create_sheet("Audit Trail")
+    # ---- Audit & security summary sheet ----
+    ws6 = wb.create_sheet("Audit & Security")
     write_table(
         ws6, 1,
-        ["Action", "Category", "Status", "Actor", "Summary", "Occurred At"],
-        [
-            [e["audit_action"], e["audit_category"], e["audit_status"], e["actor_id"] or "—",
-             e["change_summary"] or "", _fmt_dt(e["occurred_at"])]
-            for e in report["audit_entries"]
-        ] or [["No audit entries in this period", "", "", "", "", ""]],
+        ["Metric", "Value"],
+        _audit_security_rows(report),
     )
 
     buf = BytesIO()
@@ -238,15 +256,11 @@ def export_docx(report: dict) -> bytes:
         "No alerts in this period.",
     )
 
-    doc.add_heading("Audit Trail", level=1)
+    doc.add_heading("Audit & Security Summary", level=1)
     add_table(
-        ["Action", "Category", "Status", "Actor", "Summary", "Occurred At"],
-        [
-            [e["audit_action"], e["audit_category"], e["audit_status"], e["actor_id"] or "—",
-             e["change_summary"] or "", _fmt_dt(e["occurred_at"])]
-            for e in report["audit_entries"]
-        ],
-        "No audit entries in this period.",
+        ["Metric", "Value"],
+        _audit_security_rows(report),
+        "No audit data.",
     )
 
     footer = doc.add_paragraph()
@@ -378,14 +392,12 @@ def export_pdf(report: dict) -> bytes:
             "No alerts in this period.",
         ),
 
-        Paragraph("Audit Trail", heading_style),
+        Paragraph("Audit &amp; Security Summary", heading_style),
         table(
-            ["Action", "Category", "Status", "Actor", "Occurred At"],
-            [
-                [e["audit_action"], e["audit_category"], e["audit_status"], e["actor_id"] or "—", _fmt_dt(e["occurred_at"])]
-                for e in report["audit_entries"]
-            ],
-            "No audit entries in this period.",
+            ["Metric", "Value"],
+            _audit_security_rows(report),
+            "No audit data.",
+            col_widths=[2.5 * inch, 3.5 * inch],
         ),
     ]
 
