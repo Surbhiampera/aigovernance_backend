@@ -2630,7 +2630,11 @@ def list_proxy_requests(
                     f"   FROM ai_requests r2"
                     f"   LEFT JOIN token_usage tu2 ON tu2.request_id = r2.request_id"
                     f"   LEFT JOIN request_cost rc2 ON rc2.request_id = r2.request_id"
-                    f"   WHERE COALESCE(r2.parent_request_id, r2.request_id) = r.request_id"
+                    # Equivalent to COALESCE(r2.parent_request_id, r2.request_id) = r.request_id,
+                    # but written as an OR of two indexed equalities (unique index on
+                    # request_id, ix_ai_requests_parent_request_id) so Postgres can satisfy it
+                    # with a BitmapOr instead of scanning all of ai_requests for every page row.
+                    f"   WHERE r2.request_id = r.request_id OR r2.parent_request_id = r.request_id"
                     f" ) gt ON TRUE"
                     f" {where}"
                     f" ORDER BY r.created_at DESC LIMIT :limit OFFSET :offset"
