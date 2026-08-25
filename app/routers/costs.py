@@ -4,7 +4,7 @@ AiRequest  : one row per proxy request (input tokens, model, org, project)
 RequestCost: one row per proxy request (input_cost, output_cost, total_cost)
 TokenUsage : one row per proxy request (input/output/total token counts)
 """
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -17,11 +17,21 @@ from app.models import AiRequest, MonthlyOrgSummary, RequestCost, TokenUsage
 router = APIRouter(prefix="/costs", tags=["costs"])
 
 
-def _date_filter(query, model, *, start: Optional[date], end: Optional[date]):
-    if start:
-        query = query.filter(func.date(model.created_at) >= start)
-    if end:
-        query = query.filter(func.date(model.created_at) <= end)
+def _date_filter(
+    query, model, *, start: Optional[date], end: Optional[date], days: Optional[int] = None,
+):
+    # Plain-column range comparisons stay sargable (can use the
+    # (org_id, project_id, created_at) / (model_name, created_at) indexes);
+    # wrapping created_at in func.date() as before defeated those indexes and
+    # forced a full-table scan on every call, which is what was timing out.
+    if start or end:
+        if start:
+            query = query.filter(model.created_at >= datetime.combine(start, time.min))
+        if end:
+            query = query.filter(model.created_at < datetime.combine(end, time.min) + timedelta(days=1))
+    elif days:
+        cutoff = datetime.combine(date.today() - timedelta(days=days - 1), time.min)
+        query = query.filter(model.created_at >= cutoff)
     return query
 
 
@@ -48,6 +58,7 @@ def cost_by_model(
     project_id: Optional[str] = Query(None),
     start: Optional[date] = Query(None),
     end: Optional[date] = Query(None),
+    days: Optional[int] = Query(None, ge=1, le=365),
     db: Session = Depends(get_db),
 ) -> list[dict]:
     q = db.query(
@@ -68,7 +79,7 @@ def cost_by_model(
     ).join(AiRequest, AiRequest.request_id == RequestCost.request_id)
     q = _org_filter(q, RequestCost, org_id=org_id)
     q = _project_filter(q, RequestCost, project_id=project_id)
-    q = _date_filter(q, RequestCost, start=start, end=end)
+    q = _date_filter(q, RequestCost, start=start, end=end, days=days)
     rows = q.group_by(RequestCost.model_name, RequestCost.provider).order_by(func.sum(RequestCost.total_cost).desc()).all()
 
     return [
@@ -98,6 +109,7 @@ def cost_by_project(
     org_id: Optional[str] = Query(None),
     start: Optional[date] = Query(None),
     end: Optional[date] = Query(None),
+    days: Optional[int] = Query(None, ge=1, le=365),
     db: Session = Depends(get_db),
 ) -> list[dict]:
     q = db.query(
@@ -115,7 +127,7 @@ def cost_by_project(
         func.sum(RequestCost.total_cost).label("total_cost"),
     ).join(AiRequest, AiRequest.request_id == RequestCost.request_id)
     q = _org_filter(q, RequestCost, org_id=org_id)
-    q = _date_filter(q, RequestCost, start=start, end=end)
+    q = _date_filter(q, RequestCost, start=start, end=end, days=days)
     rows = (
         q.group_by(RequestCost.org_id, RequestCost.project_id)
         .order_by(func.sum(RequestCost.total_cost).desc())

@@ -2099,6 +2099,7 @@ def stats_by_project_model(
     project_id: Optional[str] = Query(None),
     start: Optional[date] = Query(None),
     end: Optional[date] = Query(None),
+    days: Optional[int] = Query(30, ge=1, le=365),
     db: Session = Depends(get_db),
 ) -> list[dict]:
     q = db.query(
@@ -2122,10 +2123,19 @@ def stats_by_project_model(
         q = q.filter(RequestCost.org_id == org_id)
     if project_id:
         q = q.filter(RequestCost.project_id == project_id)
-    if start:
-        q = q.filter(func.date(RequestCost.created_at) >= start)
-    if end:
-        q = q.filter(func.date(RequestCost.created_at) <= end)
+    # Plain-column range comparisons stay sargable (usable by the
+    # (org_id, project_id, created_at) index); func.date(created_at) would
+    # defeat it and force a full-table scan on every call — this endpoint
+    # previously had no `days` param at all, so the frontend's `days=30` was
+    # silently dropped and every call scanned the whole table unfiltered.
+    if start or end:
+        if start:
+            q = q.filter(RequestCost.created_at >= datetime.combine(start, datetime.min.time()))
+        if end:
+            q = q.filter(RequestCost.created_at < datetime.combine(end, datetime.min.time()) + timedelta(days=1))
+    elif days:
+        cutoff_dt = datetime.combine(date.today() - timedelta(days=days - 1), datetime.min.time())
+        q = q.filter(RequestCost.created_at >= cutoff_dt)
 
     rows = (
         q.group_by(RequestCost.project_id, RequestCost.model_name)
@@ -2164,7 +2174,11 @@ def proxy_stats_overview(
     model_name: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ) -> dict:
-    cutoff = datetime.utcnow().date() - timedelta(days=days - 1)
+    # A plain datetime lower bound stays sargable (usable by the
+    # (org_id, project_id, created_at) / (model_name, created_at) indexes);
+    # func.date(created_at) as used below would defeat those indexes and
+    # force a full-table scan on every call.
+    cutoff = datetime.combine(datetime.utcnow().date() - timedelta(days=days - 1), datetime.min.time())
     # Requests that never reached a terminal status (crashed/timed out before
     # the handler could mark them success/failed/partial/blocked) stay stuck
     # at "pending" forever. Treat any pending row older than this as failed.
@@ -2182,7 +2196,7 @@ def proxy_stats_overview(
         func.sum(RequestCost.llm_cost).label("llm_cost"),
         func.sum(RequestCost.total_cost).label("total_cost"),
     ).join(AiRequest, AiRequest.request_id == RequestCost.request_id).filter(
-        func.date(RequestCost.created_at) >= cutoff
+        RequestCost.created_at >= cutoff
     )
     if org_id:
         cost_q = cost_q.filter(RequestCost.org_id == org_id)
@@ -2229,7 +2243,7 @@ def proxy_stats_overview(
                 Integer,
             )
         ).label("blocked"),
-    ).filter(func.date(AiRequest.created_at) >= cutoff)
+    ).filter(AiRequest.created_at >= cutoff)
     if org_id:
         req_q = req_q.filter(AiRequest.org_id == org_id)
     if project_id:
@@ -2246,7 +2260,7 @@ def proxy_stats_overview(
     blocked = int(req_stats.blocked or 0)
 
     latency_q = db.query(func.avg(AiResponse.latency_ms)).filter(
-        func.date(AiResponse.created_at) >= cutoff,
+        AiResponse.created_at >= cutoff,
     )
     if org_id:
         latency_q = latency_q.filter(AiResponse.org_id == org_id)
@@ -2261,7 +2275,7 @@ def proxy_stats_overview(
     pii_q = db.query(func.count(AiRequest.id)).filter(
         AiRequest.pii_detected == True,
         AiRequest.parent_request_id.is_(None),
-        func.date(AiRequest.created_at) >= cutoff,
+        AiRequest.created_at >= cutoff,
     )
     if org_id:
         pii_q = pii_q.filter(AiRequest.org_id == org_id)
@@ -2302,7 +2316,11 @@ def proxy_stats_trends(
     model_name: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ) -> list[dict]:
-    cutoff = datetime.utcnow().date() - timedelta(days=days - 1)
+    # Plain datetime bound for the WHERE filter (sargable, usable by the
+    # (org_id, project_id, created_at) index); func.date() is still fine in
+    # SELECT/GROUP BY/ORDER BY below since it runs only over the rows the
+    # filter already narrowed down.
+    cutoff = datetime.combine(datetime.utcnow().date() - timedelta(days=days - 1), datetime.min.time())
 
     q = db.query(
         func.date(RequestCost.created_at).label("date"),
@@ -2315,7 +2333,7 @@ def proxy_stats_trends(
         func.sum(RequestCost.llm_cost).label("llm_cost"),
         func.sum(RequestCost.total_cost).label("total_cost"),
     ).join(AiRequest, AiRequest.request_id == RequestCost.request_id).filter(
-        func.date(RequestCost.created_at) >= cutoff
+        RequestCost.created_at >= cutoff
     )
     if org_id:
         q = q.filter(RequestCost.org_id == org_id)
