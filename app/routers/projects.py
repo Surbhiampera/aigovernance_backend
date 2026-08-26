@@ -33,7 +33,7 @@ def get_project(*, project_id: str, db: Session = Depends(get_db)):
     return project
 
 
-@router.post("/", response_model=ProjectResponse)
+@router.post("", response_model=ProjectResponse)
 def create_project(*, data: ProjectCreate, db: Session = Depends(get_db)):
     project = Project(
         id=data.id,

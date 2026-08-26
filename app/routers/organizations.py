@@ -18,7 +18,7 @@ from app.services.model_selection_service import get_model_selection, set_allowe
 router = APIRouter(prefix="/organizations", tags=["organizations"])
 
 
-@router.get("/", response_model=list[OrganizationResponse])
+@router.get("", response_model=list[OrganizationResponse])
 def list_organizations(*, db: Session = Depends(get_db)):
     return db.query(Organization).all()
 
@@ -34,7 +34,7 @@ def get_organization(*, org_id: str, db: Session = Depends(get_db)):
 DEFAULT_ORG_RATE_LIMIT_RPM = 1200
 
 
-@router.post("/", response_model=OrganizationResponse)
+@router.post("", response_model=OrganizationResponse)
 def create_organization(*, data: OrganizationCreate, db: Session = Depends(get_db)):
     org = Organization(id=data.id, org_name=data.org_name, plan_type=data.plan_type)
     db.add(org)
