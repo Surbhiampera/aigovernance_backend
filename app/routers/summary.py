@@ -15,10 +15,11 @@ from datetime import date, timedelta
 from decimal import Decimal
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import Integer, cast, func
 from sqlalchemy.orm import Session
 
+from app.core.date_filters import ALLOWED_PERIODS, cutoff_date, resolve_days
 from app.core.deps import get_db
 from app.models import (
     Alert,
@@ -256,9 +257,12 @@ def get_usage_trends(
     org_id: Optional[str] = Query(None),
     project_id: Optional[str] = Query(None),
     days: int = Query(30, ge=1, le=365),
+    period: Optional[str] = Query(
+        None, description="7d | 14d | 30d | 90d | all — overrides `days` when set"
+    ),
     db: Session = Depends(get_db),
 ) -> list[dict]:
-    cutoff = date.today() - timedelta(days=days - 1)
+    cutoff = cutoff_date(resolve_days(days, period))
 
     q = db.query(
         DailyOrgSummary.date,
@@ -268,7 +272,9 @@ def get_usage_trends(
         func.sum(DailyOrgSummary.success_count).label("success_count"),
         func.sum(DailyOrgSummary.failure_count).label("failure_count"),
         func.avg(DailyOrgSummary.avg_latency_ms).label("avg_latency_ms"),
-    ).filter(DailyOrgSummary.date >= cutoff)
+    )
+    if cutoff:
+        q = q.filter(DailyOrgSummary.date >= cutoff)
 
     q = _org_filter(q, DailyOrgSummary, org_id=org_id)
     q = _project_filter(q, DailyOrgSummary, project_id=project_id)
@@ -303,16 +309,24 @@ def get_overview(
     project_id: Optional[str] = Query(None),
     model: Optional[str] = Query(None),
     provider: Optional[str] = Query(None),
-    range: Optional[str] = Query(None, description="today | 7d | 30d | 90d | all"),
+    range: Optional[str] = Query(None, description="today | 7d | 14d | 30d | 90d | all"),
     db: Session = Depends(get_db),
 ) -> dict:
     today = date.today()
     range_key = (range or "all").lower()
+    _VALID_RANGE_KEYS = {"today", "week", "month", "quarter", *ALLOWED_PERIODS}
+    if range is not None and range_key not in _VALID_RANGE_KEYS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid range '{range}'. Expected one of: {', '.join(sorted(_VALID_RANGE_KEYS))}.",
+        )
 
     if range_key == "today":
         cutoff = today
     elif range_key in {"7d", "week"}:
         cutoff = today - timedelta(days=6)
+    elif range_key == "14d":
+        cutoff = today - timedelta(days=13)
     elif range_key in {"30d", "month"}:
         cutoff = today - timedelta(days=29)
     elif range_key in {"90d", "quarter"}:

@@ -192,7 +192,7 @@ def cost_by_user(
     ).join(AiRequest, AiRequest.request_id == RequestCost.request_id)
     q = _org_filter(q, RequestCost, org_id=org_id)
     q = _project_filter(q, RequestCost, project_id=project_id)
-    q = _date_filter(q, RequestCost, start=start, end=end)
+    q = _date_filter(q, RequestCost, start=start, end=end, days=days, period=period)
     rows = (
         q.group_by(AiRequest.user_id, AiRequest.user_email, AiRequest.user_role)
         .order_by(func.sum(RequestCost.total_cost).desc())
@@ -226,6 +226,8 @@ def cost_by_org(
     *,
     start: Optional[date] = Query(None),
     end: Optional[date] = Query(None),
+    days: Optional[int] = Query(None, ge=1, le=365),
+    period: Optional[str] = _PERIOD_QUERY,
     db: Session = Depends(get_db),
 ) -> list[dict]:
     q = db.query(
@@ -238,7 +240,7 @@ def cost_by_org(
         func.sum(RequestCost.total_tokens).label("total_tokens"),
         func.sum(RequestCost.total_cost).label("total_cost"),
     ).join(AiRequest, AiRequest.request_id == RequestCost.request_id)
-    q = _date_filter(q, RequestCost, start=start, end=end)
+    q = _date_filter(q, RequestCost, start=start, end=end, days=days, period=period)
     rows = (
         q.group_by(RequestCost.org_id)
         .order_by(func.sum(RequestCost.total_cost).desc())
@@ -268,9 +270,10 @@ def cost_trend_daily(
     org_id: Optional[str] = Query(None),
     project_id: Optional[str] = Query(None),
     days: int = Query(30, ge=1, le=365),
+    period: Optional[str] = _PERIOD_QUERY,
     db: Session = Depends(get_db),
 ) -> list[dict]:
-    cutoff = date.today() - timedelta(days=days - 1)
+    cutoff = cutoff_date(resolve_days(days, period))
 
     q = db.query(
         func.date(RequestCost.created_at).label("day"),
@@ -283,9 +286,9 @@ def cost_trend_daily(
         func.sum(RequestCost.input_token_cost).label("input_token_cost"),
         func.sum(RequestCost.output_token_cost).label("output_token_cost"),
         func.sum(RequestCost.total_cost).label("total_cost"),
-    ).join(AiRequest, AiRequest.request_id == RequestCost.request_id).filter(
-        func.date(RequestCost.created_at) >= cutoff
-    )
+    ).join(AiRequest, AiRequest.request_id == RequestCost.request_id)
+    if cutoff:
+        q = q.filter(func.date(RequestCost.created_at) >= cutoff)
 
     q = _org_filter(q, RequestCost, org_id=org_id)
     q = _project_filter(q, RequestCost, project_id=project_id)
@@ -431,6 +434,8 @@ def cost_summary(
     project_id: Optional[str] = Query(None),
     start: Optional[date] = Query(None),
     end: Optional[date] = Query(None),
+    days: Optional[int] = Query(None, ge=1, le=365),
+    period: Optional[str] = _PERIOD_QUERY,
     db: Session = Depends(get_db),
 ) -> dict:
     q = db.query(
@@ -446,7 +451,7 @@ def cost_summary(
     ).join(AiRequest, AiRequest.request_id == RequestCost.request_id)
     q = _org_filter(q, RequestCost, org_id=org_id)
     q = _project_filter(q, RequestCost, project_id=project_id)
-    q = _date_filter(q, RequestCost, start=start, end=end)
+    q = _date_filter(q, RequestCost, start=start, end=end, days=days, period=period)
     r = q.first()
 
     return {
