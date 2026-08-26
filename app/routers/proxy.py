@@ -53,6 +53,7 @@ from app.config import (
     get_azure_retry_max_attempts,
     get_azure_total_deadline_seconds,
 )
+from app.core.date_filters import cutoff_date, cutoff_datetime, resolve_days
 from app.core.deps import get_db
 from app.models import AiRequest, AiResponse, RequestCost, RouteExecution, TokenUsage
 from app.services.audit_service import log_event
@@ -2100,6 +2101,9 @@ def stats_by_project_model(
     start: Optional[date] = Query(None),
     end: Optional[date] = Query(None),
     days: Optional[int] = Query(30, ge=1, le=365),
+    period: Optional[str] = Query(
+        None, description="7d | 14d | 30d | 90d | all — overrides `days` when set"
+    ),
     db: Session = Depends(get_db),
 ) -> list[dict]:
     q = db.query(
@@ -2133,9 +2137,10 @@ def stats_by_project_model(
             q = q.filter(RequestCost.created_at >= datetime.combine(start, datetime.min.time()))
         if end:
             q = q.filter(RequestCost.created_at < datetime.combine(end, datetime.min.time()) + timedelta(days=1))
-    elif days:
-        cutoff_dt = datetime.combine(date.today() - timedelta(days=days - 1), datetime.min.time())
-        q = q.filter(RequestCost.created_at >= cutoff_dt)
+    else:
+        cutoff_dt = cutoff_datetime(resolve_days(days, period))
+        if cutoff_dt:
+            q = q.filter(RequestCost.created_at >= cutoff_dt)
 
     rows = (
         q.group_by(RequestCost.project_id, RequestCost.model_name)
@@ -2169,6 +2174,9 @@ def proxy_stats_overview(
     *,
     org_id: Optional[str] = Query(None),
     days: int = Query(30, ge=1, le=365),
+    period: Optional[str] = Query(
+        None, description="7d | 14d | 30d | 90d | all — overrides `days` when set"
+    ),
     project_id: Optional[str] = Query(None),
     provider: Optional[str] = Query(None),
     model_name: Optional[str] = Query(None),
@@ -2178,7 +2186,7 @@ def proxy_stats_overview(
     # (org_id, project_id, created_at) / (model_name, created_at) indexes);
     # func.date(created_at) as used below would defeat those indexes and
     # force a full-table scan on every call.
-    cutoff = datetime.combine(datetime.utcnow().date() - timedelta(days=days - 1), datetime.min.time())
+    cutoff = cutoff_datetime(resolve_days(days, period))
     # Requests that never reached a terminal status (crashed/timed out before
     # the handler could mark them success/failed/partial/blocked) stay stuck
     # at "pending" forever. Treat any pending row older than this as failed.
@@ -2195,9 +2203,9 @@ def proxy_stats_overview(
         func.sum(RequestCost.total_tokens).label("total_tokens"),
         func.sum(RequestCost.llm_cost).label("llm_cost"),
         func.sum(RequestCost.total_cost).label("total_cost"),
-    ).join(AiRequest, AiRequest.request_id == RequestCost.request_id).filter(
-        RequestCost.created_at >= cutoff
-    )
+    ).join(AiRequest, AiRequest.request_id == RequestCost.request_id)
+    if cutoff:
+        cost_q = cost_q.filter(RequestCost.created_at >= cutoff)
     if org_id:
         cost_q = cost_q.filter(RequestCost.org_id == org_id)
     if project_id:
@@ -2243,7 +2251,9 @@ def proxy_stats_overview(
                 Integer,
             )
         ).label("blocked"),
-    ).filter(AiRequest.created_at >= cutoff)
+    )
+    if cutoff:
+        req_q = req_q.filter(AiRequest.created_at >= cutoff)
     if org_id:
         req_q = req_q.filter(AiRequest.org_id == org_id)
     if project_id:
@@ -2259,9 +2269,9 @@ def proxy_stats_overview(
     partial = int(req_stats.partial or 0)
     blocked = int(req_stats.blocked or 0)
 
-    latency_q = db.query(func.avg(AiResponse.latency_ms)).filter(
-        AiResponse.created_at >= cutoff,
-    )
+    latency_q = db.query(func.avg(AiResponse.latency_ms))
+    if cutoff:
+        latency_q = latency_q.filter(AiResponse.created_at >= cutoff)
     if org_id:
         latency_q = latency_q.filter(AiResponse.org_id == org_id)
     if project_id:
@@ -2275,8 +2285,9 @@ def proxy_stats_overview(
     pii_q = db.query(func.count(AiRequest.id)).filter(
         AiRequest.pii_detected == True,
         AiRequest.parent_request_id.is_(None),
-        AiRequest.created_at >= cutoff,
     )
+    if cutoff:
+        pii_q = pii_q.filter(AiRequest.created_at >= cutoff)
     if org_id:
         pii_q = pii_q.filter(AiRequest.org_id == org_id)
     if project_id:
@@ -2311,6 +2322,9 @@ def proxy_stats_trends(
     *,
     org_id: Optional[str] = Query(None),
     days: int = Query(30, ge=1, le=365),
+    period: Optional[str] = Query(
+        None, description="7d | 14d | 30d | 90d | all — overrides `days` when set"
+    ),
     project_id: Optional[str] = Query(None),
     provider: Optional[str] = Query(None),
     model_name: Optional[str] = Query(None),
@@ -2320,7 +2334,7 @@ def proxy_stats_trends(
     # (org_id, project_id, created_at) index); func.date() is still fine in
     # SELECT/GROUP BY/ORDER BY below since it runs only over the rows the
     # filter already narrowed down.
-    cutoff = datetime.combine(datetime.utcnow().date() - timedelta(days=days - 1), datetime.min.time())
+    cutoff = cutoff_datetime(resolve_days(days, period))
 
     q = db.query(
         func.date(RequestCost.created_at).label("date"),
@@ -2332,9 +2346,9 @@ def proxy_stats_trends(
         func.sum(RequestCost.output_tokens).label("completion_tokens"),
         func.sum(RequestCost.llm_cost).label("llm_cost"),
         func.sum(RequestCost.total_cost).label("total_cost"),
-    ).join(AiRequest, AiRequest.request_id == RequestCost.request_id).filter(
-        RequestCost.created_at >= cutoff
-    )
+    ).join(AiRequest, AiRequest.request_id == RequestCost.request_id)
+    if cutoff:
+        q = q.filter(RequestCost.created_at >= cutoff)
     if org_id:
         q = q.filter(RequestCost.org_id == org_id)
     if project_id:
@@ -2369,6 +2383,9 @@ def proxy_stats_pii(
     *,
     org_id: Optional[str] = Query(None),
     days: int = Query(30, ge=1, le=365),
+    period: Optional[str] = Query(
+        None, description="7d | 14d | 30d | 90d | all — overrides `days` when set"
+    ),
     project_id: Optional[str] = Query(None),
     provider: Optional[str] = Query(None),
     model_name: Optional[str] = Query(None),
@@ -2376,14 +2393,17 @@ def proxy_stats_pii(
 ) -> dict:
     from sqlalchemy import text as _text
 
-    cutoff = (datetime.utcnow().date() - timedelta(days=days - 1)).isoformat()
+    cutoff_days = resolve_days(days, period)
+    cutoff_filter = "AND DATE(created_at) >= :cutoff" if cutoff_days else ""
 
     org_filter = "AND org_id = :org_id" if org_id else ""
     project_filter = "AND project_id = :project_id" if project_id else ""
     provider_filter = "AND provider = :provider" if provider else ""
     model_filter = "AND model_name = :model_name" if model_name else ""
 
-    params = {"cutoff": cutoff}
+    params = {}
+    if cutoff_days:
+        params["cutoff"] = cutoff_date(cutoff_days).isoformat()
     if org_id:
         params["org_id"] = org_id
     if project_id:
@@ -2404,7 +2424,7 @@ def proxy_stats_pii(
              ) AS unnested_type
         WHERE pii_detected = TRUE
           AND parent_request_id IS NULL
-          AND DATE(created_at) >= :cutoff
+          {cutoff_filter}
           {org_filter}
           {project_filter}
           {provider_filter}
@@ -2419,7 +2439,7 @@ def proxy_stats_pii(
         WHERE pii_detected = TRUE
           AND pii_action_taken IS NOT NULL
           AND parent_request_id IS NULL
-          AND DATE(created_at) >= :cutoff
+          {cutoff_filter}
           {org_filter}
           {project_filter}
           {provider_filter}
@@ -2442,6 +2462,9 @@ def proxy_stats_tool_call_reliability(
     *,
     org_id: Optional[str] = Query(None),
     days: int = Query(30, ge=1, le=365),
+    period: Optional[str] = Query(
+        None, description="7d | 14d | 30d | 90d | all — overrides `days` when set"
+    ),
     db: Session = Depends(get_db),
 ) -> list[dict]:
     """Per-model breakdown of tool-equipped requests vs. requests where the
@@ -2450,7 +2473,7 @@ def proxy_stats_tool_call_reliability(
     this is the pattern behind silent agent failures that hallucinate an
     excuse instead of calling any tool.
     """
-    cutoff = datetime.utcnow().date() - timedelta(days=days - 1)
+    cutoff = cutoff_date(resolve_days(days, period))
 
     q = (
         db.query(
@@ -2459,11 +2482,10 @@ def proxy_stats_tool_call_reliability(
             func.sum(cast(AiResponse.num_tool_calls > 0, Integer)).label("requests_with_tool_calls"),
         )
         .join(AiResponse, AiResponse.request_id == AiRequest.request_id)
-        .filter(
-            AiRequest.has_tool_definitions.is_(True),
-            func.date(AiRequest.created_at) >= cutoff,
-        )
+        .filter(AiRequest.has_tool_definitions.is_(True))
     )
+    if cutoff:
+        q = q.filter(func.date(AiRequest.created_at) >= cutoff)
     if org_id:
         q = q.filter(AiRequest.org_id == org_id)
 
