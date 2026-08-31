@@ -609,6 +609,12 @@ CREATE INDEX IF NOT EXISTS ix_ai_requests_governance_key
 CREATE INDEX IF NOT EXISTS ix_ai_requests_model
     ON ai_requests (model_name, created_at DESC);
 
+-- Plain date-range filter (no org_id/model_name equality predicate), used by
+-- dashboard stats endpoints called with only ?days=N — the composite indexes
+-- above can't be used for a range-only WHERE created_at >= cutoff.
+CREATE INDEX IF NOT EXISTS ix_ai_requests_created_at
+    ON ai_requests (created_at DESC);
+
 -- Correlation lookups: GET /proxy/v1/requests?group_by=trace_id
 CREATE INDEX IF NOT EXISTS ix_ai_requests_trace_id
     ON ai_requests (trace_id);
@@ -616,8 +622,15 @@ CREATE INDEX IF NOT EXISTS ix_ai_requests_trace_id
 CREATE INDEX IF NOT EXISTS ix_ai_requests_parent_request_id
     ON ai_requests (parent_request_id);
 
+-- GET /proxy/v1/requests: WHERE parent_request_id IS NULL ORDER BY created_at DESC
+CREATE INDEX IF NOT EXISTS ix_ai_requests_parent_created
+    ON ai_requests (parent_request_id, created_at DESC);
+
 CREATE INDEX IF NOT EXISTS ix_ai_responses_request
     ON ai_responses (request_id);
+
+CREATE INDEX IF NOT EXISTS ix_ai_responses_created_at
+    ON ai_responses (created_at DESC);
 
 -- Token & cost
 CREATE INDEX IF NOT EXISTS ix_token_usage_request
@@ -631,6 +644,10 @@ CREATE INDEX IF NOT EXISTS ix_request_cost_org_project
 
 CREATE INDEX IF NOT EXISTS ix_request_cost_model
     ON request_cost (model_name, created_at DESC);
+
+-- Plain date-range filter, same rationale as ix_ai_requests_created_at above.
+CREATE INDEX IF NOT EXISTS ix_request_cost_created_at
+    ON request_cost (created_at DESC);
 
 -- Dashboard rollups
 CREATE INDEX IF NOT EXISTS ix_daily_org_summary_org_date
