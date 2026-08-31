@@ -910,6 +910,7 @@ class PiiPolicy(Base):
     id = Column(BigInteger, primary_key=True)
     policy_id = Column(String(120), unique=True, nullable=False)
     org_id = Column(String(100), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=True)
+    project_id = Column(String(100), ForeignKey("projects.id", ondelete="CASCADE"), nullable=True)
     pii_type = Column(String(100), nullable=False)
     risk_level = Column(String(20), default="medium")
     action = Column(String(20), default="mask")
