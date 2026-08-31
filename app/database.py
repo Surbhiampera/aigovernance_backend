@@ -21,6 +21,7 @@ def _build_database_url() -> str:
 DATABASE_URL = _build_database_url()
 
 from app.config import (
+    get_db_connect_timeout,
     get_db_max_overflow,
     get_db_pool_recycle,
     get_db_pool_size,
@@ -47,6 +48,15 @@ def _engine_kwargs() -> dict:
                 "pool_size": get_db_pool_size(),
                 "max_overflow": get_db_max_overflow(),
                 "pool_timeout": get_db_pool_timeout(),
+                # Bounds the initial TCP/SSL handshake to Postgres. Without this,
+                # a connection attempt that can't complete (e.g. the network
+                # blip a fresh container can hit right after a redeploy) hangs
+                # on the OS-default socket timeout — which, during
+                # app/main.py's lifespan startup, blocks Uvicorn from ever
+                # opening the port, so every request 504s until it resolves.
+                # A bounded failure here lets startup fail fast and retry
+                # instead of hanging indefinitely.
+                "connect_args": {"connect_timeout": get_db_connect_timeout()},
             }
         )
     return kwargs

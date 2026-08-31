@@ -176,6 +176,18 @@ def get_db_pool_recycle() -> int:
     return _int("DB_POOL_RECYCLE", "1800")
 
 
+def get_db_connect_timeout() -> int:
+    """Seconds to wait for the initial TCP/SSL handshake to Postgres.
+
+    Bounds connection *establishment* specifically — separate from
+    pool_timeout (which only bounds waiting for a pooled connection to free
+    up) and from a connection's statement_timeout (which only applies once
+    connected). Without this, an unreachable DB at startup hangs on the
+    OS-default socket timeout, which blocks lifespan startup indefinitely.
+    """
+    return _int("DB_CONNECT_TIMEOUT", "10")
+
+
 def get_scheduler_max_workers() -> int:
     """Maximum APScheduler worker threads inside each API process."""
     return _int("SCHEDULER_MAX_WORKERS", "2")
