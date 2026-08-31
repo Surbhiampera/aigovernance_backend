@@ -80,6 +80,11 @@ _LOW_SENSITIVITY_DEFAULT_ALLOW: frozenset[str] = frozenset({
     "location", "organization", "url"
 })
 
+# Sentinel pii_type on a project-scoped PiiPolicy row (action="allow") that turns
+# off PII scanning entirely for that one project — no detection, no masking, no
+# pii_* fields recorded — while every other project keeps its normal policies.
+_DISABLE_ALL_PII_TYPE = "__disable_all__"
+
 
 def compute_pii_severity(entity_types: list[str]) -> str:
     """Return 'high'/'medium'/'low'/'' based on the sensitivity of detected entities.
