@@ -208,7 +208,7 @@ _RISK_ORDER: dict[str, int] = {"low": 1, "medium": 2, "high": 3}
 # ---------------------------------------------------------------------------
 # Policy loader
 # ---------------------------------------------------------------------------
-def _load_policies(db: Session, org_id: str) -> dict[str, dict]:
+def _load_policies(db: Session, org_id: str, project_id: Optional[str] = None) -> dict[str, dict]:
     from app.models import PiiPolicy
 
     rows = (
@@ -216,20 +216,35 @@ def _load_policies(db: Session, org_id: str) -> dict[str, dict]:
         .filter(
             PiiPolicy.is_active == True,
             (PiiPolicy.org_id == org_id) | (PiiPolicy.org_id == None),
+            (PiiPolicy.project_id == None) | (PiiPolicy.project_id == project_id),
         )
         .order_by(PiiPolicy.priority.desc())
         .all()
     )
 
+    def _as_dict(row) -> dict:
+        return {
+            "risk_level":    row.risk_level,
+            "action":        row.action,
+            "mask_pattern":  row.mask_pattern or _DEFAULT_MASKS.get(row.pii_type, f"[{row.pii_type.upper()}]"),
+            "log_detection": row.log_detection,
+        }
+
+    # Resolve org-vs-global rows first (org-specific always beats global default,
+    # same as before), then layer project-specific rows on top so a project
+    # override always wins regardless of priority ordering.
     policies: dict[str, dict] = {}
     for row in rows:
+        if row.project_id is not None:
+            continue
         if row.pii_type not in policies or row.org_id == org_id:
-            policies[row.pii_type] = {
-                "risk_level":    row.risk_level,
-                "action":        row.action,
-                "mask_pattern":  row.mask_pattern or _DEFAULT_MASKS.get(row.pii_type, f"[{row.pii_type.upper()}]"),
-                "log_detection": row.log_detection,
-            }
+            policies[row.pii_type] = _as_dict(row)
+
+    if project_id is not None:
+        for row in rows:
+            if row.project_id == project_id:
+                policies[row.pii_type] = _as_dict(row)
+
     return policies
 
 
@@ -247,9 +262,12 @@ def scan_and_mask(
         return PiiScanResult(sanitized_text=text or "")
 
     if policies is None and db is not None:
-        policies = _load_policies(db, org_id)
+        policies = _load_policies(db, org_id, project_id)
     if policies is None:
         policies = {}
+
+    if policies.get(_DISABLE_ALL_PII_TYPE, {}).get("action") == "allow":
+        return PiiScanResult(sanitized_text=text)
 
     try:
         analyzer, anonymizer = _get_engines()
