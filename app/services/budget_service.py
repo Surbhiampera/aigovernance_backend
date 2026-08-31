@@ -188,7 +188,11 @@ def _evaluate_budget(
             alert_type="budget_warning",
             severity="high",
         )
-        db.flush()
+        # Commit now rather than leaving this on the request's still-open
+        # transaction — see verify_governance_key() for why: this Alert
+        # row's lock would otherwise be held through the outbound LLM call,
+        # serializing concurrent requests for the same org/project.
+        db.commit()
 
 
 def _write_budget_audit(

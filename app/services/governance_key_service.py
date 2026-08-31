@@ -90,14 +90,20 @@ def verify_governance_key(db: Session, raw_key: str) -> Optional[dict]:
 
     # Update last_used_at
     row.last_used_at = datetime.utcnow()
-    db.flush()
-
-    return {
+    identity = {
         "key_id":     row.id,
         "org_id":     row.org_id,
         "project_id": row.project_id,
         "key_name":   row.key_name,
     }
+    # Commit now rather than leaving this in the request's still-open
+    # transaction: the proxy holds `db` for the rest of the request,
+    # including the outbound LLM call (up to AZURE_TOTAL_DEADLINE_SECONDS).
+    # Deferring the commit held this row's lock that whole time, so
+    # concurrent requests on the same governance key fully serialized on it.
+    db.commit()
+
+    return identity
 
 
 def revoke_governance_key(db: Session, key_id: str) -> bool:
