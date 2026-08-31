@@ -40,9 +40,18 @@ def _is_reasoning_model(model: Optional[str]) -> bool:
 
 
 def _normalize_reasoning_params(body: dict) -> dict:
+    """Reasoning models spend one shared token budget on hidden reasoning
+    *and* visible content. A caller-supplied cap sized for the visible
+    answer alone can be fully consumed by reasoning before any content is
+    written — empty response, finish_reason='length' — and larger inputs
+    need more reasoning tokens to process, so this gets worse as input size
+    grows. Drop any caller-supplied cap entirely rather than raising it to a
+    fixed replacement, so reasoning always has room to finish regardless of
+    input size; the model is still bounded by its own context window.
+    """
     out = dict(body)
-    if "max_tokens" in out:
-        out.setdefault("max_completion_tokens", out.pop("max_tokens"))
+    out.pop("max_tokens", None)
+    out.pop("max_completion_tokens", None)
     if out.get("temperature", 1) != 1:
         out.pop("temperature", None)
     if out.get("top_p", 1) != 1:
