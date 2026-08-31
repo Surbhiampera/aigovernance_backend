@@ -71,6 +71,12 @@ All AI requests from external teams go through these endpoints. Include your gov
 > - Rate limiting and budget enforcement are unaffected — they still evaluate every call in real time, since there's no way to know in advance how many child calls will follow.
 >
 > Optional — omit `X-Trace-Id` and the request is logged standalone (it's its own parent, `parent_request_id` is `null`), exactly as before.
+
+> **Set your HTTP client timeout above 100–120s**
+>
+> This backend retries and fails over across provider deployments internally, with a per-attempt cap of 60s and a total budget of up to 90s for the whole request (see `GOVERNANCE_WORKFLOW.md` §3 for the exact env vars). If your own HTTP client's timeout is set at or below that — 60s is a common default — it can fire *while this backend is still legitimately working on the request*, before its own error response has a chance to come back.
+>
+> This shows up as a bare connection-level read timeout (e.g. Python `requests.exceptions.ReadTimeout`) rather than one of the documented error responses below, and it is **not** a signal that governance is down — it means the caller gave up first. Do not treat it as a reason to bypass this proxy and call the provider directly; that skips every enforcement path (budget, PII, rate limit) and the audit trail for that request. Set the client's read timeout to at least 100–120s for non-streaming calls instead.
 >
 > **Integration checklist for client teams with multi-call pipelines (e.g. classify → tool-select → generate-response chatbots):**
 >

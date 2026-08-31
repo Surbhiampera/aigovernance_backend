@@ -39,6 +39,16 @@ Implemented in `_run_pre_flight()`. Each stage that blocks the request writes an
 - On success: token usage is read from Azure's own `usage` field when present, falling back to a tiktoken estimate otherwise (see §8). Cost calculation and the `AiResponse` / `TokenUsage` / `RequestCost` / `AuditLog` / `RouteExecution` writes happen in a **background task after the client already has the response** — the client is never blocked on bookkeeping.
 - The client receives the **raw provider response body, verbatim**, plus an added `X-Request-Id` header.
 
+### Worst-case latency budget — callers must set their HTTP timeout above this
+
+Per-attempt and total retry/failover budgets (`app/config.py`, `get_azure_read_timeout_seconds` / `get_azure_total_deadline_seconds`):
+
+- `AZURE_READ_TIMEOUT_SECONDS` (default **60s**) — how long a single attempt against one provider/deployment is allowed to hang before it's treated as failed.
+- `AZURE_TOTAL_DEADLINE_SECONDS` (default **90s**) — hard wall-clock cap across *every* retry and every failover candidate combined, kept under Azure App Service's fixed 230s front-end timeout so this app's own error handling always returns first.
+- On top of that 90s, add whatever the pre-flight pipeline itself takes (auth, rate limit, budget, PII scan, DB writes — normally milliseconds, but not zero) before the upstream call even starts.
+
+**A calling client's own HTTP timeout must be set comfortably above this — at least 100–120s for non-streaming `/proxy*` calls.** A client timeout at or below ~60–90s can fire *while this backend is still legitimately retrying/failing over*, before its own 502/503 has a chance to return. Seen in practice: a client with a 60s `requests` timeout getting `ReadTimeout` on a slow-but-in-progress request, then silently calling the provider directly as a "fallback" — which skips every governance control (budget, PII, rate limit, audit) for that request. That's not this backend being down; it's the caller giving up before this backend's own retry budget was exhausted.
+
 ### Streaming (`/proxy/stream`)
 Same pre-flight pipeline. Tokens are **always** tiktoken-estimated (Azure doesn't reliably report usage inside SSE chunks). DB writes happen synchronously at the end of the generator, not backgrounded. A stream that drops mid-way is recorded as `request_status="partial"`, `failure_code="stream_incomplete"`, and still bills whatever tokens were actually produced.
 
@@ -167,3 +177,4 @@ All dashboard data is read from the tables in §10 (live) or §11 (pre-aggregate
 3. **Two independent, divergent cost-calculation implementations** (§9) — proxy path vs. ingestion/telemetry path.
 4. **Rate limiting, budget checks, and PII scanning all fail open** on unexpected exceptions (steps 2, 5, 6 in §2) — a bug in any of these services silently disables that control rather than blocking the request.
 5. **Per-model rate limits can't match** at the pre-flight call site since the model isn't resolved yet when the rate-limit check runs (§4).
+6. **No enforced minimum caller-side timeout** — this backend's own retry/failover budget can legitimately run up to ~90s (§3), but nothing stops a client from calling in with a shorter HTTP timeout. When that happens the client sees a bare connection-level `ReadTimeout`, not one of this backend's own error bodies, and (per at least one observed integration) falls back to calling the provider directly and unaudited. Worth either documenting this loudly at integration time (done, see §3) or adding a fast-fail response once elapsed time exceeds a client-realistic threshold instead of continuing to retry silently.
