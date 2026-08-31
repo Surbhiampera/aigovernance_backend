@@ -24,9 +24,34 @@ from app.services.ai_model_pricing import normalize_provider
 _NATIVE_PROVIDERS = {"azure_openai", "azure", "openai", "", "generic"}
 _DATA_URI_RE = re.compile(r"^data:([^;]+);base64,(.+)$", re.DOTALL)
 
+# OpenAI/Azure "reasoning" models (o1/o3/o4, gpt-5 family) reject the
+# standard chat-completions sampling params: max_tokens must be sent as
+# max_completion_tokens, and temperature/top_p/penalties only accept their
+# default value — anything else 400s.
+_REASONING_MODEL_PREFIXES = ("gpt-5", "o1", "o3", "o4")
+
 
 def needs_translation(provider: str) -> bool:
     return normalize_provider(provider) not in _NATIVE_PROVIDERS
+
+
+def _is_reasoning_model(model: Optional[str]) -> bool:
+    return (model or "").lower().startswith(_REASONING_MODEL_PREFIXES)
+
+
+def _normalize_reasoning_params(body: dict) -> dict:
+    out = dict(body)
+    if "max_tokens" in out:
+        out.setdefault("max_completion_tokens", out.pop("max_tokens"))
+    if out.get("temperature", 1) != 1:
+        out.pop("temperature", None)
+    if out.get("top_p", 1) != 1:
+        out.pop("top_p", None)
+    if out.get("presence_penalty", 0) != 0:
+        out.pop("presence_penalty", None)
+    if out.get("frequency_penalty", 0) != 0:
+        out.pop("frequency_penalty", None)
+    return out
 
 
 def _parse_data_uri(url: str) -> Optional[tuple[str, str]]:
@@ -47,6 +72,8 @@ def translate_outbound_body(provider: str, forward_body: dict) -> dict:
         return _to_anthropic_body(forward_body)
     if prov == "google":
         return _to_google_body(forward_body)
+    if _is_reasoning_model(forward_body.get("model")):
+        return _normalize_reasoning_params(forward_body)
     return forward_body
 
 
