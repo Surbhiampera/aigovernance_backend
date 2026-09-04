@@ -1,6 +1,6 @@
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any, List, Optional
+from typing import Any, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -626,6 +626,54 @@ class RateLimitResponse(BaseModel):
     max_requests_per_min: Optional[int] = None
     max_tokens_per_day: Optional[int] = None
     created_at: Optional[datetime] = None
+
+
+PiiAction = Literal["block", "mask", "alert"]
+# "block": reject the request outright.
+# "mask" : detect AND replace the PII span with mask_pattern ("warn and replace").
+# "alert": detect and log/audit only — text passes through unmodified ("simply warn").
+
+
+class PiiPolicyCreate(BaseModel):
+    org_id: Optional[str] = None
+    project_id: Optional[str] = None
+    pii_type: str
+    risk_level: str = "medium"
+    action: PiiAction = "mask"
+    mask_pattern: Optional[str] = None
+    log_detection: bool = True
+    priority: int = 0
+    description: Optional[str] = None
+    is_active: bool = True
+
+
+class PiiPolicyUpdate(BaseModel):
+    risk_level: Optional[str] = None
+    action: Optional[PiiAction] = None
+    mask_pattern: Optional[str] = None
+    log_detection: Optional[bool] = None
+    priority: Optional[int] = None
+    description: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+class PiiPolicyResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    policy_id: str
+    org_id: Optional[str] = None
+    project_id: Optional[str] = None
+    pii_type: str
+    risk_level: Optional[str] = None
+    action: Optional[str] = None
+    mask_pattern: Optional[str] = None
+    log_detection: Optional[bool] = None
+    priority: Optional[int] = None
+    description: Optional[str] = None
+    is_active: Optional[bool] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
 
 TraceDetailResponse.model_rebuild()

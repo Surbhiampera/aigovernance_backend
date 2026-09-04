@@ -23,6 +23,7 @@ from app.routers import (
     models,
     optimization_tips,
     organizations,
+    pii_policies,
     pricing,
     projects,
     reports,
@@ -80,6 +81,7 @@ _ALL_ROUTERS = [
     rate_limits_router,
     optimization_tips.router,
     reports.router,
+    pii_policies.router,
 ]
 
 
