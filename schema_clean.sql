@@ -156,6 +156,7 @@ CREATE TABLE IF NOT EXISTS pii_policies (
     id              BIGSERIAL PRIMARY KEY,
     policy_id       VARCHAR(120) UNIQUE NOT NULL,
     org_id          VARCHAR(100) REFERENCES organizations(id) ON DELETE CASCADE,
+    project_id      VARCHAR(100) REFERENCES projects(id) ON DELETE CASCADE,
     pii_type        VARCHAR(100) NOT NULL,
     risk_level      VARCHAR(20) DEFAULT 'medium',
     action          VARCHAR(20) DEFAULT 'mask',
