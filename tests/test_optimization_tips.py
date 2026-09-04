@@ -479,3 +479,193 @@ def test_generate_optimization_tips_dedups_and_respects_cooldown(db_session):
     assert inserted_third == 0
     db_session.refresh(tip)
     assert tip.status == "dismissed"
+
+
+# ---------------------------------------------------------------------------
+# Apply / Dismiss — real enforcement (app/routers/optimization_tips.py)
+# ---------------------------------------------------------------------------
+
+def test_apply_model_substitution_creates_redirect_rule(db_session):
+    org_id, project_id = "org-tip-apply-ms", "proj-tip-apply-ms"
+    _seed_org(db_session, org_id, project_id)
+    tip = _make_tip(
+        db_session, org_id=org_id, project_id=project_id, tip_type="model_substitution",
+        model_name="gpt-4", params={"from_model": "gpt-4", "to_model": "gpt-4o-mini"},
+    )
+
+    result = apply_tip(tip_id=tip.id, db=db_session)
+
+    assert result["status"] == "applied"
+    assert "gpt-4o-mini" in result["applied_summary"]
+
+    rule = (
+        db_session.query(GovernanceRule)
+        .filter(
+            GovernanceRule.org_id == org_id, GovernanceRule.project_id == project_id,
+            GovernanceRule.metric_name == "model_redirect", GovernanceRule.scope_reference == "gpt-4",
+        )
+        .one()
+    )
+    assert rule.redirect_target_model == "gpt-4o-mini"
+    assert rule.is_active is True
+
+    resolved = resolve_model_redirect(db=db_session, org_id=org_id, project_id=project_id, model="gpt-4")
+    assert resolved == "gpt-4o-mini"
+    # Untouched org/model pair is unaffected.
+    assert resolve_model_redirect(db=db_session, org_id=org_id, project_id=project_id, model="gpt-4o") == "gpt-4o"
+
+
+def test_apply_response_length_creates_cap_rule(db_session):
+    org_id, project_id = "org-tip-apply-rl", "proj-tip-apply-rl"
+    _seed_org(db_session, org_id, project_id)
+    tip = _make_tip(
+        db_session, org_id=org_id, project_id=project_id, tip_type="response_length",
+        model_name="gpt-4o", params={"model": "gpt-4o", "suggested_max_tokens": 300},
+    )
+
+    result = apply_tip(tip_id=tip.id, db=db_session)
+
+    assert result["status"] == "applied"
+    assert "300" in result["applied_summary"]
+
+    rule = (
+        db_session.query(GovernanceRule)
+        .filter(
+            GovernanceRule.org_id == org_id, GovernanceRule.project_id == project_id,
+            GovernanceRule.metric_name == "optimization_max_tokens_cap", GovernanceRule.scope_reference == "gpt-4o",
+        )
+        .one()
+    )
+    assert int(rule.threshold_value) == 300
+
+
+def test_apply_response_truncated_creates_floor_rule(db_session):
+    org_id, project_id = "org-tip-apply-rt", "proj-tip-apply-rt"
+    _seed_org(db_session, org_id, project_id)
+    tip = _make_tip(
+        db_session, org_id=org_id, project_id=project_id, tip_type="response_truncated",
+        model_name="gpt-4o", params={"model": "gpt-4o", "suggested_max_tokens": 625},
+    )
+
+    apply_tip(tip_id=tip.id, db=db_session)
+
+    rule = (
+        db_session.query(GovernanceRule)
+        .filter(
+            GovernanceRule.org_id == org_id, GovernanceRule.project_id == project_id,
+            GovernanceRule.metric_name == "optimization_max_tokens_floor",
+            GovernanceRule.scope_reference == "gpt-4o",
+        )
+        .one()
+    )
+    assert int(rule.threshold_value) == 625
+
+
+def test_apply_response_length_legacy_tip_without_suggestion_400s(db_session):
+    org_id, project_id = "org-tip-apply-legacy", "proj-tip-apply-legacy"
+    _seed_org(db_session, org_id, project_id)
+    tip = _make_tip(
+        db_session, org_id=org_id, project_id=project_id, tip_type="response_length",
+        model_name="gpt-4o", params={"model": "gpt-4o"},  # no suggested_max_tokens
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        apply_tip(tip_id=tip.id, db=db_session)
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.parametrize("tip_type", ["cache_opportunity", "oversized_prompt"])
+def test_apply_advisory_only_tips_acknowledge_without_config_change(db_session, tip_type):
+    org_id, project_id = f"org-tip-apply-{tip_type}", f"proj-tip-apply-{tip_type}"
+    _seed_org(db_session, org_id, project_id)
+    tip = _make_tip(db_session, org_id=org_id, project_id=project_id, tip_type=tip_type)
+
+    result = apply_tip(tip_id=tip.id, db=db_session)
+
+    assert result["status"] == "applied"
+    assert "applied_summary" in result
+    assert db_session.query(GovernanceRule).filter(GovernanceRule.org_id == org_id).count() == 0
+
+
+def test_dismiss_and_apply_reject_non_open_tip(db_session):
+    org_id, project_id = "org-tip-apply-guard", "proj-tip-apply-guard"
+    _seed_org(db_session, org_id, project_id)
+    tip = _make_tip(
+        db_session, org_id=org_id, project_id=project_id, tip_type="cache_opportunity",
+        status="dismissed",
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        apply_tip(tip_id=tip.id, db=db_session)
+    assert exc_info.value.status_code == 400
+
+    with pytest.raises(HTTPException) as exc_info:
+        dismiss_tip(tip_id=tip.id, db=db_session)
+    assert exc_info.value.status_code == 400
+
+
+def test_apply_and_dismiss_write_audit_log(db_session):
+    org_id, project_id = "org-tip-apply-audit", "proj-tip-apply-audit"
+    _seed_org(db_session, org_id, project_id)
+    applied_tip = _make_tip(db_session, org_id=org_id, project_id=project_id, tip_type="cache_opportunity")
+    dismissed_tip = _make_tip(db_session, org_id=org_id, project_id=project_id, tip_type="oversized_prompt")
+
+    apply_tip(tip_id=applied_tip.id, db=db_session)
+    dismiss_tip(tip_id=dismissed_tip.id, db=db_session)
+
+    actions = {
+        row.entity_id: row.audit_action
+        for row in db_session.query(AuditLog).filter(AuditLog.org_id == org_id).all()
+    }
+    assert actions[str(applied_tip.id)] == "tip_applied"
+    assert actions[str(dismissed_tip.id)] == "tip_dismissed"
+
+
+# ---------------------------------------------------------------------------
+# apply_token_overrides — proxy-side enforcement
+# ---------------------------------------------------------------------------
+
+def test_apply_token_overrides_cap_lowers_or_injects(db_session):
+    org_id, project_id = "org-tip-enf-cap", "proj-tip-enf-cap"
+    _seed_org(db_session, org_id, project_id)
+    db_session.add(GovernanceRule(
+        rule_name=f"cap-{uuid.uuid4().hex[:8]}", metric_name="optimization_max_tokens_cap",
+        operator="=", threshold_value=300, scope_level="project", scope_reference="gpt-4o",
+        is_active=True, org_id=org_id, project_id=project_id,
+    ))
+    db_session.flush()
+
+    over_limit = {"max_tokens": 1000}
+    apply_token_overrides(db=db_session, org_id=org_id, project_id=project_id, model="gpt-4o", forward_body=over_limit)
+    assert over_limit["max_tokens"] == 300
+
+    omitted = {}
+    apply_token_overrides(db=db_session, org_id=org_id, project_id=project_id, model="gpt-4o", forward_body=omitted)
+    assert omitted["max_tokens"] == 300
+
+    under_limit = {"max_tokens": 100}
+    apply_token_overrides(db=db_session, org_id=org_id, project_id=project_id, model="gpt-4o", forward_body=under_limit)
+    assert under_limit["max_tokens"] == 100
+
+
+def test_apply_token_overrides_floor_raises_only_when_below(db_session):
+    org_id, project_id = "org-tip-enf-floor", "proj-tip-enf-floor"
+    _seed_org(db_session, org_id, project_id)
+    db_session.add(GovernanceRule(
+        rule_name=f"floor-{uuid.uuid4().hex[:8]}", metric_name="optimization_max_tokens_floor",
+        operator="=", threshold_value=625, scope_level="project", scope_reference="gpt-4o",
+        is_active=True, org_id=org_id, project_id=project_id,
+    ))
+    db_session.flush()
+
+    below = {"max_tokens": 200}
+    apply_token_overrides(db=db_session, org_id=org_id, project_id=project_id, model="gpt-4o", forward_body=below)
+    assert below["max_tokens"] == 625
+
+    above = {"max_tokens": 800}
+    apply_token_overrides(db=db_session, org_id=org_id, project_id=project_id, model="gpt-4o", forward_body=above)
+    assert above["max_tokens"] == 800
+
+    omitted = {}
+    apply_token_overrides(db=db_session, org_id=org_id, project_id=project_id, model="gpt-4o", forward_body=omitted)
+    assert "max_tokens" not in omitted
