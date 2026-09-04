@@ -360,6 +360,10 @@ class GovernanceRule(Base):
     org_id = Column(String(100), nullable=True)
     project_id = Column(String(100), nullable=True)
     created_at = Column(DateTime, server_default=func.now())
+    # Only populated for metric_name="model_redirect" rows (see
+    # app/services/optimization/enforcement.py) — scope_reference holds the
+    # model being redirected FROM, this column holds the model redirected TO.
+    redirect_target_model = Column(String(120), nullable=True)
 
 
 class Alert(Base):

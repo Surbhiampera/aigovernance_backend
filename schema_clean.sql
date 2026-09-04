@@ -128,7 +128,8 @@ CREATE TABLE IF NOT EXISTS governance_rules (
     is_active       BOOLEAN DEFAULT TRUE,
     org_id          VARCHAR(100),
     project_id      VARCHAR(100),
-    created_at      TIMESTAMP DEFAULT NOW()
+    created_at      TIMESTAMP DEFAULT NOW(),
+    redirect_target_model VARCHAR(120)
 );
 
 CREATE TABLE IF NOT EXISTS budgets (
