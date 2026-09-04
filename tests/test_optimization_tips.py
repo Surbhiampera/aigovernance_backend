@@ -15,10 +15,15 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from unittest.mock import patch
 
+import pytest
+from fastapi import HTTPException
+
 from app.models import (
     AiRequest,
     AiResponse,
+    AuditLog,
     DailyOrgSummary,
+    GovernanceRule,
     ModelDeployment,
     Organization,
     OptimizationTip,
@@ -26,6 +31,8 @@ from app.models import (
     RequestCost,
     TokenUsage,
 )
+from app.routers.optimization_tips import apply_tip, dismiss_tip
+from app.services.optimization.enforcement import apply_token_overrides, resolve_model_redirect
 from app.services.optimization.registry import TipRule
 from app.services.optimization.rules.cache_opportunity import CacheOpportunityRule
 from app.services.optimization.rules.model_substitution import ModelSubstitutionRule
@@ -103,6 +110,24 @@ def _window():
     window_end = date.today()
     window_start = window_end - timedelta(days=7)
     return window_start, window_end
+
+
+def _make_tip(
+    db, *, org_id: str, project_id: str, tip_type: str,
+    model_name: str = "gpt-4o", params: dict = None, status: str = "open",
+) -> OptimizationTip:
+    window_start, window_end = _window()
+    tip = OptimizationTip(
+        org_id=org_id, project_id=project_id, model_name=model_name,
+        tip_type=tip_type, severity="medium", title=f"test {tip_type}",
+        message="test tip", estimated_monthly_savings=Decimal("1.00"),
+        confidence="medium",
+        evidence_json={"rule": tip_type, "params": params or {}},
+        status=status, period_start=window_start, period_end=window_end,
+    )
+    db.add(tip)
+    db.flush()
+    return tip
 
 
 # ---------------------------------------------------------------------------
