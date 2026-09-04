@@ -253,10 +253,8 @@ def _audit_tip_action(*, db: Session, tip: OptimizationTip, action: str, summary
         actor_type="user",
         entity_type="optimization_tip",
         entity_id=str(tip.id),
-        old_value={"status": "open"},
-        new_value={"status": tip.status},
         change_summary=summary,
-        metadata={"tip_type": tip.tip_type, "model_name": tip.model_name},
+        metadata={"tip_type": tip.tip_type, "model_name": tip.model_name, "new_status": tip.status},
         flush=False,
     )
 
