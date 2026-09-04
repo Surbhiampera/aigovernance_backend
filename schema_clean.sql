@@ -128,9 +128,13 @@ CREATE TABLE IF NOT EXISTS governance_rules (
     is_active       BOOLEAN DEFAULT TRUE,
     org_id          VARCHAR(100),
     project_id      VARCHAR(100),
-    created_at      TIMESTAMP DEFAULT NOW(),
-    redirect_target_model VARCHAR(120)
+    created_at      TIMESTAMP DEFAULT NOW()
 );
+
+-- Target model for metric_name='model_redirect' rows (optimization tips
+-- "apply" — see app/services/optimization/enforcement.py)
+ALTER TABLE governance_rules
+    ADD COLUMN IF NOT EXISTS redirect_target_model VARCHAR(120);
 
 CREATE TABLE IF NOT EXISTS budgets (
     id                      BIGSERIAL PRIMARY KEY,

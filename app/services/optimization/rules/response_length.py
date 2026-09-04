@@ -4,6 +4,7 @@ name — see app/workers/tasks.py::_rebuild_daily_summary).
 """
 from __future__ import annotations
 
+import math
 from datetime import date
 from decimal import Decimal
 from typing import Optional
@@ -69,6 +70,9 @@ class ResponseLengthRule(TipRule):
             if excess_tokens <= 0:
                 continue
 
+            avg_prompt_tokens = prompt_tokens / total_events
+            suggested_max_tokens = max(256, math.ceil(float(ratio_threshold) * avg_prompt_tokens))
+
             pricing = get_model_pricing(model_name)
             if not pricing:
                 continue
@@ -118,7 +122,11 @@ class ResponseLengthRule(TipRule):
                     "sample_request_ids": sample_ids,
                     "sample_size": total_events,
                     "window_days": window_days,
-                    "params": {"model": model_name, "excess_completion_tokens": excess_tokens},
+                    "params": {
+                        "model": model_name,
+                        "excess_completion_tokens": excess_tokens,
+                        "suggested_max_tokens": suggested_max_tokens,
+                    },
                 },
                 "period_start": window_start,
                 "period_end": window_end,

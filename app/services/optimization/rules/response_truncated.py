@@ -4,6 +4,7 @@ populated by every provider adapter; no new data needed.
 """
 from __future__ import annotations
 
+import math
 from datetime import date
 from decimal import Decimal
 from typing import Optional
@@ -12,7 +13,7 @@ from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
 from app.config import get_tip_min_requests, get_tip_truncation_rate
-from app.models import AiResponse
+from app.models import AiResponse, TokenUsage
 from app.services.optimization.registry import TipRule, tip_registry
 from app.services.optimization.utils import before_window_end, project_eq
 
@@ -73,6 +74,23 @@ class ResponseTruncatedRule(TipRule):
                 )
             ]
 
+            max_truncated_output_tokens = (
+                db.query(func.max(TokenUsage.output_tokens))
+                .join(AiResponse, AiResponse.request_id == TokenUsage.request_id)
+                .filter(
+                    AiResponse.org_id == org_id,
+                    project_eq(AiResponse.project_id, project_id),
+                    AiResponse.model_name == model_name,
+                    AiResponse.finish_reason == "length",
+                    AiResponse.created_at >= window_start,
+                    before_window_end(AiResponse.created_at, window_end),
+                )
+                .scalar()
+            ) or 0
+            suggested_max_tokens = (
+                math.ceil(max_truncated_output_tokens * 1.25) if max_truncated_output_tokens > 0 else None
+            )
+
             tips.append({
                 "org_id": org_id,
                 "project_id": project_id,
@@ -95,7 +113,11 @@ class ResponseTruncatedRule(TipRule):
                     "sample_request_ids": sample_ids,
                     "sample_size": total,
                     "window_days": window_days,
-                    "params": {"model": model_name, "truncated_count": truncated},
+                    "params": {
+                        "model": model_name,
+                        "truncated_count": truncated,
+                        "suggested_max_tokens": suggested_max_tokens,
+                    },
                 },
                 "period_start": window_start,
                 "period_end": window_end,

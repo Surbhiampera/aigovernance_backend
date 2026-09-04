@@ -72,6 +72,7 @@ from app.services.provider_translation import (
 )
 from app.services.governance_key_service import verify_governance_key
 from app.services.governance_rule_service import check_governance_rules, check_max_input_tokens
+from app.services.optimization.enforcement import apply_token_overrides, resolve_model_redirect
 
 from app.services.pii_engine import scan_and_mask
 from app.services.rate_limit_service import check_rate_limit, record_tokens_used
@@ -1548,6 +1549,13 @@ async def _run_pre_flight(
         )
         raise HTTPException(status_code=400, detail=_reason)
 
+    try:
+        model_name = resolve_model_redirect(
+            db=db, org_id=org_id, project_id=project_id, model=model_name,
+        )
+    except Exception as _e:
+        _log.warning("Model redirect check skipped: %s", _e)
+
     candidate_deployments = get_deployments_for_org(
         db, org_id=org_id, project_id=project_id, requested_model=model_name,
     )
@@ -1649,6 +1657,13 @@ async def _run_pre_flight(
     forward_body = {k: v for k, v in body.items() if k != "stream"}
     forward_body["messages"] = clean_messages
     forward_body["model"] = model
+
+    try:
+        apply_token_overrides(
+            db=db, org_id=org_id, project_id=project_id, model=model, forward_body=forward_body,
+        )
+    except Exception as _e:
+        _log.warning("Token override check skipped: %s", _e)
 
     try:
         check_max_input_tokens(
