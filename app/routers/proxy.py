@@ -411,7 +411,7 @@ def _scan_messages(
     db: Session,
 ):
     """Return (sanitised_messages, combined_pii_result)."""
-    from app.services.pii_engine import PiiScanResult, compute_pii_severity
+    from app.services.pii_engine import PiiScanResult, combine_severity
     sanitised: list[dict] = []
     combined = PiiScanResult(sanitized_text="")
 
@@ -439,6 +439,7 @@ def _scan_messages(
             )
         if result.action_taken == "mask":
             combined.action_taken = "mask"
+        combined.severity = combine_severity(combined.severity, result.severity)
         for entity in result.entity_details:
             combined.entity_details.append({
                 **entity,
@@ -464,7 +465,6 @@ def _scan_messages(
             sanitised.append({**msg, "content": scanned_blocks})
         else:
             sanitised.append(msg)
-    combined.severity = compute_pii_severity([e["pii_type"] for e in combined.entity_details])
     return sanitised, combined
 
 

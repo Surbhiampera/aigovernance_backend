@@ -86,7 +86,7 @@ _LOW_SENSITIVITY_DEFAULT_ALLOW: frozenset[str] = frozenset({
 _DISABLE_ALL_PII_TYPE = "__disable_all__"
 
 
-def compute_pii_severity(entity_types: list[str]) -> str:
+def compute_pii_severity(entity_types: list[str], risk_overrides: Optional[dict[str, str]] = None) -> str:
     """Return 'high'/'medium'/'low'/'' based on the sensitivity of detected entities.
 
     One occurrence of a high-sensitivity type (ssn, credit_card, ...) is always
@@ -94,12 +94,29 @@ def compute_pii_severity(entity_types: list[str]) -> str:
     location, url) don't count toward the volume thresholds below — only
     entities that are PII on their own do, so e.g. 11 "organization" mentions
     and nothing else stays 'low', not 'high'.
+
+    `risk_overrides` maps a pii_type to a risk_level explicitly configured via an
+    org/project PiiPolicy row. When a type has an override, it wins over the
+    hardcoded classification below — this is what lets a project (e.g. one whose
+    "national_id"-looking text is just test-app placeholder data, not real PII)
+    opt out of the type's default severity without changing it for every other
+    project.
     """
     if not entity_types:
         return ""
-    if any(t in _HIGH_SENSITIVITY for t in entity_types):
+    risk_overrides = risk_overrides or {}
+
+    def _is_high(t: str) -> bool:
+        override = risk_overrides.get(t)
+        return override == "high" if override is not None else t in _HIGH_SENSITIVITY
+
+    def _is_low(t: str) -> bool:
+        override = risk_overrides.get(t)
+        return override == "low" if override is not None else t in _LOW_SENSITIVITY_DEFAULT_ALLOW
+
+    if any(_is_high(t) for t in entity_types):
         return "high"
-    significant = [t for t in entity_types if t not in _LOW_SENSITIVITY_DEFAULT_ALLOW]
+    significant = [t for t in entity_types if not _is_low(t)]
     if len(significant) >= 5:
         return "high"
     if len(significant) >= 3:
@@ -391,5 +408,13 @@ def scan_and_mask(
         sum(1 for e in _entity_details if e["masked_value"] is not None)
         if result.pii_masked else 0
     )
-    result.severity = compute_pii_severity([e["pii_type"] for e in result.entity_details])
+    risk_overrides = {t: p["risk_level"] for t, p in policies.items() if t in by_type}
+    result.severity = compute_pii_severity(
+        [e["pii_type"] for e in result.entity_details], risk_overrides=risk_overrides
+    )
     return result
+
+
+def combine_severity(a: str, b: str) -> str:
+    """Return the higher of two severity levels ('' < low < medium < high)."""
+    return a if _RISK_ORDER.get(a, 0) >= _RISK_ORDER.get(b, 0) else b
