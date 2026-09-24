@@ -63,7 +63,6 @@ _UNUSED_TABLES = frozenset({
 })
 
 _ALL_ROUTERS = [
-    auth.router,
     summary.router,
     models.router,
     alerts.router,
@@ -213,6 +212,7 @@ for _router in _ALL_ROUTERS:
     app.include_router(_router, dependencies=_license_gate)
 app.include_router(deployments_router, dependencies=_license_gate)
 app.include_router(license_router)  # never gated — must explain a freeze even while frozen
+app.include_router(auth.router)  # never gated — users must be able to sign in while frozen
 
 # All proxy endpoints live under /proxy (see router prefix in app/routers/proxy.py).
 # External teams must set their SDK base_url to "https://<host>/proxy".

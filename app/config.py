@@ -403,3 +403,92 @@ def get_tip_duplicate_min_hits() -> int:
 def get_tip_cooldown_days() -> int:
     """Days a dismissed tip is suppressed from reappearing."""
     return _int("TIP_COOLDOWN_DAYS", "14")
+
+
+# ── Dashboard sign-in (app/routers/auth.py) ─────────────────────────────────
+# Only the /auth endpoints read these. With AUTH_JWT_SECRET unset those
+# endpoints answer 503 and nothing else in the app is affected.
+def _bool(key: str, default: str) -> bool:
+    return os.getenv(key, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+def get_auth_jwt_secret() -> str:
+    """Signs session and password-reset tokens. Must be 32+ characters and
+    identical on every worker/instance, or sessions break across them."""
+    return os.getenv("AUTH_JWT_SECRET", "")
+
+
+def get_auth_access_token_minutes() -> int:
+    return _int("AUTH_ACCESS_TOKEN_MINUTES", "480")
+
+
+def get_auth_reset_token_minutes() -> int:
+    return _int("AUTH_RESET_TOKEN_MINUTES", "30")
+
+
+def get_auth_password_min_length() -> int:
+    """Must match PASSWORD_MIN_LENGTH in the frontend's authUtils.js."""
+    return _int("AUTH_PASSWORD_MIN_LENGTH", "12")
+
+
+def get_auth_allow_registration() -> bool:
+    return _bool("AUTH_ALLOW_REGISTRATION", "true")
+
+
+def get_auth_default_role() -> str:
+    return os.getenv("AUTH_DEFAULT_ROLE", "viewer").strip() or "viewer"
+
+
+def get_auth_cookie_name() -> str:
+    return os.getenv("AUTH_COOKIE_NAME", "aigov_session").strip() or "aigov_session"
+
+
+def get_auth_cookie_secure() -> bool:
+    """Leave true anywhere served over HTTPS. Only set false for plain-HTTP
+    local development, where browsers drop Secure cookies."""
+    return _bool("AUTH_COOKIE_SECURE", "true")
+
+
+def get_auth_cookie_samesite() -> str:
+    value = os.getenv("AUTH_COOKIE_SAMESITE", "strict").strip().lower()
+    return value if value in ("strict", "lax", "none") else "strict"
+
+
+def get_auth_login_max_failures() -> int:
+    """Failed logins for one email before it is locked for AUTH_LOCKOUT_MINUTES."""
+    return _int("AUTH_LOGIN_MAX_FAILURES", "5")
+
+
+def get_auth_lockout_minutes() -> int:
+    return _int("AUTH_LOCKOUT_MINUTES", "15")
+
+
+def get_auth_ip_max_attempts() -> int:
+    """Auth attempts allowed per client IP per AUTH_IP_WINDOW_MINUTES, per endpoint."""
+    return _int("AUTH_IP_MAX_ATTEMPTS", "30")
+
+
+def get_auth_ip_window_minutes() -> int:
+    return _int("AUTH_IP_WINDOW_MINUTES", "15")
+
+
+def get_auth_forgot_max_per_hour() -> int:
+    """Reset emails sent per address per hour."""
+    return _int("AUTH_FORGOT_MAX_PER_HOUR", "3")
+
+
+def get_auth_trust_proxy_headers() -> bool:
+    """Take the client IP from X-Forwarded-For. Enable only when the backend is
+    reachable solely through your own proxy (e.g. nginx), otherwise clients
+    can spoof the header to dodge per-IP limits."""
+    return _bool("AUTH_TRUST_PROXY_HEADERS", "false")
+
+
+def get_auth_dev_log_reset_links() -> bool:
+    """Development only: log password-reset links instead of relying on SMTP.
+    Never enable in production — anyone with log access could take over accounts."""
+    return _bool("AUTH_DEV_LOG_RESET_LINKS", "false")
+
+
+def get_frontend_url() -> str:
+    return os.getenv("FRONTEND_URL", "http://localhost:3000").rstrip("/")

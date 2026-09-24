@@ -49,6 +49,8 @@ class User(Base):
     email = Column(String(150), nullable=True)
     role = Column(String(50), nullable=True)
     created_at = Column(DateTime, server_default=func.now())
+    name = Column(String(150), nullable=True)
+    password_hash = Column(String(255), nullable=True)
 
 
 class ApiKey(Base):

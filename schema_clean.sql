@@ -52,6 +52,12 @@ CREATE TABLE IF NOT EXISTS users (
     created_at      TIMESTAMP DEFAULT NOW()
 );
 
+-- Dashboard sign-in (app/routers/auth.py). Both nullable: pre-existing/seeded
+-- users have no password and set one via "Forgot password".
+ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS name          VARCHAR(150),
+    ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255);
+
 -- ---------------------------------------------------------------------------
 -- API keys (proxy governance keys)
 -- ---------------------------------------------------------------------------
@@ -596,6 +602,12 @@ CREATE TABLE IF NOT EXISTS optimization_tips (
 -- ---------------------------------------------------------------------------
 -- Indexes
 -- ---------------------------------------------------------------------------
+
+-- Users — case-insensitive email lookup for sign-in. Not UNIQUE: existing
+-- rows may already hold case-variant duplicates, and a unique index would make
+-- this file fail on those databases. Registration enforces uniqueness in code.
+CREATE INDEX IF NOT EXISTS ix_users_email_lower
+    ON users (LOWER(email));
 
 -- Audit
 CREATE INDEX IF NOT EXISTS ix_audit_logs_policy

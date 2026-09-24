@@ -21,10 +21,13 @@ Optional (Microsoft Teams via Incoming Webhooks):
 """
 from __future__ import annotations
 
+import logging
 import os
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+
+_log = logging.getLogger(__name__)
 
 _EMOJI = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢"}
 _TEAMS_COLOR = {"critical": "FF0000", "high": "FF6600", "medium": "FFCC00", "low": "00AA44"}
@@ -94,6 +97,36 @@ class NotificationService:
                 server.sendmail(self.from_email, self.notification_emails, msg.as_string())
         except Exception:
             pass
+
+    def send_email_to(self, to: str | list[str], subject: str, body: str) -> bool:
+        """Send a plain-text email to specific recipients (e.g. a password reset).
+
+        Unlike _send_email this ignores NOTIFICATION_EMAIL. Returns False when
+        SMTP is not configured or sending fails; never raises, and never logs
+        the body since it may contain a one-time link.
+        """
+        recipients = [to] if isinstance(to, str) else list(to)
+        recipients = [r.strip() for r in recipients if r and r.strip()]
+        if not self.smtp_host or not recipients:
+            if not self.smtp_host:
+                _log.warning("SMTP_HOST not set — email '%s' was not sent", subject)
+            return False
+        try:
+            msg = MIMEMultipart()
+            msg["From"] = self.from_email
+            msg["To"] = ", ".join(recipients)
+            msg["Subject"] = subject
+            msg.attach(MIMEText(body, "plain"))
+            with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=15) as server:
+                server.ehlo()
+                if self.smtp_user:
+                    server.starttls()
+                    server.login(self.smtp_user, self.smtp_password)
+                server.sendmail(self.from_email, recipients, msg.as_string())
+            return True
+        except Exception as exc:
+            _log.warning("Failed to send email '%s': %s", subject, type(exc).__name__)
+            return False
 
     # ─────────────────── whatsapp ───────────────────
 
