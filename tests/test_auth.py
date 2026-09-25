@@ -1,13 +1,11 @@
-"""Dashboard sign-in: login, lockout, /me, forgot/reset password, and that
-public registration is gone.
+"""Dashboard sign-in: login, lockout, /me, and that public registration and
+emailed-link endpoints are gone.
 
 Users are created inside the rolled-back test transaction (see conftest.py).
 Rate-limit counters are forced onto the in-memory store so tests never touch
 the real Redis.
 """
-import re
 import uuid
-from urllib.parse import unquote
 
 import pytest
 
@@ -28,18 +26,6 @@ def auth_env(monkeypatch):
     auth_rate_limit.reset_memory()
     yield
     auth_rate_limit.reset_memory()
-
-
-@pytest.fixture
-def sent_emails(monkeypatch):
-    sent = []
-
-    def fake_send(to, subject, body):
-        sent.append({"to": to, "subject": subject, "body": body})
-        return True
-
-    monkeypatch.setattr(auth_router.notification_service, "send_email_to", fake_send)
-    return sent
 
 
 def _email():
@@ -72,17 +58,18 @@ def _session(client, db_session, **kwargs):
     return user.email, res.cookies["aigov_session"]
 
 
-def _reset_token(sent_emails):
-    match = re.search(r"#token=(\S+)", sent_emails[-1]["body"])
-    assert match, "reset email should contain a link"
-    return unquote(match.group(1))
-
-
 def test_register_endpoint_is_gone(client, db_session):
     email = _email()
     res = client.post("/auth/register", json={"name": "X Y", "email": email, "password": STRONG_PASSWORD})
     assert res.status_code in (404, 405)
     assert db_session.query(User).filter(User.email == email).count() == 0
+
+
+def test_no_emailed_link_endpoints(client, db_session):
+    """Admins set passwords; there are no forgot/reset links."""
+    email = make_user(db_session).email
+    assert client.post("/auth/forgot-password", json={"email": email}).status_code in (404, 405)
+    assert client.post("/auth/reset-password", json={"token": "x", "password": NEW_PASSWORD}).status_code in (404, 405)
 
 
 def test_login_success_and_bad_password(client, db_session):
@@ -129,45 +116,6 @@ def test_me_accepts_bearer_token(client, db_session):
     _, token = _session(client, db_session)
     client.cookies.clear()
     assert client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).status_code == 200
-
-
-def test_forgot_password_same_response_for_known_and_unknown(client, db_session, sent_emails):
-    email = make_user(db_session).email
-
-    known = client.post("/auth/forgot-password", json={"email": email})
-    unknown = client.post("/auth/forgot-password", json={"email": _email()})
-    assert known.status_code == unknown.status_code == 200
-    assert known.json() == unknown.json()
-    assert [m["to"] for m in sent_emails] == [email]
-
-
-def test_reset_works_once_and_kills_old_sessions(client, db_session, sent_emails):
-    email, old_session = _session(client, db_session)
-
-    client.post("/auth/forgot-password", json={"email": email})
-    token = _reset_token(sent_emails)
-
-    weak = client.post("/auth/reset-password", json={"token": token, "password": "short"})
-    assert weak.status_code == 422
-
-    ok = client.post("/auth/reset-password", json={"token": token, "password": NEW_PASSWORD})
-    assert ok.status_code == 200
-    assert sent_emails[-1]["subject"] == "Your AI Governance password was changed"
-
-    reused = client.post("/auth/reset-password", json={"token": token, "password": "An0ther-Str0ng-One!"})
-    assert reused.status_code == 400
-
-    client.cookies.clear()
-    assert client.get("/auth/me", headers={"Authorization": f"Bearer {old_session}"}).status_code == 401
-
-    assert client.post("/auth/login", json={"email": email, "password": STRONG_PASSWORD}).status_code == 401
-    assert client.post("/auth/login", json={"email": email, "password": NEW_PASSWORD}).status_code == 200
-
-
-def test_session_token_cannot_be_used_as_reset_token(client, db_session):
-    _, session = _session(client, db_session)
-    res = client.post("/auth/reset-password", json={"token": session, "password": NEW_PASSWORD})
-    assert res.status_code == 400
 
 
 def test_unconfigured_secret_returns_503(client, monkeypatch):

@@ -424,10 +424,6 @@ def get_auth_access_token_minutes() -> int:
     return _int("AUTH_ACCESS_TOKEN_MINUTES", "480")
 
 
-def get_auth_reset_token_minutes() -> int:
-    return _int("AUTH_RESET_TOKEN_MINUTES", "30")
-
-
 def get_auth_password_min_length() -> int:
     """Must match PASSWORD_MIN_LENGTH in the frontend's authUtils.js."""
     return _int("AUTH_PASSWORD_MIN_LENGTH", "12")
@@ -471,23 +467,8 @@ def get_auth_ip_window_minutes() -> int:
     return _int("AUTH_IP_WINDOW_MINUTES", "15")
 
 
-def get_auth_forgot_max_per_hour() -> int:
-    """Reset emails sent per address per hour."""
-    return _int("AUTH_FORGOT_MAX_PER_HOUR", "3")
-
-
 def get_auth_trust_proxy_headers() -> bool:
     """Take the client IP from X-Forwarded-For. Enable only when the backend is
     reachable solely through your own proxy (e.g. nginx), otherwise clients
     can spoof the header to dodge per-IP limits."""
     return _bool("AUTH_TRUST_PROXY_HEADERS", "false")
-
-
-def get_auth_dev_log_reset_links() -> bool:
-    """Development only: log password-reset links instead of relying on SMTP.
-    Never enable in production — anyone with log access could take over accounts."""
-    return _bool("AUTH_DEV_LOG_RESET_LINKS", "false")
-
-
-def get_frontend_url() -> str:
-    return os.getenv("FRONTEND_URL", "http://localhost:3000").rstrip("/")

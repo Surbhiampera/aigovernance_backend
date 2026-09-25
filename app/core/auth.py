@@ -3,10 +3,10 @@
 Passwords: PBKDF2-SHA256 (stdlib), stored as
 ``pbkdf2_sha256$<iterations>$<salt_b64>$<hash_b64>``.
 
-Tokens: HS256 JWTs carrying ``sub`` (user id), ``purpose`` (access or
-password_reset), ``iat``, ``exp`` and ``pwv`` — a short fingerprint of the
-user's current password hash. Changing the password changes the fingerprint,
-which makes a reset link single-use and ends every existing session.
+Tokens: HS256 JWTs carrying ``sub`` (user id), ``purpose`` (access), ``iat``,
+``exp`` and ``pwv`` — a short fingerprint of the user's current password hash.
+Changing the password changes the fingerprint, which ends every existing
+session.
 Tokens never carry the role: it is read from the database on every request,
 so role changes and removals apply immediately.
 """
@@ -29,7 +29,6 @@ from app.config import (
     get_auth_cookie_name,
     get_auth_jwt_secret,
     get_auth_password_min_length,
-    get_auth_reset_token_minutes,
 )
 from app.core.deps import get_db
 
@@ -37,7 +36,6 @@ from app.core.deps import get_db
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 
 PURPOSE_ACCESS = "access"
-PURPOSE_RESET = "password_reset"
 
 ADMIN_ROLE = "admin"
 
@@ -163,7 +161,7 @@ def password_fingerprint(password_hash: Optional[str]) -> str:
 
 
 def create_token(user, purpose: str) -> str:
-    minutes = get_auth_access_token_minutes() if purpose == PURPOSE_ACCESS else get_auth_reset_token_minutes()
+    minutes = get_auth_access_token_minutes()
     now = datetime.now(timezone.utc)
     payload = {
         "sub": user.id,
