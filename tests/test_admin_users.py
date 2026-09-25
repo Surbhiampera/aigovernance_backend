@@ -13,7 +13,6 @@ import pytest
 from app.models import AuditLog, User
 from tests.test_auth import (  # noqa: F401  (auth_env is an autouse fixture)
     NEW_PASSWORD,
-    STRONG_PASSWORD,
     _email,
     _login,
     auth_env,
