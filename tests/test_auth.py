@@ -92,6 +92,7 @@ def test_login_success_and_bad_password(client, db_session):
     assert ok.status_code == 200
     assert ok.json()["user"]["email"] == email
     assert "aigov_session" in ok.cookies
+    assert ok.headers["cache-control"] == "no-store"
 
     bad = client.post("/auth/login", json={"email": email, "password": "Wrong-Passw0rd!"})
     assert bad.status_code == 401
