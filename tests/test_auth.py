@@ -1,4 +1,5 @@
-"""Dashboard sign-in: register, login, lockout, /me, forgot/reset password.
+"""Dashboard sign-in: login, lockout, /me, forgot/reset password, and that
+public registration is gone.
 
 Users are created inside the rolled-back test transaction (see conftest.py).
 Rate-limit counters are forced onto the in-memory store so tests never touch
@@ -10,6 +11,8 @@ from urllib.parse import unquote
 
 import pytest
 
+from app.core.auth import hash_password
+from app.models import User
 from app.routers import auth as auth_router
 from app.services import auth_rate_limit
 
@@ -21,7 +24,6 @@ NEW_PASSWORD = "C0rrect-Horse-Battery!"
 def auth_env(monkeypatch):
     monkeypatch.setenv("AUTH_JWT_SECRET", "test-secret-" + "x" * 40)
     monkeypatch.setenv("AUTH_COOKIE_SECURE", "false")  # TestClient talks plain HTTP
-    monkeypatch.setenv("AUTH_ALLOW_REGISTRATION", "true")
     monkeypatch.setattr(auth_rate_limit, "get_redis_client", lambda: None)
     auth_rate_limit.reset_memory()
     yield
@@ -44,8 +46,30 @@ def _email():
     return f"auth-test-{uuid.uuid4().hex[:10]}@example.com"
 
 
-def _register(client, email, password=STRONG_PASSWORD, name="Test Person"):
-    return client.post("/auth/register", json={"name": name, "email": email, "password": password})
+def make_user(db_session, email=None, password=STRONG_PASSWORD, role="viewer", name="Test Person"):
+    """Insert a user directly (there is no sign-up). password=None → invited."""
+    user = User(
+        id=str(uuid.uuid4()),
+        email=email or _email(),
+        name=name,
+        role=role,
+        password_hash=hash_password(password) if password else None,
+    )
+    db_session.add(user)
+    db_session.flush()
+    return user
+
+
+def _login(client, email, password=STRONG_PASSWORD):
+    return client.post("/auth/login", json={"email": email, "password": password})
+
+
+def _session(client, db_session, **kwargs):
+    """Create a user, sign in; return (email, session token)."""
+    user = make_user(db_session, **kwargs)
+    res = _login(client, user.email)
+    assert res.status_code == 200
+    return user.email, res.cookies["aigov_session"]
 
 
 def _reset_token(sent_emails):
@@ -54,33 +78,15 @@ def _reset_token(sent_emails):
     return unquote(match.group(1))
 
 
-def test_register_success_and_duplicate(client):
+def test_register_endpoint_is_gone(client, db_session):
     email = _email()
-    res = _register(client, email)
-    assert res.status_code == 200
-    assert res.json()["user"]["email"] == email
-    assert res.json()["user"]["role"] == "viewer"
-    assert "aigov_session" in res.cookies
-    assert res.headers["cache-control"] == "no-store"
-
-    dup = _register(client, email.upper())
-    assert dup.status_code == 409
+    res = client.post("/auth/register", json={"name": "X Y", "email": email, "password": STRONG_PASSWORD})
+    assert res.status_code in (404, 405)
+    assert db_session.query(User).filter(User.email == email).count() == 0
 
 
-def test_register_rejects_weak_password(client):
-    res = _register(client, _email(), password="password")
-    assert res.status_code == 422
-
-
-def test_register_disabled(client, monkeypatch):
-    monkeypatch.setenv("AUTH_ALLOW_REGISTRATION", "false")
-    assert _register(client, _email()).status_code == 403
-
-
-def test_login_success_and_bad_password(client):
-    email = _email()
-    _register(client, email)
-    client.cookies.clear()
+def test_login_success_and_bad_password(client, db_session):
+    email = make_user(db_session).email
 
     ok = client.post("/auth/login", json={"email": email.upper(), "password": STRONG_PASSWORD})
     assert ok.status_code == 200
@@ -94,11 +100,9 @@ def test_login_success_and_bad_password(client):
     assert bad.json() == unknown.json()
 
 
-def test_lockout_after_repeated_failures(client, monkeypatch):
+def test_lockout_after_repeated_failures(client, db_session, monkeypatch):
     monkeypatch.setenv("AUTH_LOGIN_MAX_FAILURES", "3")
-    email = _email()
-    _register(client, email)
-    client.cookies.clear()
+    email = make_user(db_session).email
 
     for _ in range(3):
         assert client.post("/auth/login", json={"email": email, "password": "Wrong-Passw0rd!"}).status_code == 401
@@ -108,9 +112,8 @@ def test_lockout_after_repeated_failures(client, monkeypatch):
     assert int(locked.headers["retry-after"]) > 0
 
 
-def test_me_with_and_without_cookie(client):
-    email = _email()
-    _register(client, email)
+def test_me_with_and_without_cookie(client, db_session):
+    email, _ = _session(client, db_session)
 
     me = client.get("/auth/me")
     assert me.status_code == 200
@@ -121,16 +124,14 @@ def test_me_with_and_without_cookie(client):
     assert client.get("/auth/me").status_code == 401
 
 
-def test_me_accepts_bearer_token(client):
-    res = _register(client, _email())
-    token = res.cookies["aigov_session"]
+def test_me_accepts_bearer_token(client, db_session):
+    _, token = _session(client, db_session)
     client.cookies.clear()
     assert client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).status_code == 200
 
 
-def test_forgot_password_same_response_for_known_and_unknown(client, sent_emails):
-    email = _email()
-    _register(client, email)
+def test_forgot_password_same_response_for_known_and_unknown(client, db_session, sent_emails):
+    email = make_user(db_session).email
 
     known = client.post("/auth/forgot-password", json={"email": email})
     unknown = client.post("/auth/forgot-password", json={"email": _email()})
@@ -139,9 +140,8 @@ def test_forgot_password_same_response_for_known_and_unknown(client, sent_emails
     assert [m["to"] for m in sent_emails] == [email]
 
 
-def test_reset_works_once_and_kills_old_sessions(client, sent_emails):
-    email = _email()
-    old_session = _register(client, email).cookies["aigov_session"]
+def test_reset_works_once_and_kills_old_sessions(client, db_session, sent_emails):
+    email, old_session = _session(client, db_session)
 
     client.post("/auth/forgot-password", json={"email": email})
     token = _reset_token(sent_emails)
@@ -163,8 +163,8 @@ def test_reset_works_once_and_kills_old_sessions(client, sent_emails):
     assert client.post("/auth/login", json={"email": email, "password": NEW_PASSWORD}).status_code == 200
 
 
-def test_session_token_cannot_be_used_as_reset_token(client):
-    session = _register(client, _email()).cookies["aigov_session"]
+def test_session_token_cannot_be_used_as_reset_token(client, db_session):
+    _, session = _session(client, db_session)
     res = client.post("/auth/reset-password", json={"token": session, "password": NEW_PASSWORD})
     assert res.status_code == 400
 
@@ -186,4 +186,4 @@ def test_client_ip_from_forwarded_header(monkeypatch, header, expected):
 
     monkeypatch.setenv("AUTH_TRUST_PROXY_HEADERS", "true")
     scope = {"type": "http", "headers": [(b"x-forwarded-for", header.encode())], "client": ("127.0.0.1", 1)}
-    assert auth_router._client_ip(Request(scope)) == expected
+    assert auth_router.client_ip(Request(scope)) == expected

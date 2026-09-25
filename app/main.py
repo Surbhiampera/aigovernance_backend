@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from app.config import get_cors_origins
 from app.core.deps import get_db
 from app.routers import (
+    admin_users,
     alerts,
     alerts_security,
     apikeys,
@@ -213,6 +214,7 @@ for _router in _ALL_ROUTERS:
 app.include_router(deployments_router, dependencies=_license_gate)
 app.include_router(license_router)  # never gated — must explain a freeze even while frozen
 app.include_router(auth.router)  # never gated — users must be able to sign in while frozen
+app.include_router(admin_users.router)  # never gated — admins manage access while frozen too
 
 # All proxy endpoints live under /proxy (see router prefix in app/routers/proxy.py).
 # External teams must set their SDK base_url to "https://<host>/proxy".

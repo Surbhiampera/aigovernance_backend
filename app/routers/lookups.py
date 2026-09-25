@@ -8,7 +8,8 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
-from app.config import get_lookup_defaults
+from app.config import get_auth_default_role, get_lookup_defaults
+from app.core.auth import ADMIN_ROLE
 from app.core.deps import get_db
 from app.models import (
     AiRequest,
@@ -151,6 +152,21 @@ def list_proxy_projects(
         q = q.filter(AiRequest.org_id == org_id)
     rows = q.all()
     return [{"id": r[0], "label": r[0]} for r in rows if r[0]]
+
+
+# ---------------------------------------------------------------------------
+# Dashboard user roles (admin Users page)
+# ---------------------------------------------------------------------------
+
+@router.get("/user-roles")
+def list_user_roles(*, db: Session = Depends(get_db)) -> list[str]:
+    # The admin and default roles are always offered: the sign-in code
+    # depends on both, even before any user holds them.
+    return _merge(
+        get_lookup_defaults("USER_ROLES"),
+        [get_auth_default_role(), ADMIN_ROLE],
+        _distinct(db, User.role),
+    )
 
 
 # ---------------------------------------------------------------------------

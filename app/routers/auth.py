@@ -1,4 +1,8 @@
-"""Authentication router — dashboard sign-in, registration and password reset.
+"""Authentication router — dashboard sign-in and password reset.
+
+There is no self-registration: admins create accounts in
+app/routers/admin_users.py and the user sets a password from the invite link,
+which /reset-password accepts alongside reset links.
 
 Sessions are an httpOnly cookie holding a signed JWT (see app/core/auth.py).
 Registered outside the license gate in app/main.py so users can still sign in
@@ -6,7 +10,6 @@ while a license is frozen.
 """
 
 import logging
-import uuid
 from typing import Callable
 from urllib.parse import quote
 
@@ -17,13 +20,12 @@ from sqlalchemy.orm import Session
 
 from app.config import (
     get_auth_access_token_minutes,
-    get_auth_allow_registration,
     get_auth_cookie_name,
     get_auth_cookie_samesite,
     get_auth_cookie_secure,
-    get_auth_default_role,
     get_auth_dev_log_reset_links,
     get_auth_forgot_max_per_hour,
+    get_auth_invite_token_minutes,
     get_auth_ip_max_attempts,
     get_auth_ip_window_minutes,
     get_auth_lockout_minutes,
@@ -34,9 +36,9 @@ from app.config import (
 )
 from app.core.auth import (
     EMAIL_MAX_LENGTH,
-    NAME_MAX_LENGTH,
     PASSWORD_MAX_LENGTH,
     PURPOSE_ACCESS,
+    PURPOSE_INVITE,
     PURPOSE_RESET,
     burn_password_check,
     check_password_policy,
@@ -58,8 +60,9 @@ from app.services.notification_service import notification_service
 _log = logging.getLogger(__name__)
 
 
-class _NoStoreRoute(APIRoute):
-    """Adds Cache-Control: no-store to every auth response, errors included."""
+class NoStoreRoute(APIRoute):
+    """Adds Cache-Control: no-store to every response, errors included. Shared
+    with app/routers/admin_users.py."""
 
     def get_route_handler(self) -> Callable:
         handler = super().get_route_handler()
@@ -76,7 +79,7 @@ class _NoStoreRoute(APIRoute):
         return no_store_handler
 
 
-router = APIRouter(prefix="/auth", tags=["auth"], route_class=_NoStoreRoute)
+router = APIRouter(prefix="/auth", tags=["auth"], route_class=NoStoreRoute)
 
 _LOGIN_FAILED = "Incorrect email or password."
 _FORGOT_MESSAGE = "If an account exists for that email, a password reset link has been sent."
@@ -84,12 +87,6 @@ _INVALID_RESET = "This reset link is invalid, expired or already used."
 
 
 # ─────────────────── request bodies ───────────────────
-
-class RegisterRequest(BaseModel):
-    name: str = Field(..., max_length=NAME_MAX_LENGTH)
-    email: str = Field(..., max_length=EMAIL_MAX_LENGTH)
-    password: str = Field(..., max_length=PASSWORD_MAX_LENGTH)
-
 
 class LoginRequest(BaseModel):
     email: str = Field(..., max_length=EMAIL_MAX_LENGTH)
@@ -117,7 +114,7 @@ def _strip_port(value: str) -> str:
     return value
 
 
-def _client_ip(request: Request) -> str:
+def client_ip(request: Request) -> str:
     if get_auth_trust_proxy_headers():
         forwarded = request.headers.get("x-forwarded-for", "")
         if forwarded:
@@ -134,9 +131,9 @@ def _too_many(retry_after: int) -> HTTPException:
     )
 
 
-def _limit_ip(request: Request, scope: str) -> None:
+def limit_ip(request: Request, scope: str) -> None:
     retry = limits.hit(
-        limits.ip_key(scope, _client_ip(request)),
+        limits.ip_key(scope, client_ip(request)),
         get_auth_ip_max_attempts(),
         get_auth_ip_window_minutes() * 60,
     )
@@ -166,7 +163,33 @@ def _clear_session_cookie(response: Response) -> None:
     )
 
 
-def _send_reset_email(email: str, link: str) -> None:
+def token_link(user, purpose: str) -> str:
+    """Frontend link for a reset or invite token. The token goes in the
+    fragment, not the query, so it never reaches server access logs or
+    Referer headers."""
+    page = "set-password" if purpose == PURPOSE_INVITE else "reset-password"
+    return f"{get_frontend_url()}/{page}#token={quote(create_token(user, purpose))}"
+
+
+def send_invite_email(user, link: str) -> bool:
+    """Email an admin-created user their set-password link. Returns whether it
+    was sent, so the caller can hand the link to the admin instead."""
+    days = max(1, round(get_auth_invite_token_minutes() / 1440))
+    greeting = f"Hi {user.name},\n\n" if user.name else ""
+    body = (
+        f"{greeting}An administrator has created an AI Governance account for you.\n\n"
+        f"Set your password here (valid for {days} day{'s' if days != 1 else ''}, one use only):\n{link}\n\n"
+        "If you weren't expecting this, you can ignore this email."
+    )
+    sent = notification_service.send_email_to(user.email, "Set up your AI Governance account", body)
+    if get_auth_dev_log_reset_links():
+        _log.warning("AUTH_DEV_LOG_RESET_LINKS is on — invite link for %s: %s", user.email, link)
+    elif not sent:
+        _log.warning("Invite email could not be sent (check SMTP_* settings)")
+    return sent
+
+
+def send_reset_email(email: str, link: str) -> bool:
     minutes = get_auth_reset_token_minutes()
     body = (
         "We received a request to reset the password for your AI Governance account.\n\n"
@@ -178,6 +201,7 @@ def _send_reset_email(email: str, link: str) -> None:
         _log.warning("AUTH_DEV_LOG_RESET_LINKS is on — reset link for %s: %s", email, link)
     elif not sent:
         _log.warning("Password reset email could not be sent (check SMTP_* settings)")
+    return sent
 
 
 def _send_password_changed_email(email: str) -> None:
@@ -191,46 +215,6 @@ def _send_password_changed_email(email: str) -> None:
 
 # ─────────────────── endpoints ───────────────────
 
-@router.post("/register")
-def register(
-    body: RegisterRequest,
-    request: Request,
-    response: Response,
-    db: Session = Depends(get_db),
-):
-    from app.models import User
-
-    require_auth_configured()
-    if not get_auth_allow_registration():
-        raise HTTPException(status_code=403, detail="Self-registration is disabled. Ask an administrator for access.")
-    _limit_ip(request, "register")
-
-    name = " ".join(body.name.split())
-    email = normalize_email(body.email)
-    if not name:
-        raise HTTPException(status_code=422, detail="Please enter your name.")
-    if not is_valid_email(email):
-        raise HTTPException(status_code=422, detail="Please enter a valid email address.")
-    check_password_policy(body.password, email=email, name=name)
-
-    if find_user_by_email(db, email):
-        raise HTTPException(status_code=409, detail="An account with this email already exists.")
-
-    user = User(
-        id=str(uuid.uuid4()),
-        email=email,
-        name=name,
-        role=get_auth_default_role(),
-        password_hash=hash_password(body.password),
-    )
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-
-    _set_session_cookie(response, user)
-    return {"user": user_payload(user)}
-
-
 @router.post("/login")
 def login(
     body: LoginRequest,
@@ -239,7 +223,7 @@ def login(
     db: Session = Depends(get_db),
 ):
     require_auth_configured()
-    _limit_ip(request, "login")
+    limit_ip(request, "login")
 
     email = normalize_email(body.email)
     failures_key = limits.email_key("login_failures", email)
@@ -284,7 +268,7 @@ def forgot_password(
 ):
     """Always the same answer, so it can't be used to discover accounts."""
     require_auth_configured()
-    _limit_ip(request, "forgot")
+    limit_ip(request, "forgot")
 
     email = normalize_email(body.email)
     if is_valid_email(email):
@@ -294,11 +278,8 @@ def forgot_password(
                 limits.email_key("forgot", email), get_auth_forgot_max_per_hour(), 3600,
             )
             if not over_limit:
-                token = create_token(user, PURPOSE_RESET)
-                # Token in the fragment, not the query, so it never reaches
-                # server access logs or Referer headers.
-                link = f"{get_frontend_url()}/reset-password#token={quote(token)}"
-                background_tasks.add_task(_send_reset_email, user.email, link)
+                link = token_link(user, PURPOSE_RESET)
+                background_tasks.add_task(send_reset_email, user.email, link)
 
     return {"message": _FORGOT_MESSAGE}
 
@@ -311,19 +292,23 @@ def reset_password(
     db: Session = Depends(get_db),
 ):
     require_auth_configured()
-    _limit_ip(request, "reset")
+    limit_ip(request, "reset")
 
-    user = user_from_token(db, body.token.strip(), PURPOSE_RESET)
+    user = user_from_token(db, body.token.strip(), (PURPOSE_RESET, PURPOSE_INVITE))
     if not user:
         raise HTTPException(status_code=400, detail=_INVALID_RESET)
     check_password_policy(body.password, email=user.email or "", name=user.name or "")
 
-    # Changing the hash changes the token fingerprint: this link and every
-    # existing session stop working.
+    first_password = not user.password_hash
+    # Changing the hash changes the token fingerprint: this link, any other
+    # outstanding invite/reset link and every existing session stop working.
     user.password_hash = hash_password(body.password)
     db.commit()
 
     if user.email:
         limits.clear(limits.email_key("login_failures", normalize_email(user.email)))
-        background_tasks.add_task(_send_password_changed_email, user.email)
+        if not first_password:
+            background_tasks.add_task(_send_password_changed_email, user.email)
+    if first_password:
+        return {"message": "Your password has been set. Sign in to continue."}
     return {"message": "Your password has been reset. Sign in with your new password."}
