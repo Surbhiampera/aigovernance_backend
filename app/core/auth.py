@@ -3,12 +3,12 @@
 Passwords: PBKDF2-SHA256 (stdlib), stored as
 ``pbkdf2_sha256$<iterations>$<salt_b64>$<hash_b64>``.
 
-Tokens: HS256 JWTs carrying ``sub`` (user id), ``purpose`` (access,
-password_reset or invite), ``iat``, ``exp`` and ``pwv`` — a short fingerprint
-of the user's current password hash. Changing the password changes the
-fingerprint, which makes reset and invite links single-use and ends every
-existing session. Tokens never carry the role: it is read from the database on
-every request, so role changes and removals apply immediately.
+Tokens: HS256 JWTs carrying ``sub`` (user id), ``purpose`` (access or
+password_reset), ``iat``, ``exp`` and ``pwv`` — a short fingerprint of the
+user's current password hash. Changing the password changes the fingerprint,
+which makes a reset link single-use and ends every existing session.
+Tokens never carry the role: it is read from the database on every request,
+so role changes and removals apply immediately.
 """
 
 import base64
@@ -17,7 +17,7 @@ import hmac
 import os
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Iterable, Optional, Union
+from typing import Optional
 
 import jwt
 from fastapi import Depends, HTTPException, Request
@@ -27,7 +27,6 @@ from sqlalchemy.orm import Session
 from app.config import (
     get_auth_access_token_minutes,
     get_auth_cookie_name,
-    get_auth_invite_token_minutes,
     get_auth_jwt_secret,
     get_auth_password_min_length,
     get_auth_reset_token_minutes,
@@ -39,7 +38,6 @@ FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 
 PURPOSE_ACCESS = "access"
 PURPOSE_RESET = "password_reset"
-PURPOSE_INVITE = "invite"
 
 ADMIN_ROLE = "admin"
 
@@ -164,16 +162,8 @@ def password_fingerprint(password_hash: Optional[str]) -> str:
     return hashlib.sha256((password_hash or "").encode("utf-8")).hexdigest()[:16]
 
 
-def _token_minutes(purpose: str) -> int:
-    if purpose == PURPOSE_ACCESS:
-        return get_auth_access_token_minutes()
-    if purpose == PURPOSE_INVITE:
-        return get_auth_invite_token_minutes()
-    return get_auth_reset_token_minutes()
-
-
 def create_token(user, purpose: str) -> str:
-    minutes = _token_minutes(purpose)
+    minutes = get_auth_access_token_minutes() if purpose == PURPOSE_ACCESS else get_auth_reset_token_minutes()
     now = datetime.now(timezone.utc)
     payload = {
         "sub": user.id,
@@ -185,12 +175,11 @@ def create_token(user, purpose: str) -> str:
     return jwt.encode(payload, get_auth_jwt_secret(), algorithm=_JWT_ALG)
 
 
-def user_from_token(db: Session, token: str, purpose: Union[str, Iterable[str]]):
+def user_from_token(db: Session, token: str, purpose: str):
     """Return the user a valid token belongs to, or None.
 
-    Checks signature, expiry, purpose (one, or any of several), that the user
-    still exists, and that the password hasn't changed since the token was
-    issued.
+    Checks signature, expiry, purpose, that the user still exists, and that
+    the password hasn't changed since the token was issued.
     """
     from app.models import User
 
@@ -205,8 +194,7 @@ def user_from_token(db: Session, token: str, purpose: Union[str, Iterable[str]])
         )
     except jwt.PyJWTError:
         return None
-    allowed = {purpose} if isinstance(purpose, str) else set(purpose)
-    if payload.get("purpose") not in allowed:
+    if payload.get("purpose") != purpose:
         return None
     user = db.query(User).filter(User.id == str(payload["sub"])).first()
     if not user:

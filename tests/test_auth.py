@@ -47,7 +47,7 @@ def _email():
 
 
 def make_user(db_session, email=None, password=STRONG_PASSWORD, role="viewer", name="Test Person"):
-    """Insert a user directly (there is no sign-up). password=None → invited."""
+    """Insert a user directly (there is no sign-up). password=None → no password."""
     user = User(
         id=str(uuid.uuid4()),
         email=email or _email(),

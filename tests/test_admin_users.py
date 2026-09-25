@@ -1,23 +1,20 @@
 """Admin user management: /admin/users and /lookups/user-roles.
 
 Reuses the sign-in fixtures from test_auth.py (JWT secret, in-memory rate
-limits, captured emails). Users are created inside the rolled-back test
-transaction.
+limits). Users are created inside the rolled-back test transaction.
 """
-import re
 import uuid
-from urllib.parse import unquote
 
 import pytest
 
 from app.models import AuditLog, User
 from tests.test_auth import (  # noqa: F401  (auth_env is an autouse fixture)
     NEW_PASSWORD,
+    STRONG_PASSWORD,
     _email,
     _login,
     auth_env,
     make_user,
-    sent_emails,
 )
 
 
@@ -33,14 +30,11 @@ def admin(client, db_session):
     return user
 
 
-def _token(body):
-    match = re.search(r"#token=(\S+)", body)
-    assert match, "message should contain a link"
-    return unquote(match.group(1))
-
-
-def _create(client, email=None, role="viewer", name="New Person"):
-    return client.post("/admin/users", json={"name": name, "email": email or _email(), "role": role})
+def _create(client, email=None, role="viewer", name="New Person", password=NEW_PASSWORD):
+    return client.post(
+        "/admin/users",
+        json={"name": name, "email": email or _email(), "role": role, "password": password},
+    )
 
 
 def _audit_actions(db_session, user_id):
@@ -58,7 +52,7 @@ def test_non_admin_gets_403_everywhere(client, db_session):
         client.get("/admin/users"),
         _create(client),
         client.patch(f"/admin/users/{target.id}", json={"role": "admin"}),
-        client.post(f"/admin/users/{target.id}/resend-invite"),
+        client.put(f"/admin/users/{target.id}/password", json={"password": NEW_PASSWORD}),
         client.delete(f"/admin/users/{target.id}"),
     ]
     assert [r.status_code for r in calls] == [403] * 5
@@ -70,77 +64,71 @@ def test_signed_out_gets_401(client):
     assert client.get("/admin/users").status_code == 401
 
 
-# ─────────────────── create + invite ───────────────────
+# ─────────────────── create + passwords ───────────────────
 
-def test_create_user_sends_single_use_invite(client, db_session, admin, sent_emails):
+def test_create_user_with_password_then_they_sign_in(client, db_session, admin):
     email = _email()
     res = _create(client, email=email.upper(), role="security_reviewer")
     assert res.status_code == 201
-    body = res.json()
-    assert body["invite_sent"] is True
-    assert "invite_link" not in body
-    assert body["user"]["email"] == email
-    assert body["user"]["role"] == "security_reviewer"
-    assert body["user"]["status"] == "invited"
-    assert "password_hash" not in body["user"]
-    assert "user_created" in _audit_actions(db_session, body["user"]["id"])
+    user = res.json()["user"]
+    assert user["email"] == email
+    assert user["role"] == "security_reviewer"
+    assert user["status"] == "active"
+    assert "password_hash" not in user
+    assert "user_created" in _audit_actions(db_session, user["id"])
 
-    assert sent_emails[-1]["to"] == email
-    assert "/set-password#token=" in sent_emails[-1]["body"]
-    token = _token(sent_emails[-1]["body"])
-
-    # Can't sign in before setting a password.
     client.cookies.clear()
-    assert _login(client, email).status_code == 401
-
-    ok = client.post("/auth/reset-password", json={"token": token, "password": NEW_PASSWORD})
-    assert ok.status_code == 200
-    reused = client.post("/auth/reset-password", json={"token": token, "password": "An0ther-Str0ng-One!"})
-    assert reused.status_code == 400
-
     assert _login(client, email, NEW_PASSWORD).status_code == 200
     assert client.get("/auth/me").json()["role"] == "security_reviewer"
 
 
-def test_invite_link_returned_only_when_email_fails(client, admin, monkeypatch):
-    from app.routers import auth as auth_router
-
-    monkeypatch.setattr(auth_router.notification_service, "send_email_to", lambda *a: False)
-    body = _create(client).json()
-    assert body["invite_sent"] is False
-    assert "/set-password#token=" in body["invite_link"]
+def test_create_rejects_weak_password(client, admin):
+    assert _create(client, password="password").status_code == 422
+    assert _create(client, name="Mallory Smith", password="Mallory-Smith-99!").status_code == 422
 
 
-def test_duplicate_email_409(client, db_session, admin, sent_emails):
+def test_duplicate_email_409(client, db_session, admin):
     existing = make_user(db_session)
     assert _create(client, email=existing.email.upper()).status_code == 409
 
 
-def test_rejects_unknown_role_and_bad_email(client, admin, sent_emails):
+def test_rejects_unknown_role_and_bad_email(client, admin):
     assert _create(client, role="superuser").status_code == 422
     assert _create(client, email="not-an-email").status_code == 422
 
 
-def test_list_users_shows_status_and_no_hashes(client, db_session, admin, sent_emails):
-    invited = _create(client).json()["user"]
+def test_list_users_shows_status_and_no_hashes(client, db_session, admin):
+    created = _create(client).json()["user"]
+    legacy = make_user(db_session, password=None)
     rows = {u["id"]: u for u in client.get("/admin/users").json()}
     assert rows[admin.id]["status"] == "active"
-    assert rows[invited["id"]]["status"] == "invited"
+    assert rows[created["id"]]["status"] == "active"
+    assert rows[legacy.id]["status"] == "no_password"
     assert all("password_hash" not in u for u in rows.values())
 
 
-def test_resend_invite_vs_reset(client, db_session, admin, sent_emails):
-    invited = make_user(db_session, password=None)
-    active = make_user(db_session)
+def test_admin_sets_password_and_old_sessions_end(client, db_session, admin):
+    user = make_user(db_session)
+    old_session = _login(client, user.email).cookies["aigov_session"]
+    assert _login(client, admin.email).status_code == 200
 
-    res = client.post(f"/admin/users/{invited.id}/resend-invite")
-    assert res.status_code == 200 and res.json() == {"invite_sent": True}
-    assert "/set-password#token=" in sent_emails[-1]["body"]
+    weak = client.put(f"/admin/users/{user.id}/password", json={"password": "short"})
+    assert weak.status_code == 422
 
-    res = client.post(f"/admin/users/{active.id}/resend-invite")
-    assert res.status_code == 200 and res.json() == {"invite_sent": True}
-    assert "/reset-password#token=" in sent_emails[-1]["body"]
-    assert "user_invite_resent" in _audit_actions(db_session, active.id)
+    res = client.put(f"/admin/users/{user.id}/password", json={"password": NEW_PASSWORD})
+    assert res.status_code == 200
+    assert "user_password_set" in _audit_actions(db_session, user.id)
+
+    client.cookies.clear()
+    assert client.get("/auth/me", headers={"Authorization": f"Bearer {old_session}"}).status_code == 401
+    assert _login(client, user.email, STRONG_PASSWORD).status_code == 401
+    assert _login(client, user.email, NEW_PASSWORD).status_code == 200
+
+
+def test_admin_setting_own_password_stays_signed_in(client, admin):
+    res = client.put(f"/admin/users/{admin.id}/password", json={"password": NEW_PASSWORD})
+    assert res.status_code == 200
+    assert client.get("/auth/me").status_code == 200
 
 
 # ─────────────────── roles ───────────────────

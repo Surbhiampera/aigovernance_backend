@@ -1,9 +1,8 @@
 """Admin user management — the only way dashboard accounts are created.
 
-Admins add a user by name, email and role; the user gets an invite link and
-sets their own password (POST /auth/reset-password accepts invite tokens).
-Admins never choose or see a password. When the invite email can't be sent,
-the link is returned once so the admin can share it by hand.
+Admins add a user by name, email, role and password, and share those
+credentials with the user themselves; no email is sent. Admins also set a new
+password for anyone who forgets theirs, which signs that user out everywhere.
 
 Every endpoint needs an admin session (require_admin). Removing a user deletes
 the row, which ends their sessions: tokens are resolved against the database
@@ -20,28 +19,22 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.config import get_auth_default_role, get_auth_forgot_max_per_hour
+from app.config import get_auth_default_role
 from app.core.auth import (
     ADMIN_ROLE,
     EMAIL_MAX_LENGTH,
     NAME_MAX_LENGTH,
-    PURPOSE_INVITE,
-    PURPOSE_RESET,
+    PASSWORD_MAX_LENGTH,
+    check_password_policy,
     find_user_by_email,
+    hash_password,
     is_valid_email,
     normalize_email,
     require_admin,
 )
 from app.core.deps import get_db
 from app.models import User
-from app.routers.auth import (
-    NoStoreRoute,
-    client_ip,
-    limit_ip,
-    send_invite_email,
-    send_reset_email,
-    token_link,
-)
+from app.routers.auth import NoStoreRoute, client_ip, limit_ip, set_session_cookie
 from app.routers.lookups import list_user_roles
 from app.services import auth_rate_limit as limits
 from app.services.audit_service import log_event
@@ -58,6 +51,11 @@ class CreateUserRequest(BaseModel):
     name: str = Field(..., max_length=NAME_MAX_LENGTH)
     email: str = Field(..., max_length=EMAIL_MAX_LENGTH)
     role: Optional[str] = Field(None, max_length=50)
+    password: str = Field(..., max_length=PASSWORD_MAX_LENGTH)
+
+
+class SetPasswordRequest(BaseModel):
+    password: str = Field(..., max_length=PASSWORD_MAX_LENGTH)
 
 
 class UpdateUserRequest(BaseModel):
@@ -72,7 +70,9 @@ def _is_admin(user) -> bool:
 
 
 def _status(user) -> str:
-    return "active" if user.password_hash else "invited"
+    # "no_password": older rows created before sign-in existed. They can't
+    # log in until an admin sets a password.
+    return "active" if user.password_hash else "no_password"
 
 
 def _user_row(user) -> dict:
@@ -142,24 +142,6 @@ def _audit(db: Session, request: Request, admin, target, action: str, summary: s
     )
 
 
-def _limit_invites(email: str) -> None:
-    """Cap invite/reset emails per address, like /auth/forgot-password."""
-    retry = limits.hit(limits.email_key("admin_invite", normalize_email(email)), get_auth_forgot_max_per_hour(), 3600)
-    if retry:
-        raise HTTPException(
-            status_code=429,
-            detail="Too many emails sent to this user. Please try again later.",
-            headers={"Retry-After": str(retry)},
-        )
-
-
-def _send_invite(user) -> dict:
-    """Email the set-password link; return the link only if sending failed."""
-    link = token_link(user, PURPOSE_INVITE)
-    sent = send_invite_email(user, link)
-    return {"invite_sent": True} if sent else {"invite_sent": False, "invite_link": link}
-
-
 # ─────────────────── endpoints ───────────────────
 
 @router.get("")
@@ -184,14 +166,21 @@ def create_user(
     role = _resolve_role(db, body.role)
     if find_user_by_email(db, email):
         raise HTTPException(status_code=409, detail="An account with this email already exists.")
-    _limit_invites(email)
+    check_password_policy(body.password, email=email, name=name)
 
-    user = User(id=str(uuid.uuid4()), email=email, name=name, role=role, org_id=admin.org_id)
+    user = User(
+        id=str(uuid.uuid4()),
+        email=email,
+        name=name,
+        role=role,
+        org_id=admin.org_id,
+        password_hash=hash_password(body.password),
+    )
     db.add(user)
     _audit(db, request, admin, user, "user_created", f"Created user {email} with role {role}", role=role)
     db.commit()
     db.refresh(user)
-    return {"user": _user_row(user), **_send_invite(user)}
+    return {"user": _user_row(user)}
 
 
 @router.patch("/{user_id}")
@@ -233,29 +222,32 @@ def update_user(
     return _user_row(user)
 
 
-@router.post("/{user_id}/resend-invite")
-def resend_invite(
+@router.put("/{user_id}/password")
+def set_password(
     user_id: str,
+    body: SetPasswordRequest,
     request: Request,
+    response: Response,
     db: Session = Depends(get_db),
     admin=Depends(require_admin),
 ) -> dict:
-    """Invite link for a user who hasn't set a password yet, reset link
-    otherwise. A reset link is never returned to the admin: that would let
-    them take over an active account."""
-    limit_ip(request, "admin_users_invite")
+    """Set a new password for a user, e.g. one who forgot theirs. Changing the
+    hash signs them out of every existing session."""
+    limit_ip(request, "admin_users_password")
     user = _get_target(db, user_id)
-    if not user.email:
-        raise HTTPException(status_code=422, detail="This user has no email address.")
-    _limit_invites(user.email)
+    check_password_policy(body.password, email=user.email or "", name=user.name or "")
 
-    kind = "invite" if not user.password_hash else "reset"
-    _audit(db, request, admin, user, "user_invite_resent", f"Sent {kind} link to {user.email}", link_type=kind)
+    user.password_hash = hash_password(body.password)
+    _audit(db, request, admin, user, "user_password_set", f"Set a new password for {user.email}")
     db.commit()
+    db.refresh(user)
 
-    if kind == "invite":
-        return _send_invite(user)
-    return {"invite_sent": send_reset_email(user.email, token_link(user, PURPOSE_RESET))}
+    if user.email:
+        limits.clear(limits.email_key("login_failures", normalize_email(user.email)))
+    if user.id == admin.id:
+        # The admin's own session was just invalidated with the old hash.
+        set_session_cookie(response, user)
+    return _user_row(user)
 
 
 @router.delete("/{user_id}", status_code=204)

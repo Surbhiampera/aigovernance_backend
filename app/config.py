@@ -408,8 +408,8 @@ def get_tip_cooldown_days() -> int:
 # ── Dashboard sign-in (app/routers/auth.py) ─────────────────────────────────
 # Only the /auth and /admin/users endpoints read these. With AUTH_JWT_SECRET
 # unset those endpoints answer 503 and nothing else in the app is affected.
-# There is no self-registration: admins create users (app/routers/admin_users.py),
-# and the first admin comes from scripts/create_admin.py.
+# There is no self-registration: admins create users with a password they share
+# (app/routers/admin_users.py); the first admin comes from scripts/create_admin.py.
 def _bool(key: str, default: str) -> bool:
     return os.getenv(key, default).strip().lower() in ("1", "true", "yes", "on")
 
@@ -431,11 +431,6 @@ def get_auth_reset_token_minutes() -> int:
 def get_auth_password_min_length() -> int:
     """Must match PASSWORD_MIN_LENGTH in the frontend's authUtils.js."""
     return _int("AUTH_PASSWORD_MIN_LENGTH", "12")
-
-
-def get_auth_invite_token_minutes() -> int:
-    """How long an admin's invite link stays valid (default 3 days)."""
-    return _int("AUTH_INVITE_TOKEN_MINUTES", "4320")
 
 
 def get_auth_default_role() -> str:
