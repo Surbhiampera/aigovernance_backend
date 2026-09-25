@@ -107,12 +107,22 @@ class ResetPasswordRequest(BaseModel):
 
 # ─────────────────── helpers ───────────────────
 
+def _strip_port(value: str) -> str:
+    """Azure App Service sends X-Forwarded-For as "ip:port" — drop the port so
+    each client gets one bucket, not one per connection."""
+    if value.startswith("["):  # [IPv6]:port
+        return value[1:].split("]", 1)[0]
+    if value.count(":") == 1:  # IPv4:port (bare IPv6 has several colons)
+        return value.split(":", 1)[0]
+    return value
+
+
 def _client_ip(request: Request) -> str:
     if get_auth_trust_proxy_headers():
         forwarded = request.headers.get("x-forwarded-for", "")
         if forwarded:
             # The right-most entry is the one appended by our own proxy.
-            return forwarded.split(",")[-1].strip() or "unknown"
+            return _strip_port(forwarded.split(",")[-1].strip()) or "unknown"
     return request.client.host if request.client else "unknown"
 
 

@@ -173,3 +173,17 @@ def test_unconfigured_secret_returns_503(client, monkeypatch):
     monkeypatch.setenv("AUTH_JWT_SECRET", "")
     assert client.post("/auth/login", json={"email": _email(), "password": "x"}).status_code == 503
     assert client.get("/auth/me").status_code == 503
+
+
+@pytest.mark.parametrize("header,expected", [
+    ("203.0.113.5:54321", "203.0.113.5"),          # Azure App Service style
+    ("10.0.0.1, 203.0.113.5", "203.0.113.5"),       # right-most entry wins
+    ("[2001:db8::1]:443", "2001:db8::1"),
+    ("2001:db8::1", "2001:db8::1"),
+])
+def test_client_ip_from_forwarded_header(monkeypatch, header, expected):
+    from starlette.requests import Request
+
+    monkeypatch.setenv("AUTH_TRUST_PROXY_HEADERS", "true")
+    scope = {"type": "http", "headers": [(b"x-forwarded-for", header.encode())], "client": ("127.0.0.1", 1)}
+    assert auth_router._client_ip(Request(scope)) == expected
