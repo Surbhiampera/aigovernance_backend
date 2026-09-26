@@ -1,11 +1,12 @@
 """Scheduled task functions called by APScheduler.
 
 All DB sessions are managed by the caller (scheduler.py).
-Four jobs:
+Jobs:
   _rebuild_daily_summary      — aggregates AiRequest + RequestCost → DailyOrgSummary
   _detect_daily_anomalies     — compares today vs N-day baseline → UsageAnomaly rows
   _rebuild_monthly_summary    — rolls up DailyOrgSummary → MonthlyOrgSummary
   _generate_optimization_tips — evaluates optimization/rules/* → OptimizationTip rows
+  _refresh_exchange_rates     — fetches today's USD→INR rate → ExchangeRate row
 """
 from __future__ import annotations
 
@@ -511,3 +512,25 @@ def _generate_optimization_tips(*, db: Session, window_end: date) -> int:
 
     db.flush()
     return inserted
+
+
+# ---------------------------------------------------------------------------
+# Exchange rates — FX API → ExchangeRate (USD→INR)
+# ---------------------------------------------------------------------------
+
+def _refresh_exchange_rates(*, db: Session) -> bool:
+    """Fetch and store today's USD→INR rate. Returns True if a rate was stored.
+
+    On a failed fetch nothing is written and the exception propagates to the
+    scheduler, which logs it; get_usd_inr_rate() keeps serving the most recent
+    stored rate meanwhile. An admin's manual rate for the same day is kept.
+    """
+    from app.services.fx_service import fetch_usd_inr_rate, upsert_rate
+
+    rate, effective_date, source = fetch_usd_inr_rate()
+    row = upsert_rate(db, rate=rate, effective_date=effective_date, source=source)
+    if row is None:
+        _log.info("fx_rates: kept manual USD→INR rate for %s (fetched %s)", effective_date, rate)
+        return False
+    _log.info("fx_rates: USD→INR %s effective %s (source=%s)", rate, effective_date, source)
+    return True

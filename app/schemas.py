@@ -596,6 +596,30 @@ class ModelPricingResponse(BaseModel):
     effective_from: Optional[datetime] = None
 
 
+class ExchangeRateUpsert(BaseModel):
+    rate: Decimal = Field(gt=0, max_digits=12, decimal_places=6, description="INR per 1 USD")
+    effective_date: date
+
+
+class ExchangeRateResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    base_currency: str
+    quote_currency: str
+    rate: Decimal
+    effective_date: date
+    source: str
+    created_at: Optional[datetime] = None
+
+
+class CurrentExchangeRateResponse(BaseModel):
+    base_currency: str
+    quote_currency: str
+    on_date: date
+    rate: Optional[Decimal] = None
+
+
 class BudgetUtilizationResponse(BaseModel):
     org_id: str
     project_id: Optional[str] = None

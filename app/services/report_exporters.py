@@ -11,6 +11,20 @@ def _fmt_money(value) -> str:
     return f"${float(value or 0):,.4f}"
 
 
+# The PDF's built-in Helvetica has no ₹ glyph, so the PDF exporter passes "INR ".
+def _fmt_inr(value, symbol: str = "₹") -> str:
+    return "—" if value is None else f"{symbol}{float(value):,.4f}"
+
+
+def _fmt_rate_applied(summary: dict, symbol: str = "₹") -> str:
+    lo, hi = summary.get("min_exchange_rate"), summary.get("max_exchange_rate")
+    if lo is None:
+        return "—"
+    if lo == hi:
+        return f"{symbol}{lo:,.2f}/USD"
+    return f"{symbol}{lo:,.2f} – {symbol}{hi:,.2f}/USD (each request at its own day's rate)"
+
+
 def _fmt_dt(value) -> str:
     if value is None:
         return "—"
@@ -99,17 +113,19 @@ def export_excel(report: dict) -> bytes:
         ["Input cost", _fmt_money(s["input_cost"])],
         ["Output cost", _fmt_money(s["output_cost"])],
         ["Total cost", _fmt_money(s["total_cost"])],
+        ["Total cost (INR)", _fmt_inr(s.get("total_cost_inr"))],
+        ["USD→INR rate applied", _fmt_rate_applied(s)],
     ])
 
     # ---- Cost by model sheet ----
     ws2 = wb.create_sheet("Cost by Model")
     write_table(
         ws2, 1,
-        ["Model", "Provider", "Requests", "Total Tokens", "Total Cost"],
+        ["Model", "Provider", "Requests", "Total Tokens", "Total Cost", "Total Cost (INR)"],
         [
-            [m["model_name"], m["provider"], m["total_requests"], m["total_tokens"], _fmt_money(m["total_cost"])]
+            [m["model_name"], m["provider"], m["total_requests"], m["total_tokens"], _fmt_money(m["total_cost"]), _fmt_inr(m.get("total_cost_inr"))]
             for m in report["cost_by_model"]
-        ] or [["No usage in this period", "", "", "", ""]],
+        ] or [["No usage in this period", "", "", "", "", ""]],
     )
 
     # ---- Budgets sheet ----
@@ -209,15 +225,17 @@ def export_docx(report: dict) -> bytes:
             ["Input cost", _fmt_money(s["input_cost"])],
             ["Output cost", _fmt_money(s["output_cost"])],
             ["Total cost", _fmt_money(s["total_cost"])],
+            ["Total cost (INR)", _fmt_inr(s.get("total_cost_inr"))],
+            ["USD→INR rate applied", _fmt_rate_applied(s)],
         ],
         "No usage data.",
     )
 
     doc.add_heading("Cost by Model", level=1)
     add_table(
-        ["Model", "Provider", "Requests", "Total Tokens", "Total Cost"],
+        ["Model", "Provider", "Requests", "Total Tokens", "Total Cost", "Total Cost (INR)"],
         [
-            [m["model_name"], m["provider"], m["total_requests"], m["total_tokens"], _fmt_money(m["total_cost"])]
+            [m["model_name"], m["provider"], m["total_requests"], m["total_tokens"], _fmt_money(m["total_cost"]), _fmt_inr(m.get("total_cost_inr"))]
             for m in report["cost_by_model"]
         ],
         "No model usage in this period.",
@@ -347,13 +365,15 @@ def export_pdf(report: dict) -> bytes:
             ["Input cost", _fmt_money(s["input_cost"])],
             ["Output cost", _fmt_money(s["output_cost"])],
             ["Total cost", _fmt_money(s["total_cost"])],
+            ["Total cost (INR)", _fmt_inr(s.get("total_cost_inr"), "INR ")],
+            ["USD to INR rate applied", _fmt_rate_applied(s, "INR ")],
         ], "No usage data.", col_widths=[2.5 * inch, 2.5 * inch]),
 
         Paragraph("Cost by Model", heading_style),
         table(
-            ["Model", "Provider", "Requests", "Tokens", "Cost"],
+            ["Model", "Provider", "Requests", "Tokens", "Cost", "Cost (INR)"],
             [
-                [m["model_name"], m["provider"], m["total_requests"], m["total_tokens"], _fmt_money(m["total_cost"])]
+                [m["model_name"], m["provider"], m["total_requests"], m["total_tokens"], _fmt_money(m["total_cost"]), _fmt_inr(m.get("total_cost_inr"), "INR ")]
                 for m in report["cost_by_model"]
             ],
             "No model usage in this period.",

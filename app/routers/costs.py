@@ -134,6 +134,7 @@ def cost_by_project(
         func.sum(RequestCost.output_token_cost).label("output_cost"),
         func.sum(RequestCost.llm_cost).label("llm_cost"),
         func.sum(RequestCost.total_cost).label("total_cost"),
+        func.sum(RequestCost.total_cost_inr).label("total_cost_inr"),
     ).join(AiRequest, AiRequest.request_id == RequestCost.request_id)
     q = _org_filter(q, RequestCost, org_id=org_id)
     q = _date_filter(q, RequestCost, start=start, end=end, days=days, period=period)
@@ -155,6 +156,8 @@ def cost_by_project(
             "output_cost": float(r.output_cost or 0),
             "llm_cost": float(r.llm_cost or 0),
             "total_cost": float(r.total_cost or 0),
+            # Sum of each row's own-day INR snapshot — not total_cost × today's rate.
+            "total_cost_inr": float(r.total_cost_inr) if r.total_cost_inr is not None else None,
         }
         for r in rows
     ]

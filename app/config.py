@@ -472,3 +472,23 @@ def get_auth_trust_proxy_headers() -> bool:
     reachable solely through your own proxy (e.g. nginx), otherwise clients
     can spoof the header to dodge per-IP limits."""
     return _bool("AUTH_TRUST_PROXY_HEADERS", "false")
+
+
+def get_fx_fetch_enabled() -> bool:
+    """Fetch the USD->INR rate daily from FX_RATE_API_URL. Turn off for air-gapped
+    deployments and enter the rate by hand via PUT /exchange-rates instead."""
+    return _bool("FX_FETCH_ENABLED", "true")
+
+
+def get_fx_rate_api_url() -> str:
+    """Endpoint returning JSON with rates.INR for base USD. The default (Frankfurter,
+    ECB reference rates) needs no key; openexchangerates also works, e.g.
+    https://openexchangerates.org/api/latest.json?app_id=<id>&symbols=INR"""
+    return os.getenv("FX_RATE_API_URL", "https://api.frankfurter.dev/v1/latest?base=USD&symbols=INR")
+
+
+def get_fx_usd_inr_fallback_rate() -> "Decimal | None":
+    """Rate used only when exchange_rates has no USD->INR row at all. Unset = none:
+    cost rows are then written with NULL INR until a rate exists."""
+    raw = os.getenv("FX_USD_INR_FALLBACK_RATE", "").strip()
+    return Decimal(raw) if raw else None

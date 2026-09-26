@@ -4,6 +4,7 @@ Jobs:
   daily_agg          — every hour: aggregate AiRequest + RequestCost → DailyOrgSummary
   monthly_agg        — every 24 hours: roll up DailyOrgSummary → MonthlyOrgSummary
   optimization_tips  — every 24 hours: evaluate tip rules → OptimizationTip rows
+  fx_rates           — every 24 hours (and 10s after boot): fetch USD→INR → ExchangeRate
   startup_backfill   — once, 5s after boot: fill gaps in the daily rollups
 """
 from __future__ import annotations
@@ -17,6 +18,7 @@ from app.config import (
     get_db_health_check_enabled,
     get_db_health_check_interval_seconds,
     get_db_size_warning_gb,
+    get_fx_fetch_enabled,
     get_license_check_interval_seconds,
     get_license_enforcement_enabled,
     get_scheduler_max_workers,
@@ -33,6 +35,7 @@ _last_success: dict[str, datetime.datetime | None] = {
     "db_health_check": None,
     "optimization_tips": None,
     "startup_backfill": None,
+    "fx_rates": None,
 }
 
 # Per-process, once-a-day dedup so a 15-day renewal window or an ongoing
@@ -241,6 +244,28 @@ def _job_optimization_tips() -> None:
         db.close()
 
 
+def _job_fx_rates() -> None:
+    import datetime
+    import logging
+
+    from app.database import SessionLocal
+    from app.workers.tasks import _refresh_exchange_rates
+
+    _log = logging.getLogger(__name__)
+    db = SessionLocal()
+    try:
+        _refresh_exchange_rates(db=db)
+        db.commit()
+        _last_success["fx_rates"] = datetime.datetime.utcnow()
+    except Exception:
+        # Lookups fall back to the most recent stored rate, so a missed day
+        # only means yesterday's rate is used until the next successful run.
+        _log.exception("fx_rates job failed")
+        db.rollback()
+    finally:
+        db.close()
+
+
 def _job_monthly_aggregation() -> None:
     import datetime
 
@@ -290,6 +315,12 @@ def start_scheduler() -> BackgroundScheduler:
         _job_optimization_tips, "interval", hours=24,
         id="optimization_tips", replace_existing=True,
     )
+    if get_fx_fetch_enabled():
+        _scheduler.add_job(
+            _job_fx_rates, "interval", hours=24,
+            next_run_time=datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=10),
+            id="fx_rates", replace_existing=True,
+        )
     # One-shot backfill, a few seconds after boot so it never delays the port opening.
     _scheduler.add_job(
         _job_startup_backfill, "date",

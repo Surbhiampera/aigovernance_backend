@@ -378,6 +378,27 @@ CREATE TABLE IF NOT EXISTS request_cost (
     created_at          TIMESTAMP DEFAULT NOW()
 );
 
+-- INR snapshot per cost row (app/services/fx_service.py). Nullable: rows written
+-- before a USD->INR rate was known stay NULL until scripts/backfill_inr_costs.py runs.
+ALTER TABLE request_cost
+    ADD COLUMN IF NOT EXISTS exchange_rate   NUMERIC(12, 6),
+    ADD COLUMN IF NOT EXISTS total_cost_inr  NUMERIC(16, 8),
+    ADD COLUMN IF NOT EXISTS input_cost_inr  NUMERIC(16, 8),
+    ADD COLUMN IF NOT EXISTS output_cost_inr NUMERIC(16, 8);
+
+-- Daily currency rates, filled by the fx_rates scheduler job or entered by an
+-- admin via PUT /exchange-rates (source = 'manual').
+CREATE TABLE IF NOT EXISTS exchange_rates (
+    id              BIGSERIAL PRIMARY KEY,
+    base_currency   VARCHAR(3) NOT NULL,
+    quote_currency  VARCHAR(3) NOT NULL,
+    rate            NUMERIC(12, 6) NOT NULL,
+    effective_date  DATE NOT NULL,
+    source          VARCHAR(50) NOT NULL,
+    created_at      TIMESTAMP DEFAULT NOW(),
+    CONSTRAINT uq_exchange_rates_pair_date UNIQUE (base_currency, quote_currency, effective_date)
+);
+
 -- ---------------------------------------------------------------------------
 -- Aggregation / rollup tables (populated by APScheduler jobs)
 -- ---------------------------------------------------------------------------

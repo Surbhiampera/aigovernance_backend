@@ -814,6 +814,31 @@ class RequestCost(Base):
     cost_model_type = Column(String(50), nullable=True)
     discount_pct = Column(Numeric(6, 3), default=0)
     adjusted_total_cost = Column(Numeric(14, 8), default=0)
+    # INR snapshot taken when the row is written (see app/services/fx_service.py).
+    # The rate is stored per row so a request keeps its own day's rate and its
+    # INR cost never moves when the exchange rate does. NULL = no rate known.
+    exchange_rate = Column(Numeric(12, 6), nullable=True)
+    total_cost_inr = Column(Numeric(16, 8), nullable=True)
+    input_cost_inr = Column(Numeric(16, 8), nullable=True)
+    output_cost_inr = Column(Numeric(16, 8), nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class ExchangeRate(Base):
+    """One currency-pair rate per day. Filled daily by the fx_rates scheduler
+    job, or entered by an admin (source="manual", which the job never overwrites)."""
+    __tablename__ = "exchange_rates"
+    __table_args__ = (
+        UniqueConstraint("base_currency", "quote_currency", "effective_date", name="uq_exchange_rates_pair_date"),
+        {"extend_existing": True},
+    )
+
+    id = Column(BigInteger, primary_key=True)
+    base_currency = Column(String(3), nullable=False)
+    quote_currency = Column(String(3), nullable=False)
+    rate = Column(Numeric(12, 6), nullable=False)
+    effective_date = Column(Date, nullable=False)
+    source = Column(String(50), nullable=False)
     created_at = Column(DateTime, server_default=func.now())
 
 

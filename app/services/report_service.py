@@ -31,6 +31,10 @@ def _date_filter(query, model, *, start: Optional[date], end: Optional[date]):
     return query
 
 
+def _opt_float(value) -> Optional[float]:
+    return float(value) if value is not None else None
+
+
 def build_project_report(
     db: Session,
     *,
@@ -55,6 +59,9 @@ def build_project_report(
         func.sum(RequestCost.input_token_cost).label("input_cost"),
         func.sum(RequestCost.output_token_cost).label("output_cost"),
         func.sum(RequestCost.total_cost).label("total_cost"),
+        func.sum(RequestCost.total_cost_inr).label("total_cost_inr"),
+        func.min(RequestCost.exchange_rate).label("min_exchange_rate"),
+        func.max(RequestCost.exchange_rate).label("max_exchange_rate"),
     ).join(AiRequest, AiRequest.request_id == RequestCost.request_id).filter(
         RequestCost.project_id == project_id
     )
@@ -70,6 +77,7 @@ def build_project_report(
         ).label("total_requests"),
         func.sum(RequestCost.total_tokens).label("total_tokens"),
         func.sum(RequestCost.total_cost).label("total_cost"),
+        func.sum(RequestCost.total_cost_inr).label("total_cost_inr"),
     ).join(AiRequest, AiRequest.request_id == RequestCost.request_id).filter(
         RequestCost.project_id == project_id
     )
@@ -204,6 +212,11 @@ def build_project_report(
             "output_cost": float(totals.output_cost or 0),
             "total_cost": float(totals.total_cost or 0),
             "currency": "USD",
+            # Sum of each row's own-day INR snapshot; the rate range shows which
+            # USD->INR rates those rows were converted at.
+            "total_cost_inr": _opt_float(totals.total_cost_inr),
+            "min_exchange_rate": _opt_float(totals.min_exchange_rate),
+            "max_exchange_rate": _opt_float(totals.max_exchange_rate),
         },
         "cost_by_model": [
             {
@@ -212,6 +225,7 @@ def build_project_report(
                 "total_requests": r.total_requests or 0,
                 "total_tokens": r.total_tokens or 0,
                 "total_cost": float(r.total_cost or 0),
+                "total_cost_inr": _opt_float(r.total_cost_inr),
             }
             for r in by_model_rows
         ],

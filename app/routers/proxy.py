@@ -61,6 +61,7 @@ from app.services.budget_service import check_budget
 from app.services.circuit_breaker import CircuitBreaker
 from app.services.cost_lookup import calculate_cost as _calculate_cost
 from app.services.deployment_service import build_provider_request, get_deployments_for_org
+from app.services.fx_service import inr_cost_fields
 from app.services.model_selection_service import get_default_model
 from app.services.provider_translation import (
     extract_usage,
@@ -696,6 +697,7 @@ def _store_response_and_cost(
         **token_usage_extras,
     ))
 
+    cost_created_at = datetime.utcnow()
     db.add(RequestCost(
         request_id=request_id,
         org_id=org_id,
@@ -713,7 +715,11 @@ def _store_response_and_cost(
         cost_model_type=pricing_source,
         pricing_snapshot=pricing_snapshot,
         pricing_version=pricing_version,
-        created_at=datetime.utcnow(),
+        created_at=cost_created_at,
+        **inr_cost_fields(
+            db, on_date=cost_created_at.date(),
+            total_cost=total_cost, input_cost=input_cost, output_cost=output_cost,
+        ),
     ))
 
     record_tokens_used(org_id=org_id, project_id=project_id, tokens=input_tokens + output_tokens)
@@ -974,6 +980,7 @@ def _mark_request_failed_with_cost(
         **token_usage_extras,
     ))
 
+    cost_created_at = datetime.utcnow()
     db.add(RequestCost(
         request_id=request_id,
         org_id=org_id,
@@ -991,7 +998,11 @@ def _mark_request_failed_with_cost(
         cost_model_type=pricing_source,
         pricing_snapshot=pricing_snapshot,
         pricing_version=pricing_version,
-        created_at=datetime.utcnow(),
+        created_at=cost_created_at,
+        **inr_cost_fields(
+            db, on_date=cost_created_at.date(),
+            total_cost=total_cost, input_cost=input_cost, output_cost=output_cost,
+        ),
     ))
 
     record_tokens_used(org_id=org_id, project_id=project_id, tokens=input_tokens + output_tokens)
@@ -2137,6 +2148,7 @@ def stats_by_project_model(
         func.sum(RequestCost.output_token_cost).label("output_cost"),
         func.sum(RequestCost.llm_cost).label("llm_cost"),
         func.sum(RequestCost.total_cost).label("total_cost"),
+        func.sum(RequestCost.total_cost_inr).label("total_cost_inr"),
     ).join(AiRequest, AiRequest.request_id == RequestCost.request_id)
     if org_id:
         q = q.filter(RequestCost.org_id == org_id)
@@ -2175,6 +2187,7 @@ def stats_by_project_model(
             "output_cost": float(r.output_cost or 0),
             "llm_cost": float(r.llm_cost or 0),
             "total_cost": float(r.total_cost or 0),
+            "total_cost_inr": float(r.total_cost_inr) if r.total_cost_inr is not None else None,
         }
         for r in rows
     ]
@@ -2653,6 +2666,10 @@ def list_proxy_requests(
                     f" r.failure_code, r.failure_reason, r.completed_at, r.request_payload,"
                     f" r.trace_id, gt.request_count,"
                     f" r.user_id, r.user_email, r.user_role,"
+                    f" gt.g_total_cost_inr AS total_cost_inr,"
+                    f" gt.g_input_cost_inr AS input_cost_inr,"
+                    f" gt.g_output_cost_inr AS output_cost_inr,"
+                    f" gt.g_exchange_rate AS exchange_rate,"
                     f" COUNT(*) OVER() AS total_count"
                     f" FROM ai_requests r"
                     f" LEFT JOIN LATERAL ("
@@ -2663,7 +2680,14 @@ def list_proxy_requests(
                     f"   SUM(rc2.total_cost) AS g_total_cost,"
                     f"   SUM(rc2.llm_cost) AS g_llm_cost,"
                     f"   SUM(rc2.input_token_cost) AS g_input_cost,"
-                    f"   SUM(rc2.output_token_cost) AS g_output_cost"
+                    f"   SUM(rc2.output_token_cost) AS g_output_cost,"
+                    f"   SUM(rc2.total_cost_inr) AS g_total_cost_inr,"
+                    f"   SUM(rc2.input_cost_inr) AS g_input_cost_inr,"
+                    f"   SUM(rc2.output_cost_inr) AS g_output_cost_inr,"
+                    # The group's calls almost always share one day's rate; if they
+                    # straddle a rate change there is no single rate to show → NULL.
+                    f"   CASE WHEN MIN(rc2.exchange_rate) = MAX(rc2.exchange_rate)"
+                    f"        THEN MIN(rc2.exchange_rate) END AS g_exchange_rate"
                     f"   FROM ai_requests r2"
                     f"   LEFT JOIN token_usage tu2 ON tu2.request_id = r2.request_id"
                     f"   LEFT JOIN request_cost rc2 ON rc2.request_id = r2.request_id"
@@ -2701,6 +2725,7 @@ def list_proxy_requests(
                     f" r.failure_code, r.failure_reason, r.completed_at, r.request_payload,"
                     f" r.trace_id, NULL AS request_count, r.parent_request_id,"
                     f" r.user_id, r.user_email, r.user_role,"
+                    f" rc.total_cost_inr, rc.input_cost_inr, rc.output_cost_inr, rc.exchange_rate,"
                     f" COUNT(*) OVER() AS total_count"
                     f" FROM ai_requests r"
                     f" LEFT JOIN token_usage tu ON tu.request_id = r.request_id"
@@ -2753,6 +2778,10 @@ def list_proxy_requests(
                 "llm_cost":         float(r[20]) if r[20] is not None else None,
                 "input_cost":       float(r[21]) if r[21] is not None else None,
                 "output_cost":      float(r[22]) if r[22] is not None else None,
+                "total_cost_inr":   float(r.total_cost_inr) if r.total_cost_inr is not None else None,
+                "input_cost_inr":   float(r.input_cost_inr) if r.input_cost_inr is not None else None,
+                "output_cost_inr":  float(r.output_cost_inr) if r.output_cost_inr is not None else None,
+                "exchange_rate":    float(r.exchange_rate) if r.exchange_rate is not None else None,
                 "entry_point":           r[23],
                 "pii_severity":          r[24],
                 "pii_entities_detected": r[25] or 0,
@@ -2804,7 +2833,10 @@ def _list_proxy_requests_grouped_by_trace(
                 f" SUM(tu.total_tokens) AS total_tokens,"
                 f" SUM(rc.total_cost) AS total_cost,"
                 f" MAX(r.org_id) AS org_id,"
-                f" MAX(r.project_id) AS project_id"
+                f" MAX(r.project_id) AS project_id,"
+                f" SUM(rc.total_cost_inr) AS total_cost_inr,"
+                f" CASE WHEN MIN(rc.exchange_rate) = MAX(rc.exchange_rate)"
+                f"      THEN MIN(rc.exchange_rate) END AS exchange_rate"
                 f" FROM ai_requests r"
                 f" LEFT JOIN token_usage tu ON tu.request_id = r.request_id"
                 f" LEFT JOIN request_cost rc ON rc.request_id = r.request_id"
@@ -2833,6 +2865,8 @@ def _list_proxy_requests_grouped_by_trace(
                 "total_cost":         float(r[7]) if r[7] is not None else None,
                 "org_id":             r[8],
                 "project_id":         r[9],
+                "total_cost_inr":     float(r.total_cost_inr) if r.total_cost_inr is not None else None,
+                "exchange_rate":      float(r.exchange_rate) if r.exchange_rate is not None else None,
             }
             for r in rows
         ],

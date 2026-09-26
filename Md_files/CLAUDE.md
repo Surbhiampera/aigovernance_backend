@@ -76,8 +76,9 @@ Optional `X-User-Id` (plus `X-User-Email`/`X-User-Role`) proxy headers attribute
 | `app/services/pii_engine.py` | Presidio-based PII detection and masking (Aadhaar/PAN custom recognizers) |
 | `app/core/deps.py` | `get_db`, `require_api_key`/`require_role(...)` — admin-API auth (distinct from the proxy's `X-Governance-Key`) |
 | `app/services/optimization/registry.py`, `app/services/optimization/rules/*` | Pluggable optimization-tip rules (self-register via `@tip_registry.register`) |
-| `app/workers/tasks.py` | Aggregation functions called by the scheduler: `_rebuild_daily_summary`, `_rebuild_daily_user_summary`, `_detect_daily_anomalies`, `_rebuild_monthly_summary`, `_generate_optimization_tips` |
-| `app/scheduler.py` | APScheduler: hourly daily-agg (summary + user summary + anomaly detection), daily monthly-agg |
+| `app/workers/tasks.py` | Aggregation functions called by the scheduler: `_rebuild_daily_summary`, `_rebuild_daily_user_summary`, `_detect_daily_anomalies`, `_rebuild_monthly_summary`, `_generate_optimization_tips`, `_refresh_exchange_rates` |
+| `app/services/fx_service.py` | USD→INR rates: `get_usd_inr_rate()` (latest on/before a date, falls back to most recent stored), daily fetch, and the INR snapshot (`exchange_rate`, `*_cost_inr`) stored on each `request_cost` row at write time. Historical rows: `scripts/backfill_inr_costs.py` |
+| `app/scheduler.py` | APScheduler: hourly daily-agg (summary + user summary + anomaly detection), daily monthly-agg, daily `fx_rates` (USD→INR; `FX_FETCH_ENABLED`, `FX_RATE_API_URL`) |
 | `app/config.py` | All environment variable accessors |
 
 ### Database
