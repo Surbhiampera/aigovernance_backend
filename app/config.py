@@ -421,7 +421,7 @@ def get_auth_jwt_secret() -> str:
 
 
 def get_auth_access_token_minutes() -> int:
-    return _int("AUTH_ACCESS_TOKEN_MINUTES", "480")
+    return _int("AUTH_ACCESS_TOKEN_MINUTES", "1440")
 
 
 def get_auth_password_min_length() -> int:
