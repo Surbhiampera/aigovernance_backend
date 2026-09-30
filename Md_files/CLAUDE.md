@@ -50,7 +50,7 @@ All enforcement decisions are logged to `audit_logs`. 403 = PII block, 429 = bud
 
 ### Multi-provider deployments
 
-`app/services/deployment_service.py` resolves the Azure/OpenAI/Anthropic/Google deployment for a given org/project/model via the `ModelDeployment` table (`app/models.py`), ranked project-specific → org-wide, default → non-default, earliest-registered first. Falls back to synthetic deployments built from `.env` vars (`AZURE_OPENAI_*`, `OPENAI_*`, `AZURE_*`, `TTS_AZURE_OPENAI_*`) when no DB row matches, with a warning logged. Admins register deployments via `POST /deployments` (`app/routers/deployments.py`); `provision_standard_deployments()` seeds org-wide defaults for new orgs from `config.get_standard_model_deployments()`.
+`app/services/deployment_service.py` resolves the Azure/OpenAI/Anthropic/Google deployment for a given org/project/model via the `ModelDeployment` table (`app/models.py`), ranked project-specific → org-wide, default → non-default, earliest-registered first. Falls back to synthetic deployments built from `.env` vars (`AZURE_OPENAI_*`, `OPENAI_*`, `AZURE_*`, `TTS_AZURE_OPENAI_*`, `AZURE_OPENAI_LUNA_*`) when no DB row matches, with a warning logged. Admins register deployments via `POST /deployments` (`app/routers/deployments.py`); `provision_standard_deployments()` seeds org-wide defaults for new orgs from `config.get_standard_model_deployments()`.
 
 ### Per-user tracking
 
@@ -130,6 +130,7 @@ Key variables expected in `.env`:
 - `OPENAI_API_KEY`, `OPENAI_ENDPOINT`, `OPENAI_DEPLOYMENT_NAME`, `OPENAI_API_VERSION` — env-fallback deployment for a second OpenAI-routed model
 - `AZURE_API_KEY`, `AZURE_ENDPOINT`, `AZURE_DEPLOYMENT`, `AZURE_API_VERSION` — env-fallback deployment (e.g. gpt-4o)
 - `TTS_AZURE_OPENAI_API_KEY`, `TTS_AZURE_OPENAI_ENDPOINT`, `TTS_AZURE_OPENAI_DEPLOYMENT`, `TTS_AZURE_OPENAI_API_VERSION` — env-fallback deployment registered for resolution only; no `/audio/speech` route exists yet
+- `AZURE_OPENAI_LUNA_API_KEY`, `AZURE_OPENAI_LUNA_ENDPOINT`, `AZURE_OPENAI_LUNA_DEPLOYMENT_NAME`, `AZURE_OPENAI_LUNA_API_VERSION` — env-fallback deployment for `gpt-5.6-luna`
 - `REDIS_URL` — backs `rate_limit_service`; falls back to Postgres counts if unset/unreachable
 - `CORS_ORIGINS` — Comma-separated allowed origins
 - `SCHEDULER_MAX_WORKERS` — APScheduler thread count (default 2)

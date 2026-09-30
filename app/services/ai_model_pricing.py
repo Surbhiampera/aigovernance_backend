@@ -24,6 +24,7 @@ MODEL_PRICING: dict[str, ModelPricing] = {
     "gpt-5":                  ModelPricing(5.00,   15.00, 400_000, 128_000, "OpenAI", "chat"),
     "gpt-5-mini":             ModelPricing(0.60,    2.40, 200_000,  64_000, "OpenAI", "chat"),
     "gpt-5-nano":             ModelPricing(0.10,    0.40, 128_000,  32_000, "OpenAI", "chat"),
+    "gpt-5.6-luna":           ModelPricing(0.20,    1.20, 200_000,  64_000, "OpenAI", "chat"),  # Azure retail Std Global, short-context (>threshold: 0.40/1.80)
     "gpt-5-nano-banana":      ModelPricing(0.12,    0.45, 128_000,  32_000, "OpenAI", "chat"),
 
     "gpt-4o":                 ModelPricing(2.50,   10.00, 128_000,  16_384, "OpenAI", "chat"),
@@ -159,6 +160,7 @@ PROVIDER_PRICING: dict[tuple[str, str], ModelPricing] = {
     # Azure OpenAI — input is half of OpenAI direct for GPT-5-nano
     ("azure_openai", "gpt-5-nano"):   ModelPricing(0.05,   0.40, 128_000, 32_000, "Azure OpenAI", "chat"),
     ("azure_openai", "gpt-5-mini"):   ModelPricing(0.55,   2.20, 200_000, 64_000, "Azure OpenAI", "chat"),
+    ("azure_openai", "gpt-5.6-luna"): ModelPricing(0.20,   1.20, 200_000, 64_000, "Azure OpenAI", "chat"),  # Azure retail Std Global, short-context (>threshold: 0.40/1.80)
     ("azure_openai", "gpt-5"):        ModelPricing(4.50,  13.50, 400_000,128_000, "Azure OpenAI", "chat"),
     ("azure_openai", "gpt-4o"):       ModelPricing(2.50,  10.00, 128_000, 16_384, "Azure OpenAI", "chat"),
     ("azure_openai", "gpt-4o-mini"):  ModelPricing(0.15,   0.60, 128_000, 16_384, "Azure OpenAI", "chat"),

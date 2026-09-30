@@ -152,6 +152,8 @@ def _env_fallback_model_names() -> dict[str, str]:
         names[os.getenv("AZURE_DEPLOYMENT")] = "azure_openai"
     if os.getenv("TTS_AZURE_OPENAI_API_KEY") and os.getenv("TTS_AZURE_OPENAI_ENDPOINT") and os.getenv("TTS_AZURE_OPENAI_DEPLOYMENT"):
         names[os.getenv("TTS_AZURE_OPENAI_DEPLOYMENT")] = "azure_openai"
+    if os.getenv("AZURE_OPENAI_LUNA_API_KEY") and os.getenv("AZURE_OPENAI_LUNA_ENDPOINT") and os.getenv("AZURE_OPENAI_LUNA_DEPLOYMENT_NAME"):
+        names[os.getenv("AZURE_OPENAI_LUNA_DEPLOYMENT_NAME")] = "azure_openai"
     return names
 
 
@@ -269,6 +271,16 @@ def _env_fallbacks(*, org_id: str, project_id: Optional[str]) -> list:
     _ver4 = os.getenv("TTS_AZURE_OPENAI_API_VERSION") or "2024-02-01"
     if _key4 and _ep4 and _dep4:
         fallbacks.append(_make_env_deployment(model_name=_dep4, api_key=_key4, endpoint=_ep4, api_version=_ver4))
+
+    # gpt-5.6-luna (and anything else routed via AZURE_OPENAI_LUNA_DEPLOYMENT_NAME)
+    _key5, _ep5, _dep5 = (
+        os.getenv("AZURE_OPENAI_LUNA_API_KEY", ""),
+        _base_endpoint(os.getenv("AZURE_OPENAI_LUNA_ENDPOINT", "")),
+        os.getenv("AZURE_OPENAI_LUNA_DEPLOYMENT_NAME", ""),
+    )
+    _ver5 = os.getenv("AZURE_OPENAI_LUNA_API_VERSION") or "2025-04-01-preview"
+    if _key5 and _ep5 and _dep5:
+        fallbacks.append(_make_env_deployment(model_name=_dep5, api_key=_key5, endpoint=_ep5, api_version=_ver5))
 
     if fallbacks:
         _log.warning(
