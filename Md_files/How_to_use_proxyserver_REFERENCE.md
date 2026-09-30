@@ -126,6 +126,8 @@ Content-Type: application/json
 
 > `model` can also be passed as a query param: `POST /proxy?model=gpt-4o` (takes precedence over body).
 
+> **Reasoning models (`gpt-5*`, including `gpt-5-nano` and `gpt-5.6-luna`)**: the proxy drops `max_tokens` / `max_completion_tokens` (the model manages its own token budget), and drops `temperature`, `top_p`, `presence_penalty` and `frequency_penalty` unless they are at their default value. Sending them is harmless — they are ignored, not rejected.
+
 **Response**
 
 ```json
@@ -846,11 +848,14 @@ Model deployments map a model name to an AI provider endpoint, scoped per `org_i
 > **Two ways a model resolves for a request:**
 >
 > 1. **DB row (`ModelDeployment`)** — looked up by `org_id` + `model_name`, project-specific rows preferred over org-wide ones. This is the durable, per-org way to grant access to a model.
-> 2. **Env-var fallback** — used only when no DB row matches. Two fallback sets are currently wired up, each tied to one model name and applied across *any* org with no matching DB row:
+> 2. **Env-var fallback** — used only when no DB row matches. Each set below is tied to one model and applied across *any* org with no matching DB row:
 >    - `AZURE_OPENAI_API_KEY` / `AZURE_OPENAI_ENDPOINT` / `AZURE_OPENAI_DEPLOYMENT_NAME` / `AZURE_OPENAI_API_VERSION`
->    - `OPENAI_API_KEY` / `OPENAI_ENDPOINT` / `AZURE_DEPLOYMENT` / `OPENAI_API_VERSION`
+>    - `OPENAI_API_KEY` / `OPENAI_ENDPOINT` / `OPENAI_DEPLOYMENT_NAME` / `OPENAI_API_VERSION`
+>    - `AZURE_API_KEY` / `AZURE_ENDPOINT` / `AZURE_DEPLOYMENT` / `AZURE_API_VERSION`
+>    - `TTS_AZURE_OPENAI_API_KEY` / `TTS_AZURE_OPENAI_ENDPOINT` / `TTS_AZURE_OPENAI_DEPLOYMENT` / `TTS_AZURE_OPENAI_API_VERSION` (deployment resolution only; no audio route yet)
+>    - `AZURE_OPENAI_LUNA_API_KEY` / `AZURE_OPENAI_LUNA_ENDPOINT` / `AZURE_OPENAI_LUNA_DEPLOYMENT_NAME` / `AZURE_OPENAI_LUNA_API_VERSION` (`gpt-5.6-luna`)
 >
->    Both can be active at once and are matched by model name per-request, so the same org/project can use both models in parallel. Because the fallback is global (not org-scoped), prefer DB rows when you need to restrict a model to specific orgs.
+>    All can be active at once and are matched by model name per-request, so the same org/project can use several models in parallel. Because the fallback is global (not org-scoped), prefer DB rows when you need to restrict a model to specific orgs.
 >
 > **Auto-provisioning new orgs:** set `STANDARD_MODEL_DEPLOYMENTS` to a JSON array of deployment templates (see `app/config.py`) and every org created via `POST /organizations/` automatically gets one org-wide `ModelDeployment` row per template. For orgs that already existed before this was set up, call `POST /organizations/{org_id}/provision-deployments` (§5) to backfill.
 
@@ -972,6 +977,20 @@ Dismiss an alert.
 ### `GET /models/`
 
 List all available models.
+
+### `GET /models/catalog`
+
+Models that can actually be called through this proxy — only those with configured credentials (a deployment template or DB deployment with an API key, or a complete env-var fallback set). Use this, not a hardcoded list, to see valid values for `model` and for an org/project's allowed/default model.
+
+```json
+[
+  { "model_name": "gpt-5.6-luna", "provider": "OpenAI", "category": "chat",
+    "input_per_1m": 0.2, "output_per_1m": 1.2,
+    "context_window": 200000, "max_output_tokens": 64000 }
+]
+```
+
+Prices are USD per 1M tokens. A model missing from this list is not callable, even if it has a pricing entry.
 
 ---
 
