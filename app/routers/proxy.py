@@ -655,7 +655,7 @@ def _store_response_and_cost(
     )
 
     tool_calls = (
-        response_payload.get("choices", [{}])[0].get("message", {}).get("tool_calls")
+        ((response_payload.get("choices") or [{}])[0].get("message") or {}).get("tool_calls")
         if isinstance(response_payload, dict)
         else None
     )
@@ -1125,7 +1125,7 @@ async def _stream_azure(
                 ctx.update(attempt)
             yield f"data: {json.dumps({'error': str(exc)})}\n\n".encode()
             partial_output = "".join(
-                json.loads(c).get("choices", [{}])[0].get("delta", {}).get("content") or ""
+                ((json.loads(c).get("choices") or [{}])[0].get("delta") or {}).get("content") or ""
                 for c in chunks_raw if _is_valid_json(c)
             )
             partial_output_tokens = count_tokens(text=partial_output, model_name=model) if partial_output else 0
@@ -1194,7 +1194,7 @@ async def _stream_azure(
     latency_ms = int((time.time() - t_start) * 1000)
 
     combined = "".join(
-        json.loads(c).get("choices", [{}])[0].get("delta", {}).get("content") or ""
+        ((json.loads(c).get("choices") or [{}])[0].get("delta") or {}).get("content") or ""
         for c in chunks_raw
         if _is_valid_json(c)
     )
