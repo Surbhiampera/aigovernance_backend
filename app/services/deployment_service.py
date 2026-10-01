@@ -292,11 +292,15 @@ def _env_fallbacks(*, org_id: str, project_id: Optional[str]) -> list:
     return fallbacks
 
 
-def build_provider_request(depl, stream: bool = False) -> tuple[str, dict]:
+def build_provider_request(depl, stream: bool = False, api: str = "chat") -> tuple[str, dict]:
     """Return (url, headers) for the given deployment config.
 
     `stream` only changes the URL for providers with a distinct streaming
     endpoint (currently Google Gemini's streamGenerateContent).
+
+    `api="responses"` targets the OpenAI Responses API instead of chat
+    completions. Only OpenAI-compatible providers have one; callers must not
+    request it for anthropic/google.
     """
     provider  = (depl.provider or "").lower().replace("-", "_").replace(" ", "_")
     api_key   = depl.api_key or ""
@@ -309,7 +313,21 @@ def build_provider_request(depl, stream: bool = False) -> tuple[str, dict]:
     )
     dep_name  = depl.deployment_name or depl.model_name
 
-    if provider in ("azure_openai", "azure"):
+    if api == "responses":
+        if provider in ("azure_openai", "azure"):
+            # v1 GA route: no api-version needed, deployment goes in body "model".
+            url = f"{endpoint}/openai/v1/responses"
+            headers = {"api-key": api_key, "Content-Type": _CONTENT_TYPE_JSON}
+        elif provider == "openai":
+            url = f"{endpoint or 'https://api.openai.com'}/v1/responses"
+            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": _CONTENT_TYPE_JSON}
+        elif provider in ("anthropic", "google"):
+            raise ValueError(f"Responses API is not supported for provider '{provider}'.")
+        else:
+            url = f"{endpoint}/responses"
+            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": _CONTENT_TYPE_JSON}
+
+    elif provider in ("azure_openai", "azure"):
         url = (
             f"{endpoint}/openai/deployments/{dep_name}"
             f"/chat/completions?api-version={api_ver}"

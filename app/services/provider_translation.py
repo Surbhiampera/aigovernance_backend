@@ -341,6 +341,33 @@ def extract_usage(provider: str, response_data: dict) -> ProviderUsage:
     return _usage_from_openai(response_data)
 
 
+def extract_responses_usage(response_data: dict) -> ProviderUsage:
+    """Tokens/finish state from an OpenAI Responses-API object (usage.input_tokens/
+    output_tokens, `output` items) — the shape differs from chat completions."""
+    usage = response_data.get("usage", {}) or {}
+    prompt = int(usage.get("input_tokens", 0) or 0)
+    completion = int(usage.get("output_tokens", 0) or 0)
+    output_text = "".join(
+        part.get("text") or ""
+        for item in (response_data.get("output") or []) if isinstance(item, dict) and item.get("type") == "message"
+        for part in (item.get("content") or []) if isinstance(part, dict)
+    )
+    status = response_data.get("status")
+    if status == "incomplete":
+        reason = (response_data.get("incomplete_details") or {}).get("reason") or "incomplete"
+    else:
+        has_call = any(
+            isinstance(i, dict) and i.get("type") == "function_call"
+            for i in (response_data.get("output") or [])
+        )
+        reason = "tool_calls" if has_call else status
+    return ProviderUsage(
+        input_tokens=prompt, output_tokens=completion, finish_reason=reason,
+        input_tokens_known=prompt > 0, output_tokens_known=completion > 0,
+        output_text=output_text,
+    )
+
+
 def _usage_from_openai(response_data: dict) -> ProviderUsage:
     usage = response_data.get("usage", {}) or {}
     prompt = int(usage.get("prompt_tokens", 0))

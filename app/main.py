@@ -36,7 +36,7 @@ from app.routers.deployments import router as deployments_router
 from app.routers.license import router as license_router
 from app.routers.license import enforce_license
 from app.routers.proxy import router as proxy_router
-from app.routers.proxy import proxy_chat_openai_compat
+from app.routers.proxy import proxy_chat_openai_compat, proxy_responses
 
 _log = logging.getLogger(__name__)
 
@@ -243,6 +243,27 @@ async def root_chat_completions_alias(
 ):
     # proxy_chat_openai_compat dispatches to the SSE handler when stream=true.
     return await proxy_chat_openai_compat(
+        request=request, background_tasks=background_tasks, model=model,
+        x_governance_key=x_governance_key, x_trace_id=x_trace_id, x_user_id=x_user_id,
+        x_user_email=x_user_email, x_user_role=x_user_role, db=db,
+    )
+
+
+@app.post("/responses")
+@app.post("/v1/responses")
+async def root_responses_alias(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    model: Optional[str] = Query(None, description="AI model name (overrides body 'model' field)"),
+    x_governance_key: str = Header(..., alias="X-Governance-Key"),
+    x_trace_id: Optional[str] = Header(None, alias="X-Trace-Id"),
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+    x_user_email: Optional[str] = Header(None, alias="X-User-Email"),
+    x_user_role: Optional[str] = Header(None, alias="X-User-Role"),
+    db: Session = Depends(get_db),
+):
+    # Same misconfigured-base_url rationale as the chat alias above.
+    return await proxy_responses(
         request=request, background_tasks=background_tasks, model=model,
         x_governance_key=x_governance_key, x_trace_id=x_trace_id, x_user_id=x_user_id,
         x_user_email=x_user_email, x_user_role=x_user_role, db=db,

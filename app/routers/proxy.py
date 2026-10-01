@@ -5,8 +5,9 @@ Client apps configure only:
     BASE_URL=https://governance.company.com
 
 Endpoints:
-    POST /proxy          — non-streaming chat completion
-    POST /proxy/stream   — streaming chat completion (SSE)
+    POST /proxy            — non-streaming chat completion
+    POST /proxy/stream     — streaming chat completion (SSE)
+    POST /proxy/responses  — OpenAI Responses API (streaming via body `stream: true`)
 
 Model is specified by the client via ?model=<name> query param or "model" in the
 request body. The proxy resolves the correct Azure deployment from the DB and
@@ -64,6 +65,7 @@ from app.services.deployment_service import build_provider_request, get_deployme
 from app.services.fx_service import inr_cost_fields
 from app.services.model_selection_service import get_default_model
 from app.services.provider_translation import (
+    extract_responses_usage,
     extract_usage,
     needs_translation,
     stream_delta_text,
@@ -404,16 +406,11 @@ def _authenticate(
 # Step 4: PII scan
 # ---------------------------------------------------------------------------
 
-def _scan_messages(
-    *,
-    messages: list[dict],
-    org_id: str,
-    project_id: Optional[str],
-    db: Session,
-):
-    """Return (sanitised_messages, combined_pii_result)."""
+def _new_text_scanner(*, org_id: str, project_id: Optional[str], db: Session):
+    """Return (combined_result, scan_text). scan_text(text, idx=, role=) masks
+    one string via the org's PII policy, raises 403 on a block-action hit, and
+    folds the findings into combined_result."""
     from app.services.pii_engine import PiiScanResult, combine_severity
-    sanitised: list[dict] = []
     combined = PiiScanResult(sanitized_text="")
 
     def _scan_text(text: str, *, idx: int, role: str) -> str:
@@ -451,6 +448,20 @@ def _scan_messages(
         combined.entities_masked += result.entities_masked
         return result.sanitized_text
 
+    return combined, _scan_text
+
+
+def _scan_messages(
+    *,
+    messages: list[dict],
+    org_id: str,
+    project_id: Optional[str],
+    db: Session,
+):
+    """Return (sanitised_messages, combined_pii_result)."""
+    combined, _scan_text = _new_text_scanner(org_id=org_id, project_id=project_id, db=db)
+    sanitised: list[dict] = []
+
     for idx, msg in enumerate(messages):
         content = msg.get("content", "")
         role = msg.get("role", "user")
@@ -467,6 +478,119 @@ def _scan_messages(
         else:
             sanitised.append(msg)
     return sanitised, combined
+
+
+# ---------------------------------------------------------------------------
+# Responses API: PII scan + message view over `instructions` / `input` items
+# ---------------------------------------------------------------------------
+
+_RESPONSES_TEXT_BLOCKS = ("input_text", "output_text", "text")
+
+
+def _scan_responses_content(content: Any, *, idx: int, role: str, scan_text) -> Any:
+    if isinstance(content, str):
+        return scan_text(content, idx=idx, role=role)
+    if isinstance(content, list):
+        return [
+            {**b, "text": scan_text(b["text"], idx=idx, role=role)}
+            if isinstance(b, dict) and b.get("type") in _RESPONSES_TEXT_BLOCKS and isinstance(b.get("text"), str)
+            else b
+            for b in content
+        ]
+    return content
+
+
+def _scan_responses_body(*, body: dict, org_id: str, project_id: Optional[str], db: Session):
+    """Return (clean_instructions, clean_input, combined_pii_result).
+
+    Only human/tool-visible text is scanned: message content and
+    function_call_output. `reasoning` items (opaque encrypted_content),
+    function_call and every other item type pass through byte-for-byte —
+    altering them would break replaying reasoning across tool-result turns.
+    """
+    combined, scan_text = _new_text_scanner(org_id=org_id, project_id=project_id, db=db)
+
+    instructions = body.get("instructions")
+    if isinstance(instructions, str) and instructions:
+        instructions = scan_text(instructions, idx=0, role="system")
+
+    raw_input = body.get("input")
+    if isinstance(raw_input, str):
+        clean_input: Any = scan_text(raw_input, idx=1, role="user")
+    elif isinstance(raw_input, list):
+        clean_input = []
+        for idx, item in enumerate(raw_input, start=1):
+            if not isinstance(item, dict):
+                clean_input.append(item)
+                continue
+            itype = item.get("type")
+            if itype in (None, "message"):
+                role = item.get("role", "user")
+                clean_input.append({**item, "content": _scan_responses_content(
+                    item.get("content"), idx=idx, role=role, scan_text=scan_text)})
+            elif itype == "function_call_output":
+                clean_input.append({**item, "output": _scan_responses_content(
+                    item.get("output"), idx=idx, role="tool", scan_text=scan_text)})
+            else:
+                clean_input.append(item)
+    else:
+        clean_input = raw_input
+    return instructions, clean_input, combined
+
+
+def _responses_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            b["text"] for b in content
+            if isinstance(b, dict) and isinstance(b.get("text"), str)
+        )
+    return ""
+
+
+def _responses_as_messages(instructions: Any, raw_input: Any) -> list[dict]:
+    """Flatten Responses `instructions`/`input` into chat-style {role, content}
+    messages so the request log columns, token estimates and input-size
+    governance checks (all written against `messages`) keep working."""
+    out: list[dict] = []
+    if isinstance(instructions, str) and instructions:
+        out.append({"role": "system", "content": instructions})
+    if isinstance(raw_input, str):
+        out.append({"role": "user", "content": raw_input})
+    elif isinstance(raw_input, list):
+        for item in raw_input:
+            if not isinstance(item, dict):
+                continue
+            itype = item.get("type")
+            if itype in (None, "message"):
+                out.append({"role": item.get("role", "user"), "content": _responses_text(item.get("content"))})
+            elif itype == "function_call_output":
+                out.append({"role": "tool", "content": _responses_text(item.get("output"))})
+            elif itype == "function_call":
+                out.append({"role": "assistant", "content": f"{item.get('name', '')} {item.get('arguments', '')}"})
+    return out
+
+
+def _redact_encrypted_reasoning(obj: Any) -> Any:
+    """Copy of a Responses request body or response with reasoning items'
+    encrypted_content replaced by a marker. That blob is large, opaque and
+    re-sent on every tool turn; keeping it in audit rows only bloats them."""
+    def _redact(items: Any) -> Any:
+        if not isinstance(items, list):
+            return items
+        return [
+            {**i, "encrypted_content": "[redacted]"}
+            if isinstance(i, dict) and i.get("encrypted_content") else i
+            for i in items
+        ]
+    if not isinstance(obj, dict):
+        return obj
+    out = dict(obj)
+    for key in ("input", "output"):
+        if key in out:
+            out[key] = _redact(out[key])
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -609,7 +733,7 @@ def _token_usage_extras(
         if isinstance(response_payload, dict):
             usage = response_payload.get("usage") or {}
             cached = 0
-            details = usage.get("prompt_tokens_details")
+            details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details")
             if isinstance(details, dict):
                 cached = int(details.get("cached_tokens", 0) or 0)
             elif "cache_read_input_tokens" in usage:
@@ -654,11 +778,19 @@ def _store_response_and_cost(
         output_tokens=output_tokens,
     )
 
-    tool_calls = (
-        ((response_payload.get("choices") or [{}])[0].get("message") or {}).get("tool_calls")
-        if isinstance(response_payload, dict)
-        else None
-    )
+    if isinstance(response_payload, dict) and isinstance(response_payload.get("output"), list):
+        # Responses API: tool calls are `function_call` items in `output`.
+        tool_calls = [
+            i for i in response_payload["output"]
+            if isinstance(i, dict) and i.get("type") == "function_call"
+        ] or None
+        response_payload = _redact_encrypted_reasoning(response_payload)
+    else:
+        tool_calls = (
+            ((response_payload.get("choices") or [{}])[0].get("message") or {}).get("tool_calls")
+            if isinstance(response_payload, dict)
+            else None
+        )
     num_tool_calls = len(tool_calls) if tool_calls else 0
 
     req_row = db.query(AiRequest).filter(AiRequest.request_id == request_id).first()
@@ -1485,13 +1617,17 @@ async def _run_pre_flight(
     user_id: Optional[str] = None,
     user_email: Optional[str] = None,
     user_role: Optional[str] = None,
+    api: str = "chat",
 ) -> dict:
     """Auth, rate-limit, model resolution, budget/governance checks, PII scan, token count.
 
-    Returns a context dict consumed by both proxy endpoints.
+    `api` is "chat" (chat completions, `messages`) or "responses" (OpenAI
+    Responses API, `instructions`/`input`). Returns a context dict consumed by
+    every proxy endpoint.
     Raises HTTPException on any enforcement failure.
     """
     t_request_start = time.time()
+    responses_api = api == "responses"
 
     identity = _authenticate(db=db, raw_key=x_governance_key)
     org_id: str = identity["org_id"]
@@ -1581,6 +1717,23 @@ async def _run_pre_flight(
         )
         raise HTTPException(status_code=404, detail=_reason)
 
+    if responses_api:
+        # Anthropic/Google have no Responses endpoint, and their native
+        # shapes can't carry Responses items — never fail over to them.
+        candidate_deployments = [
+            c for c in candidate_deployments if not needs_translation(getattr(c, "provider", None) or "")
+        ]
+        if not candidate_deployments:
+            _reason = f"Model '{model_name}' does not support the Responses API; use /proxy/chat/completions."
+            _log_blocked_request(
+                db=db, request_id=request_id, org_id=org_id, project_id=project_id,
+                key_id=key_id, source_ip=source_ip, user_agent=user_agent, trace_id=trace_id,
+                parent_request_id=parent_request_id, user_id=user_id,
+                user_email=user_email, user_role=user_role,
+                failure_code="unsupported_api", failure_reason=_reason, request_payload=body,
+            )
+            raise HTTPException(status_code=400, detail=_reason)
+
     depl = candidate_deployments[0]
     model: str = depl.model_name
     deployment: str = depl.deployment_name or depl.model_name
@@ -1589,7 +1742,9 @@ async def _run_pre_flight(
     try:
         check_governance_rules(
             db=db, org_id=org_id, project_id=project_id, model=model,
-            max_output_tokens_requested=body.get("max_tokens"),
+            max_output_tokens_requested=(
+                body.get("max_output_tokens") if responses_api else body.get("max_tokens")
+            ),
             request_id=request_id, source_ip=source_ip,
         )
     except HTTPException as exc:
@@ -1624,7 +1779,11 @@ async def _run_pre_flight(
     except Exception as _e:
         _log.warning("Budget check skipped: %s", _e)
 
-    messages: list[dict] = body.get("messages", [])
+    if responses_api:
+        messages: list[dict] = _responses_as_messages(body.get("instructions"), body.get("input"))
+    else:
+        messages = body.get("messages", [])
+    clean_instructions, clean_input = body.get("instructions"), body.get("input")
     pii_detected = False
     pii_types: list = []
     pii_masked = False
@@ -1639,9 +1798,15 @@ async def _run_pre_flight(
         # async def's event loop thread would stall every other coroutine on
         # this worker — including unrelated dashboard endpoints — for the
         # duration of the scan. Thread-offloading keeps the loop free.
-        clean_messages, pii_result = await run_in_threadpool(
-            _scan_messages, messages=messages, org_id=org_id, project_id=project_id, db=db,
-        )
+        if responses_api:
+            clean_instructions, clean_input, pii_result = await run_in_threadpool(
+                _scan_responses_body, body=body, org_id=org_id, project_id=project_id, db=db,
+            )
+            clean_messages = _responses_as_messages(clean_instructions, clean_input)
+        else:
+            clean_messages, pii_result = await run_in_threadpool(
+                _scan_messages, messages=messages, org_id=org_id, project_id=project_id, db=db,
+            )
         pii_detected = pii_result.pii_detected
         pii_types = pii_result.pii_types
         pii_masked = pii_result.pii_masked
@@ -1669,13 +1834,32 @@ async def _run_pre_flight(
     # path re-adds stream=True on the outbound body, so keep it only there.
     _drop = {"stream"} if stream else {"stream", "stream_options"}
     forward_body = {k: v for k, v in body.items() if k not in _drop}
-    forward_body["messages"] = clean_messages
+    if responses_api:
+        if "instructions" in body:
+            forward_body["instructions"] = clean_instructions
+        if "input" in body:
+            forward_body["input"] = clean_input
+    else:
+        forward_body["messages"] = clean_messages
     forward_body["model"] = model
 
     try:
-        apply_token_overrides(
-            db=db, org_id=org_id, project_id=project_id, model=model, forward_body=forward_body,
-        )
+        if responses_api:
+            # Token override rules are keyed on max_tokens; Responses calls it
+            # max_output_tokens.
+            _cap_view = (
+                {"max_tokens": forward_body["max_output_tokens"]}
+                if forward_body.get("max_output_tokens") is not None else {}
+            )
+            apply_token_overrides(
+                db=db, org_id=org_id, project_id=project_id, model=model, forward_body=_cap_view,
+            )
+            if "max_tokens" in _cap_view:
+                forward_body["max_output_tokens"] = _cap_view["max_tokens"]
+        else:
+            apply_token_overrides(
+                db=db, org_id=org_id, project_id=project_id, model=model, forward_body=forward_body,
+            )
     except Exception as _e:
         _log.warning("Token override check skipped: %s", _e)
 
@@ -1711,10 +1895,10 @@ async def _run_pre_flight(
         org_id=org_id,
         project_id=project_id,
         key_id=key_id,
-        request_type="chat_completion",
+        request_type="responses" if responses_api else "chat_completion",
         model=model,
         deployment=deployment,
-        payload=forward_body,
+        payload=_redact_encrypted_reasoning(forward_body) if responses_api else forward_body,
         input_tokens=input_tokens,
         source_ip=source_ip,
         original_messages=messages,
@@ -1743,13 +1927,25 @@ async def _run_pre_flight(
     # redoing auth/budget/PII/governance checks above.
     attempts: list[dict] = []
     for cand in candidate_deployments:
-        cand_url, cand_hdrs = build_provider_request(cand, stream=stream)
         cand_provider = getattr(cand, "provider", None) or ""
+        if responses_api:
+            cand_url, cand_hdrs = build_provider_request(cand, stream=stream, api="responses")
+            # Azure's Responses route has no deployment in the URL: the
+            # deployment name travels in the body's `model`. Everything else
+            # (input, tools, reasoning, include, store, ...) is forwarded as-is.
+            _is_azure = cand_provider.lower().replace("-", "_") in ("azure", "azure_openai")
+            cand_body = {
+                **forward_body,
+                "model": (cand.deployment_name or cand.model_name) if _is_azure else cand.model_name,
+            }
+        else:
+            cand_url, cand_hdrs = build_provider_request(cand, stream=stream)
+            cand_body = translate_outbound_body(cand_provider, forward_body)
         attempts.append(dict(
             depl_id=getattr(cand, "deployment_id", None),
             url=cand_url,
             azure_hdrs=cand_hdrs,
-            outbound_body=translate_outbound_body(cand_provider, forward_body),
+            outbound_body=cand_body,
             provider=cand_provider,
             model=cand.model_name,
             deployment=cand.deployment_name or cand.model_name,
@@ -1766,6 +1962,8 @@ async def _run_pre_flight(
         deployment=primary["deployment"],
         provider=primary["provider"],
         forward_body=forward_body,
+        messages=clean_messages,
+        api=api,
         outbound_body=primary["outbound_body"],
         input_tokens=input_tokens,
         source_ip=source_ip,
@@ -1887,9 +2085,30 @@ async def proxy_chat(
     x_user_role: Optional[str] = Header(None, alias="X-User-Role"),
     db: Session = Depends(get_db),
 ) -> Any:
+    return await _proxy_nonstream(
+        request=request, background_tasks=background_tasks, model=model,
+        x_governance_key=x_governance_key, x_trace_id=x_trace_id, x_user_id=x_user_id,
+        x_user_email=x_user_email, x_user_role=x_user_role, db=db, api="chat",
+    )
+
+
+async def _proxy_nonstream(
+    *,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    model: Optional[str],
+    x_governance_key: str,
+    x_trace_id: Optional[str],
+    x_user_id: Optional[str],
+    x_user_email: Optional[str],
+    x_user_role: Optional[str],
+    db: Session,
+    api: str,
+) -> Any:
     ctx = await _run_pre_flight(
         request=request, x_governance_key=x_governance_key, model_override=model, db=db,
         trace_id=x_trace_id, user_id=x_user_id, user_email=x_user_email, user_role=x_user_role,
+        api=api,
     )
     t_start = time.time()
 
@@ -1920,7 +2139,7 @@ async def proxy_chat(
                 billed_input = azure_input
                 in_src = "azure"
             else:
-                billed_input = _estimate_input_tokens(ctx["forward_body"].get("messages", []), ctx["model"])
+                billed_input = _estimate_input_tokens(ctx["messages"], ctx["model"])
                 in_src = "tiktoken_estimate"
             out_src = "azure" if azure_output > 0 else "tiktoken_estimate"
             _mark_request_failed_with_cost(
@@ -1943,7 +2162,7 @@ async def proxy_chat(
         db.commit()
         raise HTTPException(status_code=status_code, detail=azure_detail)
     except httpx.RequestError as exc:
-        _fallback_tokens = _estimate_input_tokens(ctx["forward_body"].get("messages", []), ctx["model"])
+        _fallback_tokens = _estimate_input_tokens(ctx["messages"], ctx["model"])
         _mark_request_failed_with_cost(
             db=db, request_id=ctx["request_id"], org_id=ctx["org_id"],
             project_id=ctx["project_id"], key_id=ctx["key_id"],
@@ -1963,13 +2182,16 @@ async def proxy_chat(
     latency_ms = int((time.time() - t_start) * 1000)
     response_data: dict = azure_resp.json()
 
-    provider_usage = extract_usage(ctx.get("provider", ""), response_data)
+    provider_usage = (
+        extract_responses_usage(response_data) if api == "responses"
+        else extract_usage(ctx.get("provider", ""), response_data)
+    )
 
     if provider_usage.input_tokens_known:
         input_tokens = provider_usage.input_tokens
         in_src = "azure"
     else:
-        input_tokens = _estimate_input_tokens(ctx["forward_body"].get("messages", []), ctx["model"])
+        input_tokens = _estimate_input_tokens(ctx["messages"], ctx["model"])
         in_src = "tiktoken_estimate"
 
     if provider_usage.output_tokens_known:
@@ -2132,6 +2354,282 @@ async def proxy_chat_stream(
         background=release_tasks,
         headers={"Cache-Control": "no-cache", "X-Request-Id": ctx["request_id"]},
     )
+
+
+# ---------------------------------------------------------------------------
+# POST /proxy/responses — OpenAI Responses API (reasoning + tools together)
+#
+# Azure rejects function tools combined with reasoning_effort on the
+# chat-completions route; Responses is the route that supports both, and it
+# carries reasoning items (include: ["reasoning.encrypted_content"], store:
+# false) across tool-result turns. The body is forwarded untouched apart from
+# PII masking of message/tool-output text, token-cap rules and `model`.
+# Streaming is selected by `stream: true` in the body, like the SDKs do.
+# ---------------------------------------------------------------------------
+
+@router.post("/responses")
+@router.post("/v1/responses")
+async def proxy_responses(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    model: Optional[str] = Query(None, description="AI model name (overrides body 'model' field)"),
+    x_governance_key: str = Header(..., alias="X-Governance-Key"),
+    x_trace_id: Optional[str] = Header(None, alias="X-Trace-Id"),
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+    x_user_email: Optional[str] = Header(None, alias="X-User-Email"),
+    x_user_role: Optional[str] = Header(None, alias="X-User-Role"),
+    db: Session = Depends(get_db),
+) -> Any:
+    if await _body_requests_stream(request):
+        return await _proxy_responses_stream(
+            request=request, model=model, x_governance_key=x_governance_key,
+            x_trace_id=x_trace_id, x_user_id=x_user_id, x_user_email=x_user_email,
+            x_user_role=x_user_role, db=db,
+        )
+    return await _proxy_nonstream(
+        request=request, background_tasks=background_tasks, model=model,
+        x_governance_key=x_governance_key, x_trace_id=x_trace_id, x_user_id=x_user_id,
+        x_user_email=x_user_email, x_user_role=x_user_role, db=db, api="responses",
+    )
+
+
+async def _proxy_responses_stream(
+    *,
+    request: Request,
+    model: Optional[str],
+    x_governance_key: str,
+    x_trace_id: Optional[str],
+    x_user_id: Optional[str],
+    x_user_email: Optional[str],
+    x_user_role: Optional[str],
+    db: Session,
+) -> Any:
+    ctx = await _run_pre_flight(
+        request=request, x_governance_key=x_governance_key, model_override=model, db=db,
+        stream=True, trace_id=x_trace_id, user_id=x_user_id, user_email=x_user_email,
+        user_role=x_user_role, api="responses",
+    )
+    t_start = time.time()
+
+    if not await _azure_limiter.try_acquire():
+        raise HTTPException(
+            status_code=503,
+            detail="Server busy: too many concurrent requests to Azure OpenAI. Please retry shortly.",
+        )
+    release_tasks = BackgroundTasks()
+    release_tasks.add_task(_azure_limiter.release)
+
+    attempts = [
+        {**a, "outbound_body": {**a["outbound_body"], "stream": True}} for a in ctx["attempts"]
+    ]
+    return StreamingResponse(
+        _stream_responses(
+            attempts=attempts, request_id=ctx["request_id"], org_id=ctx["org_id"],
+            project_id=ctx["project_id"], key_id=ctx["key_id"], messages=ctx["messages"],
+            source_ip=ctx["source_ip"], user_agent=ctx["user_agent"],
+            db=db, t_start=t_start, ctx=ctx,
+        ),
+        media_type="text/event-stream",
+        background=release_tasks,
+        headers={"Cache-Control": "no-cache", "X-Request-Id": ctx["request_id"]},
+    )
+
+
+def _responses_sse_error(message: str, code: str = "upstream_error") -> bytes:
+    payload = {"type": "error", "code": code, "message": message}
+    return f"event: error\ndata: {json.dumps(payload)}\n\n".encode()
+
+
+def _responses_upstream_error(exc: httpx.HTTPStatusError) -> tuple[str, str]:
+    """(code, message) from an upstream Responses error body, falling back to str(exc)."""
+    try:
+        err = exc.response.json().get("error") or {}
+        return str(err.get("code") or f"upstream_error_{exc.response.status_code}"), str(err.get("message") or exc)
+    except Exception:
+        return f"upstream_error_{exc.response.status_code}", str(exc)
+
+
+_RESPONSES_TERMINAL_EVENTS = ("response.completed", "response.incomplete", "response.failed")
+
+
+async def _stream_responses(
+    *,
+    attempts: list[dict],
+    request_id: str,
+    org_id: str,
+    project_id: Optional[str],
+    key_id: str,
+    messages: list[dict],
+    source_ip: Optional[str],
+    user_agent: Optional[str],
+    db: Session,
+    t_start: float,
+    ctx: dict,
+) -> AsyncIterator[bytes]:
+    """Relay Responses-API SSE (`event:` + `data:` frames) verbatim.
+
+    Same failover contract as _stream_azure: switch to the next candidate only
+    if the connection fails before any frame has been sent downstream.
+    Accounting comes from the terminal event's `response` object (usage +
+    output items); if the stream ends without one it is recorded as partial.
+    """
+    n_frames = 0
+    text_parts: list[str] = []
+    terminal_type: Optional[str] = None
+    final_response: Optional[dict] = None
+    model = deployment = provider = ""
+
+    def _elapsed_ms() -> int:
+        return int((time.time() - t_start) * 1000)
+
+    def _total_ms() -> int:
+        return int((time.time() - ctx["t_request_start"]) * 1000)
+
+    def _record_failure(*, detail: str, failure_code: str, req_status: str = "failed",
+                        input_tokens: Optional[int] = None, input_src: str = "tiktoken_estimate",
+                        output_tokens: Optional[int] = None, output_src: str = "tiktoken_estimate") -> None:
+        partial_text = "".join(text_parts)
+        if output_tokens is None:
+            output_tokens = count_tokens(text=partial_text, model_name=model) if partial_text else 0
+        if failure_code == "upstream_rate_limited" and output_tokens == 0:
+            _mark_request_failed(
+                db=db, request_id=request_id, org_id=org_id, project_id=project_id,
+                key_id=key_id, source_ip=source_ip, user_agent=user_agent,
+                detail=detail, failure_code=failure_code, model=model, deployment=deployment,
+            )
+        else:
+            _mark_request_failed_with_cost(
+                db=db, request_id=request_id, org_id=org_id, project_id=project_id,
+                key_id=key_id, model=model, deployment=deployment, provider=provider,
+                input_tokens=input_tokens if input_tokens is not None else _estimate_input_tokens(messages, model),
+                output_tokens=output_tokens, latency_ms=_elapsed_ms(),
+                source_ip=source_ip, user_agent=user_agent, detail=detail,
+                req_status=req_status, failure_code=failure_code,
+                input_token_source=input_src, output_token_source=output_src,
+            )
+        _store_route_execution(
+            db=db, ctx=ctx, upstream_ms=_elapsed_ms(), total_ms=_total_ms(),
+            status="partial" if req_status == "partial" else "failed",
+        )
+        db.commit()
+
+    for i, attempt in enumerate(attempts):
+        is_last = i == len(attempts) - 1
+        url, headers, body = attempt["url"], attempt["azure_hdrs"], attempt["outbound_body"]
+        model, deployment, provider = attempt["model"], attempt["deployment"], attempt["provider"]
+        circuit = _get_circuit_breaker(_circuit_key(provider, deployment))
+
+        if not await circuit.allow_request():
+            if not is_last:
+                continue
+            ctx.update(attempt)
+            _msg = f"{provider or 'Provider'} circuit breaker open"
+            yield _responses_sse_error(_msg, "circuit_open")
+            _record_failure(detail=_msg, failure_code="circuit_open")
+            return
+
+        try:
+            async with httpx.AsyncClient(timeout=_azure_httpx_timeout()) as client:
+                async with client.stream("POST", url=url, headers=headers, json=body) as resp:
+                    if resp.is_error:
+                        # Streamed bodies are unread; load it so the upstream
+                        # error message/code can be relayed to the client.
+                        await resp.aread()
+                    resp.raise_for_status()
+                    async for line in resp.aiter_lines():
+                        if line.startswith("data:"):
+                            try:
+                                evt = json.loads(line[5:].strip())
+                            except Exception:
+                                evt = None
+                            if isinstance(evt, dict):
+                                etype = evt.get("type")
+                                if etype == "response.output_text.delta" and isinstance(evt.get("delta"), str):
+                                    text_parts.append(evt["delta"])
+                                elif etype in _RESPONSES_TERMINAL_EVENTS:
+                                    terminal_type = etype
+                                    final_response = evt.get("response") if isinstance(evt.get("response"), dict) else {}
+                        # Blank lines delimit SSE frames — keep them.
+                        n_frames += 1
+                        yield (line + "\n").encode()
+            await circuit.record_success()
+            ctx.update(attempt)
+            break
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code
+            if not n_frames and not is_last and (status_code >= 500 or status_code == 429):
+                await circuit.record_failure()
+                continue
+            if status_code >= 500:
+                await circuit.record_failure()
+            ctx.update(attempt)
+            code, msg = _responses_upstream_error(exc)
+            yield _responses_sse_error(msg, code)
+            _record_failure(
+                detail=f"Azure responses stream error {status_code}: {msg}",
+                failure_code="upstream_rate_limited" if status_code == 429 else f"upstream_error_{status_code}",
+            )
+            return
+        except httpx.RequestError as exc:
+            await circuit.record_failure()
+            if not n_frames and not is_last:
+                continue
+            ctx.update(attempt)
+            yield _responses_sse_error(f"Azure unreachable: {exc}", "upstream_unreachable")
+            _record_failure(
+                detail=f"Azure responses stream unreachable (timeout/connection): {exc}",
+                failure_code="upstream_unreachable",
+            )
+            return
+
+    latency_ms = _elapsed_ms()
+
+    if terminal_type is None:
+        # Connection dropped before response.completed — bill what streamed.
+        _record_failure(
+            detail=f"Responses stream ended without a terminal event after {n_frames} frames",
+            failure_code="stream_incomplete", req_status="partial",
+        )
+        return
+
+    resp_obj = final_response or {}
+    usage = extract_responses_usage(resp_obj)
+    if usage.input_tokens_known:
+        input_tokens, in_src = usage.input_tokens, "azure"
+    else:
+        input_tokens, in_src = _estimate_input_tokens(messages, model), "tiktoken_estimate"
+    if usage.output_tokens_known:
+        output_tokens, out_src = usage.output_tokens, "azure"
+    else:
+        _text = usage.output_text or "".join(text_parts)
+        output_tokens = count_tokens(text=_text, model_name=model) if _text else 0
+        out_src = "tiktoken_estimate"
+
+    if terminal_type == "response.failed":
+        err = resp_obj.get("error") or {}
+        _record_failure(
+            detail=f"Responses stream failed upstream: {err.get('message') or err}",
+            failure_code="upstream_response_failed",
+            input_tokens=input_tokens, input_src=in_src,
+            output_tokens=output_tokens, output_src=out_src,
+        )
+        return
+
+    _store_response_and_cost(
+        db=db, request_id=request_id, org_id=org_id, project_id=project_id,
+        model=model, deployment=deployment, provider=provider,
+        response_payload=resp_obj or {"streamed": True},
+        input_tokens=input_tokens, output_tokens=output_tokens,
+        finish_reason=usage.finish_reason, latency_ms=latency_ms, status="success",
+        input_token_source=in_src, output_token_source=out_src,
+    )
+    _store_audit(
+        db=db, request_id=request_id, org_id=org_id, project_id=project_id,
+        key_id=key_id, action="proxy_stream_complete", status="success",
+        source_ip=source_ip, user_agent=user_agent,
+    )
+    _store_route_execution(db=db, ctx=ctx, upstream_ms=latency_ms, total_ms=_total_ms(), status="success")
+    db.commit()
 
 
 # ---------------------------------------------------------------------------
