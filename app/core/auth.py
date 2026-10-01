@@ -216,12 +216,15 @@ def find_user_by_email(db: Session, email: str):
 
 
 def user_payload(user) -> dict:
+    is_admin = (user.role or "").strip().lower() == ADMIN_ROLE
     return {
         "id": user.id,
         "email": user.email,
         "name": user.name,
         "role": user.role,
         "org_id": user.org_id,
+        # Dashboard modules this user may use; the UI disables the rest.
+        "modules": {"proxy_setup": is_admin},
     }
 
 
