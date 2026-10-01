@@ -241,6 +241,7 @@ async def root_chat_completions_alias(
     x_user_role: Optional[str] = Header(None, alias="X-User-Role"),
     db: Session = Depends(get_db),
 ):
+    # proxy_chat_openai_compat dispatches to the SSE handler when stream=true.
     return await proxy_chat_openai_compat(
         request=request, background_tasks=background_tasks, model=model,
         x_governance_key=x_governance_key, x_trace_id=x_trace_id, x_user_id=x_user_id,

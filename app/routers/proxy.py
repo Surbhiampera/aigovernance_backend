@@ -1665,7 +1665,10 @@ async def _run_pre_flight(
         _log.warning("PII scan skipped: %s", _e)
         clean_messages = messages
 
-    forward_body = {k: v for k, v in body.items() if k != "stream"}
+    # `stream_options` is only valid upstream alongside stream=true; the stream
+    # path re-adds stream=True on the outbound body, so keep it only there.
+    _drop = {"stream"} if stream else {"stream", "stream_options"}
+    forward_body = {k: v for k, v in body.items() if k not in _drop}
     forward_body["messages"] = clean_messages
     forward_body["model"] = model
 
@@ -2028,11 +2031,27 @@ async def proxy_chat_openai_compat(
     x_user_role: Optional[str] = Header(None, alias="X-User-Role"),
     db: Session = Depends(get_db),
 ) -> Any:
+    # OpenAI SDKs select streaming with a body flag, not a different URL, so
+    # honor `stream: true` here and hand off to the SSE handler.
+    if await _body_requests_stream(request):
+        return await proxy_chat_stream(
+            request=request, model=model,
+            x_governance_key=x_governance_key, x_trace_id=x_trace_id, x_user_id=x_user_id,
+            x_user_email=x_user_email, x_user_role=x_user_role, db=db,
+        )
     return await proxy_chat(
         request=request, background_tasks=background_tasks, model=model,
         x_governance_key=x_governance_key, x_trace_id=x_trace_id, x_user_id=x_user_id,
         x_user_email=x_user_email, x_user_role=x_user_role, db=db,
     )
+
+
+async def _body_requests_stream(request: Request) -> bool:
+    try:
+        body = await request.json()
+    except Exception:
+        return False
+    return isinstance(body, dict) and body.get("stream") is True
 
 
 # ---------------------------------------------------------------------------
