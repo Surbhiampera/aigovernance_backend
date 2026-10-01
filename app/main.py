@@ -236,11 +236,15 @@ async def root_chat_completions_alias(
     model: Optional[str] = Query(None, description="AI model name (overrides body 'model' field)"),
     x_governance_key: str = Header(..., alias="X-Governance-Key"),
     x_trace_id: Optional[str] = Header(None, alias="X-Trace-Id"),
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+    x_user_email: Optional[str] = Header(None, alias="X-User-Email"),
+    x_user_role: Optional[str] = Header(None, alias="X-User-Role"),
     db: Session = Depends(get_db),
 ):
     return await proxy_chat_openai_compat(
         request=request, background_tasks=background_tasks, model=model,
-        x_governance_key=x_governance_key, x_trace_id=x_trace_id, db=db,
+        x_governance_key=x_governance_key, x_trace_id=x_trace_id, x_user_id=x_user_id,
+        x_user_email=x_user_email, x_user_role=x_user_role, db=db,
     )
 
 
